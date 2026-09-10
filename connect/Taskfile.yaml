@@ -1,0 +1,156 @@
+version: '3'
+
+# ─── Variables ──────────────────────────────────────────────────────────────
+
+vars:
+  RUST_PROJECT: connect-lib
+  GO_PROJECT: connect-plugin
+  PLUGIN_BINARY: datumctl-connect
+  RUST_BINARY: datum-connect
+  PLUGIN_DIR: '{{.ROOT_DIR}}/bin'
+  PLUGIN_INSTALL_DIR: '$HOME/.datumctl/plugins'
+
+  GO_BUILD_FLAGS: -trimpath
+
+  GIT_COMMIT:
+    sh: git rev-parse --short HEAD
+  GO_LDFLAGS: -X main.version=v0.1.0+{{.GIT_COMMIT}}
+
+  CARGO_TARGET_DIR: '{{.ROOT_DIR}}/{{.RUST_PROJECT}}/target'
+  CARGO_BUILD_FLAGS: -p {{.RUST_BINARY}}
+  RELEASE_FLAGS: --release
+
+  E2E_SCRIPT: '{{.ROOT_DIR}}/../e2e-test.sh'
+
+# ─── Tasks ──────────────────────────────────────────────────────────────────
+
+tasks:
+
+  default:
+    cmds:
+      - task --list
+    silent: true
+
+  # ════════════════════════════════════════════════════════════════════════
+  #  Build
+  # ════════════════════════════════════════════════════════════════════════
+
+  build:
+    desc: "Build the Go plugin and Rust binary (debug)"
+    cmds:
+      - task: build:go
+      - task: build:rust
+
+  build:go:
+    desc: "Build the Go plugin binary"
+    cmds:
+      - go build {{.GO_BUILD_FLAGS}} -ldflags '{{.GO_LDFLAGS}}' -o {{.PLUGIN_BINARY}} .
+    dir: '{{.ROOT_DIR}}/{{.GO_PROJECT}}'
+
+  build:rust:
+    desc: "Build the Rust binary (debug)"
+    cmds:
+      - cargo build {{.CARGO_BUILD_FLAGS}}
+    dir: '{{.ROOT_DIR}}/{{.RUST_PROJECT}}'
+
+  build:release:
+    desc: "Build the Go plugin and Rust binary (release)"
+    cmds:
+      - task: build:go
+      - task: build:rust:release
+
+  build:rust:release:
+    desc: "Build the Rust binary with LTO and symbol stripping"
+    cmds:
+      - cargo build {{.CARGO_BUILD_FLAGS}} {{.RELEASE_FLAGS}}
+    dir: '{{.ROOT_DIR}}/{{.RUST_PROJECT}}'
+
+  # ════════════════════════════════════════════════════════════════════════
+  #  Install
+  # ════════════════════════════════════════════════════════════════════════
+
+  install:
+    desc: "Build and install both binaries to the managed plugins directory"
+    cmds:
+      - task: build
+      - task: install:go
+      - task: install:rust
+
+  install:go:
+    desc: "Copy the Go plugin binary to $HOME/.datumctl/plugins"
+    dir: '{{.ROOT_DIR}}/{{.GO_PROJECT}}'
+    cmds:
+      - mkdir -p {{.PLUGIN_INSTALL_DIR}}
+      - cp {{.PLUGIN_BINARY}} {{.PLUGIN_INSTALL_DIR}}/{{.PLUGIN_BINARY}}.new && mv {{.PLUGIN_INSTALL_DIR}}/{{.PLUGIN_BINARY}}.new {{.PLUGIN_INSTALL_DIR}}/{{.PLUGIN_BINARY}}
+      - chmod +x {{.PLUGIN_INSTALL_DIR}}/{{.PLUGIN_BINARY}}
+
+  install:rust:
+    desc: "Copy the Rust binary to $HOME/.datumctl/plugins"
+    cmds:
+      - mkdir -p {{.PLUGIN_INSTALL_DIR}}
+      - cp {{.CARGO_TARGET_DIR}}/debug/{{.RUST_BINARY}} {{.PLUGIN_INSTALL_DIR}}/{{.RUST_BINARY}}.new && mv {{.PLUGIN_INSTALL_DIR}}/{{.RUST_BINARY}}.new {{.PLUGIN_INSTALL_DIR}}/{{.RUST_BINARY}}
+      - chmod +x {{.PLUGIN_INSTALL_DIR}}/{{.RUST_BINARY}}
+
+  install:release:
+    desc: "Build (release) and install both binaries"
+    dir: '{{.ROOT_DIR}}/{{.GO_PROJECT}}'
+    cmds:
+      - task: build:release
+      - mkdir -p {{.PLUGIN_INSTALL_DIR}}
+      - cp {{.PLUGIN_BINARY}} {{.PLUGIN_INSTALL_DIR}}/{{.PLUGIN_BINARY}}.new && mv {{.PLUGIN_INSTALL_DIR}}/{{.PLUGIN_BINARY}}.new {{.PLUGIN_INSTALL_DIR}}/{{.PLUGIN_BINARY}}
+      - chmod +x {{.PLUGIN_INSTALL_DIR}}/{{.PLUGIN_BINARY}}
+      - cp {{.CARGO_TARGET_DIR}}/release/{{.RUST_BINARY}} {{.PLUGIN_INSTALL_DIR}}/{{.RUST_BINARY}}.new && mv {{.PLUGIN_INSTALL_DIR}}/{{.RUST_BINARY}}.new {{.PLUGIN_INSTALL_DIR}}/{{.RUST_BINARY}}
+      - chmod +x {{.PLUGIN_INSTALL_DIR}}/{{.RUST_BINARY}}
+
+  # ════════════════════════════════════════════════════════════════════════
+  #  Test
+  # ════════════════════════════════════════════════════════════════════════
+
+  test:
+    desc: "Run all tests (Go tests + Rust unit tests)"
+    cmds:
+      - task: test:go
+      - task: test:rust
+
+  test:go:
+    desc: "Run Go unit tests"
+    cmds:
+      - go test ./... -count=1 -timeout 60s
+    dir: '{{.ROOT_DIR}}/{{.GO_PROJECT}}'
+
+  test:rust:
+    desc: "Run Rust unit tests"
+    cmds:
+      - cargo test --workspace
+    dir: '{{.ROOT_DIR}}/{{.RUST_PROJECT}}'
+
+  test:e2e:
+    desc: "Run the E2E tunnel stability test script"
+    cmds:
+      - cmd: '{{.E2E_SCRIPT}}'
+        silent: false
+
+  # ════════════════════════════════════════════════════════════════════════
+  #  Clean
+  # ════════════════════════════════════════════════════════════════════════
+
+  clean:
+    desc: "Remove all build artifacts"
+    cmds:
+      - rm -f {{.ROOT_DIR}}/{{.GO_PROJECT}}/{{.PLUGIN_BINARY}}
+      - rm -f {{.ROOT_DIR}}/{{.RUST_PROJECT}}/target/debug/{{.RUST_BINARY}}
+      - rm -f {{.ROOT_DIR}}/{{.RUST_PROJECT}}/target/release/{{.RUST_BINARY}}
+      - rm -rf {{.ROOT_DIR}}/{{.RUST_PROJECT}}/target
+
+  clean:all:
+    desc: "Remove build artifacts, installed binaries, and tmp files"
+    cmds:
+      - task: clean
+      - rm -f $HOME/.datumctl/plugins/{{.PLUGIN_BINARY}} $HOME/.datumctl/plugins/{{.RUST_BINARY}}
+      - rm -rf {{.ROOT_DIR}}/tmp
+
+  # ════════════════════════════════════════════════════════════════════════
+  #  Utility
+  # ════════════════════════════════════════════════════════════════════════
+
+

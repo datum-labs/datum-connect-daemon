@@ -1,0 +1,7 @@
+# Shell scripts must keep LF endings regardless of the checking-out
+# machine's OS/git config -- these run on Linux (inside a container or on
+# a Linux build box), and a CRLF-corrupted shebang line breaks them
+# outright. Found this the practical way while committing deploy/daytona-poc/.
+*.sh text eol=lf
+*.py text eol=lf
+Dockerfile text eol=lf

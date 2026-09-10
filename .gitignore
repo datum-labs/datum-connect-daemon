@@ -1,0 +1,8 @@
+target/
+*.log
+*.so
+*.exe
+datumctl-connect
+fake-datum-connect
+fake-datum-connect-test
+.drewr-*/

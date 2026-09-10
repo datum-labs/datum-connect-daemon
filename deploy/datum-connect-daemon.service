@@ -1,0 +1,49 @@
+# systemd unit for datum-connect-daemon — auto-starts the daemon on boot
+# and restarts it on crash. Pairs with the daemon's own reconciliation
+# pass (see NOTES.md's "recover a tunnel after reboot" note): systemd
+# gets the *process* running again; the daemon's own startup logic
+# handles bringing previously-enabled tunnels back live.
+#
+# Install:
+#   sudo cp datum-connect-daemon.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now datum-connect-daemon
+#
+# Before enabling, fill in the placeholders below for your setup:
+#   - User/Group: the account that owns $DATUM_CONNECT_DIR and holds the
+#     Datum Cloud credentials this daemon should run as (a service
+#     account is strongly preferred over a human session for anything
+#     unattended — see NOTES.md's "Service account auth" section).
+#   - ExecStart: the actual path to the built datum-connect-daemon binary.
+#   - Environment lines: DATUM_SESSION, DATUM_CREDENTIALS_HELPER,
+#     DATUM_PROJECT, DATUM_CONNECT_DIR — same variables described in
+#     SETUP.md and API-REFERENCE.md. Consider an EnvironmentFile instead
+#     of inline Environment= lines if any of these are sensitive.
+
+[Unit]
+Description=Datum Connect daemon (persistent local tunnel API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=REPLACE_ME
+Group=REPLACE_ME
+ExecStart=/usr/local/bin/datum-connect-daemon --port 47780
+Restart=on-failure
+RestartSec=5s
+
+Environment=DATUM_PLUGIN_MODE=1
+Environment=DATUM_SESSION=REPLACE_ME
+Environment=DATUM_CREDENTIALS_HELPER=REPLACE_ME
+Environment=DATUM_PROJECT=REPLACE_ME
+Environment=DATUM_CONNECT_DIR=REPLACE_ME
+
+# Loopback-only by design (see NOTES.md's "Local API auth" section) — no
+# public-facing hardening needed here, but standard process isolation
+# doesn't hurt.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

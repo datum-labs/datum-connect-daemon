@@ -1,0 +1,183 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================
+   Datum Design Tokens — CSS Custom Properties
+   Mirrors the datum-website variables.css for use in plain CSS
+   ============================================================ */
+:root {
+  /* Colors */
+  --color-midnight-fjord:        #0c1d31;
+  --color-deep-navy:             #152538;
+  --color-aurora-moss:           #e6f59f;
+  --color-aurora-moss-pale:      #f3f8dd;
+  --color-canyon-clay:           #bf9595;
+  --color-canyon-clay-links:     #9c7979;
+  --color-canyon-clay-pale:      #f5e8e8;
+  --color-blush-quartz:          #ecd0d0;
+  --color-pine-forge:            #4d6356;
+  --color-glacier-mist-700:      #f6f6f5;
+  --color-glacier-mist-800:      #efefed;
+  --color-glacier-mist-900:      #e8e7e4;
+  --color-silver-mist:           #c3c6c9;
+  --color-dark-utility-5:        #e3e2df;
+  --color-alert-red:             #d25b5b;
+  --color-white:                 #ffffff;
+
+  /* Typography */
+  --font-alliance: 'Alliance No.1', ui-sans-serif, system-ui, sans-serif;
+  --font-canela:   'Canela Text', ui-serif, Georgia, serif;
+
+  /* Radius */
+  --radius-sm: 3px;
+  --radius-md: 6px;
+  --radius-lg: 9px;
+
+  /* Shadows */
+  --shadow-sm:    1px 8px 8px 0 rgba(0, 0, 0, 0.02);
+  --shadow-modal: 0 4px 16px 0 rgba(0, 0, 0, 0.05), 1px 8px 8px 0 rgba(0, 0, 0, 0.02);
+  --shadow-card:  0 10px 60px -40px rgba(12, 29, 49, 0.6);
+}
+
+/* ============================================================
+   Base Styles
+   ============================================================ */
+@layer base {
+  body {
+    margin: 0;
+    font-family: var(--font-alliance);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background-color: var(--color-glacier-mist-900);
+    color: var(--color-midnight-fjord);
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-alliance);
+    font-weight: 600;
+    color: var(--color-midnight-fjord);
+    letter-spacing: -0.01em;
+  }
+
+  a {
+    color: var(--color-canyon-clay-links);
+  }
+
+  code {
+    font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New', monospace;
+  }
+}
+
+/* ============================================================
+   Datum Component Classes
+   Reusable patterns matching the datum design language
+   ============================================================ */
+@layer components {
+
+  /* --- Buttons --- */
+  .btn-datum {
+    @apply inline-flex items-center justify-center gap-2 rounded-datum-md border font-semibold text-sm tracking-normal whitespace-nowrap transition-colors duration-150 px-5 py-2.5;
+  }
+
+  .btn-datum-primary {
+    @apply btn-datum bg-midnight-fjord text-glacier-mist-700 border-midnight-fjord hover:bg-midnight-fjord/90;
+  }
+
+  .btn-datum-secondary {
+    @apply btn-datum bg-white text-midnight-fjord border-silver-mist hover:bg-glacier-mist-800;
+  }
+
+  .btn-datum-accent {
+    @apply btn-datum bg-aurora-moss text-midnight-fjord border-transparent hover:bg-aurora-moss/80;
+  }
+
+  .btn-datum-outline {
+    @apply btn-datum bg-transparent text-midnight-fjord border-dark-utility-5 hover:bg-glacier-mist-800;
+  }
+
+  .btn-datum-danger {
+    @apply btn-datum bg-alert-red text-white border-transparent hover:bg-alert-red/80;
+  }
+
+  /* --- Cards --- */
+  .card-datum {
+    @apply bg-white rounded-datum-lg border border-glacier-mist-900 shadow-datum-sm overflow-hidden;
+  }
+
+  /* --- Form Fields --- */
+  .field-label {
+    @apply block text-sm font-semibold text-midnight-fjord mb-1.5;
+  }
+
+  .field-input {
+    @apply w-full px-3.5 py-2.5 bg-white border border-silver-mist rounded-datum-md text-midnight-fjord text-sm
+           placeholder:text-dark-utility-4
+           focus:outline-none focus:ring-2 focus:ring-midnight-fjord/30 focus:border-midnight-fjord
+           transition-colors duration-150;
+  }
+
+  .field-select {
+    @apply field-input appearance-none cursor-pointer;
+  }
+
+  .field-error {
+    @apply text-alert-red text-xs mt-1;
+  }
+
+  /* --- Status Badges --- */
+  .badge {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  }
+
+  .badge-green {
+    @apply badge bg-aurora-mist text-pine-forge;
+  }
+
+  .badge-yellow {
+    @apply badge bg-aurora-moss-pale text-midnight-fjord;
+  }
+
+  .badge-red {
+    @apply badge bg-canyon-clay-pale text-canyon-clay-links;
+  }
+
+  /* --- Info / Alert Banners --- */
+  .banner-info {
+    @apply bg-aurora-mist border border-sage-mist text-pine-forge rounded-datum-md p-4;
+  }
+
+  .banner-warn {
+    @apply bg-aurora-moss-pale border border-aurora-moss text-midnight-fjord rounded-datum-md p-4;
+  }
+
+  .banner-danger {
+    @apply bg-canyon-clay-pale border border-canyon-clay text-canyon-clay-links rounded-datum-md p-4;
+  }
+
+  /* --- Section / Page Layout --- */
+  .page-container {
+    @apply max-w-datum mx-auto px-4 sm:px-7;
+  }
+
+  .section-heading {
+    @apply text-2xl font-semibold text-midnight-fjord tracking-tight;
+  }
+
+  .section-subheading {
+    @apply text-lg font-medium text-dark-utility-3;
+  }
+
+  /* --- Stat Tile (dashboard) --- */
+  .stat-tile {
+    @apply bg-glacier-mist-800 rounded-datum-md p-4 border border-glacier-mist-900;
+  }
+
+  .stat-tile-label {
+    @apply text-xs font-semibold text-dark-utility-3 uppercase tracking-wide mb-1;
+  }
+
+  .stat-tile-value {
+    @apply text-sm font-medium text-midnight-fjord;
+  }
+}

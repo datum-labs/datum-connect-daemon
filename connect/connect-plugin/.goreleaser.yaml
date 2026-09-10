@@ -1,0 +1,65 @@
+# GoReleaser config for the datumctl-connect plugin.
+#
+# Release a version by pushing a semver tag (vX.Y.Z). The workflow runs
+# goreleaser, which builds the plugin and publishes archives + checksums.txt
+# to a GitHub release. Installable via `datumctl plugin install datum-cloud/connect`.
+#
+# Each archive bundles both the Go plugin binary (datumctl-connect) and the
+# Rust tunnel agent binary (datum-connect). The Rust binary is cross-compiled
+# in the workflow and placed at ../dist/rust/ before goreleaser runs.
+#
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+project_name: datumctl-connect
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: datumctl-connect
+    main: .
+    binary: datumctl-connect
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - "-X main.version=v{{.Version}}"
+
+archives:
+  - id: datumctl-connect
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - src: ../dist/rust/datum-connect-{{ .Os }}-{{ .Arch }}{{ if eq .Os "windows" }}.exe{{ end }}
+        dst: datum-connect{{ if eq .Os "windows" }}.exe{{ end }}
+        strip_parent: true
+
+checksum:
+  name_template: checksums.txt
+
+sboms:
+  - artifacts: archive
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"

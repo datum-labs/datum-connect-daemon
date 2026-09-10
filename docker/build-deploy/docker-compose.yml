@@ -1,0 +1,63 @@
+services:
+  db:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-property_booking}
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password123}
+    ports:
+      # Loopback only — nothing outside this host needs direct DB access,
+      # and the backend container reaches this over the compose network
+      # by service name regardless of this mapping.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../backend/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-admin} -d ${POSTGRES_DB:-property_booking}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      # Context is repo root so the Dockerfile can reach backend/ source
+      # without the dockerfile path escaping the build context
+      context: ..
+      dockerfile: build-deploy/backend.Dockerfile
+    restart: unless-stopped
+    ports:
+      # Loopback only — nginx reaches this over the compose network by
+      # service name (see nginx.conf); this mapping is just for host-side
+      # debugging, and the point of this whole demo is no public inbound
+      # ports beyond what the Datum tunnel fronts.
+      - "127.0.0.1:5000:5000"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-password123}@db:5432/${POSTGRES_DB:-property_booking}
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      NODE_ENV: ${NODE_ENV:-production}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - uploads_data:/app/uploads
+
+  frontend:
+    build:
+      # Context is repo root so the Dockerfile can reach both frontend/ source
+      # and build-deploy/nginx.conf without escaping the build context
+      context: ..
+      dockerfile: build-deploy/frontend.Dockerfile
+      args:
+        REACT_APP_API_URL: ${REACT_APP_API_URL:-http://localhost:5000}
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  uploads_data:

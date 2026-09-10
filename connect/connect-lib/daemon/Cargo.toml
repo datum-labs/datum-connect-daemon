@@ -1,0 +1,29 @@
+[package]
+name = "datum-connect-daemon"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+connect-lib = { path = "../lib" }
+axum = "0.7"
+base64 = { workspace = true }
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+iroh = { version = "0.95", default-features = false }
+n0-error = { workspace = true }
+rand = { workspace = true }
+ring = "0.17"
+rustls = { version = "0.23", features = ["ring"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+tracing-appender = "0.2"

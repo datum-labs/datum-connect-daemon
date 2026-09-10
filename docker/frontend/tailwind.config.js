@@ -1,0 +1,87 @@
+/** @type {import('tailwindcss').Config} */
+module.exports = {
+  content: [
+    "./src/**/*.{js,jsx,ts,tsx}",
+  ],
+  theme: {
+    extend: {
+      colors: {
+        // Datum brand palette
+        'midnight-fjord':        '#0c1d31',
+        'midnight-fjord-muted':  '#14233d',
+        'deep-navy':             '#152538',
+        'aurora-moss':           '#e6f59f',
+        'aurora-moss-pale':      '#f3f8dd',
+        'aurora-moss-deep':      '#b3d56f',
+        'canyon-clay':           '#bf9595',
+        'canyon-clay-links':     '#9c7979',
+        'canyon-clay-pale':      '#f5e8e8',
+        'canyon-highlight':      '#f0d9d9',
+        'canyon-highlight-panel':'#f9eeee',
+        'blush-quartz':          '#ecd0d0',
+        'pine-forge':            '#4d6356',
+        'pine-forge-links':      '#417958',
+        'potted-olive':          '#adbab0',
+        'sage-mist':             '#d6ddd7',
+        'aurora-mist':           '#e2ede7',
+        'morning-mist':          '#f5faf7',
+        'harbor-blue':           '#4e809d',
+        'steel-blue':            '#8ab2ca',
+        'connect-slate':         '#5c7693',
+        'iris':                  '#7a6f8a',
+        'iris-pale':             '#e5e3f3',
+        'glacier-mist-700':      '#f6f6f5',
+        'glacier-mist-800':      '#efefed',
+        'glacier-mist-900':      '#e8e7e4',
+        'silver-mist':           '#c3c6c9',
+        'cultured':              '#f5f5f3',
+        'dark-utility-1':        '#223143',
+        'dark-utility-2':        '#384555',
+        'dark-utility-3':        '#67717c',
+        'dark-utility-4':        '#90969c',
+        'dark-utility-5':        '#e3e2df',
+        'alert-red':             '#d25b5b',
+      },
+      fontFamily: {
+        // Datum typography
+        'alliance': [
+          'Alliance No.1',
+          'ui-sans-serif',
+          'system-ui',
+          'sans-serif',
+        ],
+        'canela': [
+          'Canela Text',
+          'ui-serif',
+          'Georgia',
+          'serif',
+        ],
+        'sans': [
+          'Alliance No.1',
+          'ui-sans-serif',
+          'system-ui',
+          '-apple-system',
+          'BlinkMacSystemFont',
+          'Segoe UI',
+          'sans-serif',
+        ],
+      },
+      borderRadius: {
+        'datum-sm': '3px',
+        'datum-md': '6px',
+        'datum-lg': '9px',
+      },
+      boxShadow: {
+        'datum-sm':    '1px 8px 8px 0 rgba(0,0,0,0.02)',
+        'datum-modal': '0 4px 16px 0 rgba(0,0,0,0.05), 1px 8px 8px 0 rgba(0,0,0,0.02)',
+        'datum-card':  '0 10px 60px -40px rgba(12,29,49,0.6)',
+      },
+      maxWidth: {
+        'datum': '1316px',
+        'datum-nav': '1520px',
+        'datum-section': '1092px',
+      },
+    },
+  },
+  plugins: [],
+}

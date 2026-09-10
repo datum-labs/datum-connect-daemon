@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  rust-cross:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: linux-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: darwin-amd64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: darwin-arm64
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-latest
+            name: windows-amd64.exe
+          - target: aarch64-pc-windows-gnu
+            os: ubuntu-latest
+            name: windows-arm64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install Linux arm64 cross-compiler
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Install Windows cross-compiler
+        if: contains(matrix.target, 'windows')
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      - name: Build Rust binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+          CARGO_TARGET_AARCH64_PC_WINDOWS_GNU_LINKER: aarch64-w64-mingw32-gcc
+        run: cargo build --release -p datum-connect --target ${{ matrix.target }}
+        working-directory: connect-lib
+      - name: Rename binary with platform suffix
+        run: |
+          cp connect-lib/target/${{ matrix.target }}/release/datum-connect${{ contains(matrix.target, 'windows') && '.exe' || '' }} \
+            /tmp/rust-bin/datum-connect-${{ matrix.name }}
+        shell: bash
+      - name: Upload Rust binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-${{ matrix.name }}
+          path: /tmp/rust-bin/datum-connect-${{ matrix.name }}
+
+  goreleaser:
+    needs: rust-cross
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: connect-plugin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: connect-plugin/go.mod
+      - name: Download all Rust binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/rust-artifacts
+      - name: Stage Rust binaries for goreleaser
+        run: |
+          mkdir -p ../dist/rust
+          find /tmp/rust-artifacts -type f -exec cp {} ../dist/rust/ \;
+          ls -la ../dist/rust/
+      - name: Install Syft CLI
+        run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

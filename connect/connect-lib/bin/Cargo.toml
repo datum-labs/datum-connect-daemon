@@ -1,0 +1,23 @@
+[package]
+name = "datum-connect"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+connect-lib = { path = "../lib" }
+clap = { version = "4", features = ["derive", "env"] }
+n0-error = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+serde_json = { workspace = true }
+rustls = { version = "0.23", features = ["ring"] }
+inquire = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+iroh = { version = "0.95", default-features = false }
+rand = { workspace = true }
+hickory-resolver = "0.25"
+url = { workspace = true }

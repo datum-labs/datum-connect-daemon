@@ -1,0 +1,28 @@
+name: testing
+
+on:
+  push:
+    paths:
+      - 'connect-plugin/**/*.go'
+      - 'connect-plugin/go.mod'
+      - 'connect-plugin/go.sum'
+
+jobs:
+  testing:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: connect-plugin/go.mod
+      - name: Verify dependencies
+        run: go mod verify
+        working-directory: connect-plugin
+      - name: Build
+        run: go build ./...
+        working-directory: connect-plugin
+      - name: Test (known-good packages only)
+        run: go test -timeout 5m ./internal/daemon ./internal/env ./internal/exec ./internal/pidfile ./internal/state ./internal/svcconfig
+        working-directory: connect-plugin
