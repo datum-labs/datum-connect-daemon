@@ -125,6 +125,7 @@ Native Windows should follow the same shape (copy both `.exe`s onto `PATH`, `dat
 
 ## Troubleshooting
 
+- **`tunnel api start` returning `Error: ... context deadline exceeded`** doesn't necessarily mean the start failed — on a freshly-created tunnel (new listen key, connector being created for the first time) the daemon can take longer to respond than the CLI's own request timeout. Before assuming something's broken, run `tunnel api get <id>` or `tunnel api progress <id>` — if a hostname has been assigned and the proxy/connector steps are advancing, the start went through server-side even though the CLI gave up waiting on the response.
 - **DNS propagation** for freshly-created tunnel hostnames (`*.datumproxy.net`) can take a few minutes — don't assume a `curl: Could not resolve host` after 30 seconds means something's broken. It's also normal for the `connector_metadata_programmed` progress step to stay `unknown` even once the tunnel is serving real traffic correctly; that field isn't blocking.
 - **`--project` on `tunnel daemon start`** requires a reasonably current `datumctl connect` build — older checkouts had an env-var-override ordering bug that silently ignored the flag.
 - **WSL2:** a process backgrounded inside a single `wsl.exe -- bash -lc "..."` invocation dies when that invocation ends, even with `&`. Use `setsid nohup <cmd> < /dev/null > log 2>&1 & disown` for anything that needs to outlive one command.
