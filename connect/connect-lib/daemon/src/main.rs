@@ -211,6 +211,7 @@ async fn get_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value>
         "project_id": state.project_id,
         "portal_base_url": "https://cloud.datum.net",
         "log_tail_max_lines": state.log_tail_max_lines,
+        "device_name": connect_lib::friendly_device_name(),
     }))
 }
 
