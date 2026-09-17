@@ -211,6 +211,7 @@ async fn get_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value>
         "project_id": state.project_id,
         "portal_base_url": "https://cloud.datum.net",
         "log_tail_max_lines": state.log_tail_max_lines,
+        "device_name": connect_lib::friendly_device_name(),
     }))
 }
 
@@ -255,14 +256,88 @@ async fn get_tunnel(
     }
 }
 
+/// Adds an explicit yes/no on top of the raw step list, so callers (the CI
+/// action and, eventually, a Kubernetes controller's `Ready` condition) don't
+/// have to re-implement step-matching themselves the way
+/// `e2e-smoke-test.sh` historically did.
+#[derive(Serialize)]
+struct TunnelProgressWithStatus {
+    #[serde(flatten)]
+    progress: connect_lib::TunnelProgress,
+    ready: bool,
+    terminal_failure: bool,
+}
+
 async fn get_progress(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> ApiResult<connect_lib::TunnelProgress> {
+) -> ApiResult<TunnelProgressWithStatus> {
     match state.control.get_active_progress(&id).await {
-        Ok(Some(p)) => Ok(Json(p)),
+        Ok(Some(p)) => {
+            let ready = p.all_ready();
+            let terminal_failure = p.terminal_failure().is_some();
+            Ok(Json(TunnelProgressWithStatus { progress: p, ready, terminal_failure }))
+        }
         Ok(None) => Err(not_found(&id)),
         Err(e) => Err(err_response(e)),
+    }
+}
+
+#[cfg(test)]
+mod progress_status_tests {
+    use super::*;
+    use connect_lib::{ProgressStep, ProgressStepKind, StepStatus};
+
+    fn step(kind: ProgressStepKind, status: StepStatus, reason: Option<&str>) -> ProgressStep {
+        ProgressStep {
+            kind,
+            status,
+            reason: reason.map(str::to_string),
+            message: None,
+            resource: None,
+        }
+    }
+
+    /// `#[serde(flatten)]` on `progress` must keep `hostnames`/`steps` at the
+    /// top level alongside the new `ready`/`terminal_failure` fields, exactly
+    /// as documented in API-REFERENCE.md — not nested under a `"progress"` key.
+    #[test]
+    fn wire_shape_flattens_progress_alongside_status_fields() {
+        let progress = connect_lib::TunnelProgress {
+            hostnames: vec!["foo-bar-12345.datumproxy.net".to_string()],
+            steps: vec![step(ProgressStepKind::ProxyAccepted, StepStatus::Ready, None)],
+        };
+        let wrapped = TunnelProgressWithStatus {
+            ready: progress.all_ready(),
+            terminal_failure: progress.terminal_failure().is_some(),
+            progress,
+        };
+        let value = serde_json::to_value(&wrapped).unwrap();
+        assert!(value.get("progress").is_none(), "progress should be flattened, not nested");
+        assert!(value.get("hostnames").is_some());
+        assert!(value.get("steps").is_some());
+        assert_eq!(value["ready"], serde_json::json!(true));
+        assert_eq!(value["terminal_failure"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn terminal_failure_true_when_iroh_dns_owner_collision() {
+        let progress = connect_lib::TunnelProgress {
+            hostnames: vec![],
+            steps: vec![step(
+                ProgressStepKind::IrohDnsPublished,
+                StepStatus::Pending,
+                Some("DeferredToOwner"),
+            )],
+        };
+        let wrapped = TunnelProgressWithStatus {
+            ready: progress.all_ready(),
+            terminal_failure: progress.terminal_failure().is_some(),
+            progress,
+        };
+        let value = serde_json::to_value(&wrapped).unwrap();
+        assert_eq!(value["ready"], serde_json::json!(false));
+        assert_eq!(value["terminal_failure"], serde_json::json!(true));
     }
 }
 

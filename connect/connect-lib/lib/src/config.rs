@@ -46,9 +46,11 @@ pub struct Config {
     #[serde(default)]
     pub dns_origin: Option<String>,
 
-    /// Optional DNS resolver address for discovery lookups.
-    ///
-    /// Useful for local development (e.g. 127.0.0.1:53535).
+    /// Optional explicit DNS nameserver, applied regardless of
+    /// `discovery_mode` — covers relay hostname resolution and discovery
+    /// lookups alike. Useful for local development (e.g. 127.0.0.1:53535)
+    /// and as a workaround on hosts where iroh's default resolver can't
+    /// use the system's DNS config (e.g. 1.1.1.1:53).
     #[serde(default)]
     pub dns_resolver: Option<SocketAddr>,
 

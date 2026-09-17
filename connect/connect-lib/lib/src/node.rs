@@ -469,6 +469,20 @@ pub async fn build_endpoint_with_relay_mode(
     if let Some(addr) = common.ipv6_addr {
         builder = builder.bind_addr_v6(addr);
     }
+    // Applies regardless of discovery_mode — relay and discovery hostname
+    // resolution both go through this resolver. Previously only wired up
+    // for Dns/Hybrid mode, but the default n0des discovery path needs the
+    // same override: on some hosts (seen on Windows) iroh's default
+    // hickory-resolver auto-detected system config times out reaching
+    // relay hosts and the default discovery host, even though the OS's own
+    // resolver reaches them fine. Pointing at an explicit nameserver (e.g.
+    // 1.1.1.1) works around that.
+    if let Some(resolver_addr) = common.dns_resolver {
+        let resolver = DnsResolver::builder()
+            .with_nameserver(resolver_addr, DnsProtocol::Udp)
+            .build();
+        builder = builder.dns_resolver(resolver);
+    }
     match common.discovery_mode {
         crate::config::DiscoveryMode::Default => {}
         crate::config::DiscoveryMode::Dns | crate::config::DiscoveryMode::Hybrid => {
@@ -478,12 +492,6 @@ pub async fn build_endpoint_with_relay_mode(
                     "dns_origin is required when discovery_mode is set to dns or hybrid"
                 ),
             };
-            if let Some(resolver_addr) = common.dns_resolver {
-                let resolver = DnsResolver::builder()
-                    .with_nameserver(resolver_addr, DnsProtocol::Udp)
-                    .build();
-                builder = builder.dns_resolver(resolver);
-            }
             builder = builder.discovery(DnsDiscovery::builder(origin));
         }
     }

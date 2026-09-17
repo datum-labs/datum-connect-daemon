@@ -100,6 +100,15 @@
   .tunnel-item.active { background: var(--panel-2); border-left: 3px solid var(--accent); }
   .tunnel-item .label { font-weight: 600; }
   .tunnel-item .host { color: var(--text-dim); font-family: var(--mono); font-size: 12px; margin-top: 2px; }
+  .tunnel-item .meta { color: var(--text-dim); font-family: var(--mono); font-size: 11px; margin-top: 4px; }
+  .tunnel-filter-note {
+    padding: 8px 16px;
+    font-size: 11px;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+  }
+  .link-toggle { color: var(--accent); cursor: pointer; text-decoration: underline; }
+  .link-toggle:hover { opacity: 0.8; }
   .badge {
     display: inline-block;
     font-size: 10px;
@@ -251,7 +260,7 @@
 <div id="modal-root"></div>
 
 <script>
-const state = { token: localStorage.getItem('dc_token') || '', tunnels: [], selected: null, traffic: [], info: null, logSources: [], selectedLog: null, logLines: [], logSearch: '', peerData: null, selectedPeer: null };
+const state = { token: localStorage.getItem('dc_token') || '', tunnels: [], selected: null, traffic: [], info: null, logSources: [], selectedLog: null, logLines: [], logSearch: '', peerData: null, selectedPeer: null, showAllTunnels: false };
 
 function humanizeBytes(bytes) {
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -261,7 +270,7 @@ function humanizeBytes(bytes) {
   return size.toFixed(1) + ' ' + units[i];
 }
 
-fetch('/v1/info').then(r => r.json()).then(info => { state.info = info; renderLogsCaption(); }).catch(() => {});
+fetch('/v1/info').then(r => r.json()).then(info => { state.info = info; renderLogsCaption(); renderTunnelList(); }).catch(() => {});
 
 const $ = (sel) => document.querySelector(sel);
 const tunnelListEl = $('#tunnel-list');
@@ -344,15 +353,45 @@ function renderTunnelList() {
     tunnelListEl.innerHTML = '<div class="empty">No tunnels</div>';
     return;
   }
-  tunnelListEl.innerHTML = state.tunnels.map(t => `
+  // Default to this device's own tunnels — a shared project can accumulate
+  // tunnels from many machines (other laptops, cloud test boxes), and those
+  // are noise for "what's running here right now". connector_device is set
+  // server-side from the same friendly_device_name() this daemon reports at
+  // /v1/info, so an exact match is a reliable "created from this machine"
+  // signal without needing per-tunnel local state.
+  const deviceName = state.info && state.info.device_name;
+  const isLocal = t => deviceName && t.connector_device === deviceName;
+  const localTunnels = state.tunnels.filter(isLocal);
+  const shown = state.showAllTunnels ? state.tunnels : localTunnels;
+
+  const toggle = state.tunnels.length !== localTunnels.length
+    ? `<div class="tunnel-filter-note">
+         Showing ${shown.length} of ${state.tunnels.length} tunnels in project
+         · <span class="link-toggle" id="toggle-all-tunnels">${state.showAllTunnels ? 'show only this device' : 'show all'}</span>
+       </div>`
+    : '';
+
+  const list = !shown.length
+    ? '<div class="empty">No tunnels on this device</div>'
+    : shown.map(t => `
     <div class="tunnel-item ${state.selected === t.id ? 'active' : ''}" data-id="${t.id}">
       <div class="label">${escapeHtml(t.label)}</div>
       <div class="host">${(t.hostnames && t.hostnames[0]) ? copyableHost(t.hostnames[0]) : (t.endpoint ? copyableHost(t.endpoint) : '(no hostname yet)')}</div>
       <span class="badge ${t.enabled ? 'on' : 'off'}">${t.enabled ? 'ON' : 'OFF'}</span>
       ${t.connector_ready ? '<span class="badge on">connector ready</span>' : ''}
       ${t.enabled && isAgentActor(t.last_start_actor) ? '<span class="badge agent">🤖 started by agent</span>' : ''}
+      ${state.showAllTunnels && !isLocal(t) ? `<div class="meta">on ${escapeHtml(t.connector_device || 'unknown device')}</div>` : ''}
     </div>
   `).join('');
+
+  tunnelListEl.innerHTML = toggle + list;
+  const toggleEl = document.getElementById('toggle-all-tunnels');
+  if (toggleEl) {
+    toggleEl.addEventListener('click', () => {
+      state.showAllTunnels = !state.showAllTunnels;
+      renderTunnelList();
+    });
+  }
   tunnelListEl.querySelectorAll('.tunnel-item').forEach(el => {
     el.addEventListener('click', () => selectTunnel(el.dataset.id));
   });
