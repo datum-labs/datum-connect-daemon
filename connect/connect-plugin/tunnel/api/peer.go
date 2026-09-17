@@ -29,9 +29,12 @@ func newPeerAdvertiseCmd() *cobra.Command {
 		Use:   "advertise",
 		Short: "Advertise a local target for direct peer access — prints a ticket to hand to the other side",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			endpoint, _ := cmd.Flags().GetString("endpoint")
-			if endpoint == "" {
-				return fmt.Errorf("--endpoint is required")
+			origin, _ := cmd.Flags().GetString("origin")
+			if endpoint, _ := cmd.Flags().GetString("endpoint"); origin == "" && endpoint != "" {
+				origin = endpoint
+			}
+			if origin == "" {
+				return fmt.Errorf("--origin is required")
 			}
 			label, _ := cmd.Flags().GetString("label")
 			var labelPtr *string
@@ -39,7 +42,7 @@ func newPeerAdvertiseCmd() *cobra.Command {
 				labelPtr = &label
 			}
 			if err := call(cmd, http.MethodPost, "/v1/peers/advertise", map[string]any{
-				"endpoint": endpoint,
+				"endpoint": origin,
 				"label":    labelPtr,
 			}); err != nil {
 				return err
@@ -48,7 +51,9 @@ func newPeerAdvertiseCmd() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().String("origin", "", "Local address to expose, host:port (required)")
 	cmd.Flags().String("endpoint", "", "Local address to expose, host:port (required)")
+	cmd.Flags().MarkDeprecated("endpoint", "use --origin instead")
 	cmd.Flags().String("label", "", "Display name for this advertisement")
 	return cmd
 }

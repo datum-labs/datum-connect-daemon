@@ -204,21 +204,26 @@ func newCreateCmd() *cobra.Command {
 		Short: "Create a tunnel profile (does not start it — see 'tunnel api start')",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			label, _ := cmd.Flags().GetString("label")
-			endpoint, _ := cmd.Flags().GetString("endpoint")
-			if endpoint == "" {
-				return fmt.Errorf("--endpoint is required")
+			origin, _ := cmd.Flags().GetString("origin")
+			if endpoint, _ := cmd.Flags().GetString("endpoint"); origin == "" && endpoint != "" {
+				origin = endpoint
+			}
+			if origin == "" {
+				return fmt.Errorf("--origin is required")
 			}
 			if label == "" {
-				label = endpoint
+				label = origin
 			}
 			return call(cmd, http.MethodPost, "/v1/tunnels", map[string]string{
 				"label":    label,
-				"endpoint": endpoint,
+				"endpoint": origin,
 			})
 		},
 	}
-	cmd.Flags().String("label", "", "Display name for the tunnel (defaults to --endpoint)")
+	cmd.Flags().String("label", "", "Display name for the tunnel (defaults to --origin)")
+	cmd.Flags().String("origin", "", "Local address to expose (host:port, required)")
 	cmd.Flags().String("endpoint", "", "Local address to expose (host:port, required)")
+	cmd.Flags().MarkDeprecated("endpoint", "use --origin instead")
 	return cmd
 }
 
