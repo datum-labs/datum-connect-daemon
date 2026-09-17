@@ -1,0 +1,27 @@
+# Local machine config — never commit, contains a local SDK path
+local.properties
+
+# Build output
+.gradle/
+build/
+app/build/
+*.apk
+*.aab
+
+# Embedded daemon/datumctl binaries — build these yourself, see README
+app/src/main/jniLibs/
+
+# Service-account credentials — mint your own, never commit
+app/src/main/assets/sa-creds.json
+
+# IDE
+.idea/
+*.iml
+
+# Debug artifacts from manual on-device testing
+*.png
+*.jpg
+window_dump*.xml
+dialog_dump.xml
+*.log
+tmp/
