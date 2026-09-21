@@ -1,4 +1,5 @@
 target/
+__pycache__/
 *.log
 *.so
 *.exe
@@ -6,3 +7,10 @@ datumctl-connect
 fake-datum-connect
 fake-datum-connect-test
 .drewr-*/
+.daytona-api-key
+datum-connect-daemon
+deploy/daytona-poc/.home-connect/
+deploy/daytona-poc/sandbox_data_log.jsonl
+demos/tunnel-demo-daytona/.demo-ssh/
+demos/tunnel-demo-daytona/.demo-state.json
+demos/tunnel-demo-daytona/sandbox/web/
