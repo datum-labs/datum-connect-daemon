@@ -46,6 +46,7 @@ A headless daemon that puts Datum Cloud tunnels — and direct peer-to-peer tunn
 - **`connect/connect-plugin`** (Go) — the `datumctl connect` plugin: process supervision, PID tracking, and the `tunnel api ...` / `tunnel daemon ...` command surface.
 - **`docker/`** — a small demo web app (a property-viewing booking system) used purely as "something real to point a tunnel at." Not part of the daemon itself — see [docker/README.md](./docker/README.md).
 - **`deploy/`** — a systemd unit for running the daemon as a Linux service, and a proof-of-concept for running it inside a [Daytona](https://daytona.io) sandbox for peer-only, Datum-agnostic use.
+- **`demos/`** — live demos of the zero-inbound-firewall story, from a hand-adaptable template to two fully scripted Daytona sandboxes — see [demos/README.md](./demos/README.md).
 
 ## Quickstart
 
