@@ -1,0 +1,98 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Datum Connect — Zero-Trust Demo</title>
+<!--
+  Runnable Daytona version of ../../ec2-zero-trust-ssh/index.html — same
+  subway-map diagram, hostnames filled in live by setup_demo.py after the
+  two Cloud tunnels exist (a real instance of the "prove real administrative
+  access" step from the static demo's own README: live-edit the site over
+  the P2P/SSH connection, no restart needed since it's a plain static file).
+-->
+<style>
+  body { font-family: system-ui, sans-serif; background: #0b1220; color: #e6edf3; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; min-height: 100vh; margin: 0; gap: 2.5rem; padding: 2.5rem 1rem 3.5rem; box-sizing: border-box; }
+  .card { text-align: center; padding: 2rem 3rem; border: 1px solid #30363d; border-radius: 12px; background: #161b22; }
+  h1 { color: #58a6ff; }
+  code { background: #0d1117; padding: 2px 8px; border-radius: 4px; }
+
+  .map-section { width: 100%; max-width: 900px; }
+  .map-section h2 { text-align: center; font-size: 1rem; font-weight: 600; color: #8b949e; text-transform: uppercase; letter-spacing: 0.04em; margin: 0 0 1rem; }
+  .map-card { border: 1px solid #30363d; border-radius: 12px; background: #161b22; padding: 1.5rem 1rem 1rem; }
+  .map-card svg { width: 100%; height: auto; display: block; }
+  .map-legend { display: flex; flex-wrap: wrap; justify-content: center; gap: 1.5rem; margin-top: 1rem; font-size: 0.8rem; color: #c9d1d9; }
+  .map-legend .swatch { display: inline-flex; align-items: center; gap: 0.5rem; }
+  .map-legend .line { width: 22px; height: 4px; border-radius: 2px; display: inline-block; }
+  .station-label { fill: #e6edf3; font-size: 13px; font-family: system-ui, sans-serif; }
+  .station-caption { fill: #8b949e; font-size: 10.5px; font-family: system-ui, sans-serif; }
+  .zone-label { fill: #8b949e; font-size: 11px; font-family: system-ui, sans-serif; text-transform: uppercase; letter-spacing: 0.04em; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Running on a Daytona sandbox</h1>
+    <p>This page is served by a plain local web server on the demo sandbox,</p>
+    <p>reached through a real Datum Connect tunnel — not a public IP.</p>
+    <p><code id="ts"></code></p>
+  </div>
+
+  <div class="map-section">
+    <h2>How this demo is wired</h2>
+    <div class="map-card">
+      <svg viewBox="0 0 900 400" preserveAspectRatio="xMidYMid meet">
+        <!-- Sandbox zone -->
+        <rect x="560" y="30" width="300" height="340" rx="14" fill="none" stroke="#30363d" stroke-width="2" stroke-dasharray="6 5"/>
+        <text x="710" y="20" text-anchor="middle" class="zone-label">Daytona sandbox — zero inbound firewall rules</text>
+
+        <!-- Proxy line (blue): Internet -> Datum Cloud Proxy -> Demo Site / Dashboard -->
+        <polyline points="90,300 330,300" stroke="#58a6ff" stroke-width="5" fill="none" stroke-linecap="round"/>
+        <polyline points="330,300 620,220" stroke="#58a6ff" stroke-width="5" fill="none" stroke-linecap="round"/>
+        <polyline points="330,300 620,340" stroke="#58a6ff" stroke-width="5" fill="none" stroke-linecap="round"/>
+
+        <!-- P2P line (green): My Laptop -> SSH, straight through, no interchange -->
+        <polyline points="90,100 620,100" stroke="#3fb950" stroke-width="5" fill="none" stroke-linecap="round"/>
+
+        <!-- Origin: Internet -->
+        <circle cx="90" cy="300" r="9" fill="#0b1220" stroke="#58a6ff" stroke-width="4"/>
+        <text x="90" y="330" text-anchor="middle" class="station-label">Internet</text>
+        <text x="90" y="345" text-anchor="middle" class="station-caption">public visitors</text>
+
+        <!-- Origin: My Laptop -->
+        <circle cx="90" cy="100" r="9" fill="#0b1220" stroke="#3fb950" stroke-width="4"/>
+        <text x="90" y="80" text-anchor="middle" class="station-label">My Laptop</text>
+        <text x="90" y="65" text-anchor="middle" class="station-caption">operator / admin</text>
+
+        <!-- Interchange: Datum Cloud Proxy (ring = interchange stop) -->
+        <circle cx="330" cy="300" r="11" fill="#161b22" stroke="#58a6ff" stroke-width="4"/>
+        <circle cx="330" cy="300" r="5" fill="#58a6ff"/>
+        <text x="330" y="330" text-anchor="middle" class="station-label">Datum Cloud Proxy</text>
+        <text x="330" y="345" text-anchor="middle" class="station-caption">*.datumproxy.net — single public gate</text>
+
+        <!-- Direct label on P2P line -->
+        <text x="330" y="90" text-anchor="middle" class="station-caption" fill="#3fb950">direct — no gate, no proxy</text>
+
+        <!-- Station: SSH :22 -->
+        <circle cx="620" cy="100" r="9" fill="#0b1220" stroke="#3fb950" stroke-width="4"/>
+        <text x="645" y="95" text-anchor="start" class="station-label">SSH :22</text>
+        <text x="645" y="112" text-anchor="start" class="station-caption">admin access, P2P only</text>
+
+        <!-- Station: Demo Site -->
+        <circle cx="620" cy="220" r="9" fill="#0b1220" stroke="#58a6ff" stroke-width="4"/>
+        <text x="645" y="215" text-anchor="start" class="station-label">Demo Site :8899</text>
+        <text x="645" y="232" text-anchor="start" class="station-caption" id="site-host">SITE_HOSTNAME_PLACEHOLDER</text>
+
+        <!-- Station: Dashboard -->
+        <circle cx="620" cy="340" r="9" fill="#0b1220" stroke="#58a6ff" stroke-width="4"/>
+        <text x="645" y="335" text-anchor="start" class="station-label">Dashboard :47780</text>
+        <text x="645" y="352" text-anchor="start" class="station-caption" id="dashboard-host">DASHBOARD_HOSTNAME_PLACEHOLDER</text>
+      </svg>
+      <div class="map-legend">
+        <span class="swatch"><span class="line" style="background:#3fb950"></span> P2P tunnel — direct, hole-punched, bypasses the proxy and the firewall entirely</span>
+        <span class="swatch"><span class="line" style="background:#58a6ff"></span> Proxy tunnel — via Datum Cloud's own proxy fleet</span>
+      </div>
+    </div>
+  </div>
+
+  <script>document.getElementById('ts').textContent = new Date().toString();</script>
+</body>
+</html>

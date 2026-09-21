@@ -14,3 +14,8 @@ deploy/daytona-poc/sandbox_data_log.jsonl
 demos/tunnel-demo-daytona/.demo-ssh/
 demos/tunnel-demo-daytona/.demo-state.json
 demos/tunnel-demo-daytona/sandbox/web/
+demos/tunnel-demo-daytona/sandbox/fake-credentials-helper.sh
+demos/ec2-zero-trust-ssh-daytona/.demo-ssh/
+demos/ec2-zero-trust-ssh-daytona/.demo-state.json
+demos/ec2-zero-trust-ssh-daytona/sandbox/web/
+demos/ec2-zero-trust-ssh-daytona/sandbox/fake-credentials-helper.sh
