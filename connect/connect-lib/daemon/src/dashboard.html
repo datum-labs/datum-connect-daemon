@@ -350,17 +350,24 @@ function bindClicks(root, selector, handler) {
   root.querySelectorAll(selector).forEach(el => el.addEventListener('click', () => handler(el)));
 }
 
-// Tunnels shown by default are just this device's own — connector_device is
-// set server-side from the same friendly_device_name() this daemon reports
-// at /v1/info. Kept as its own function (rather than inlined only in
-// renderTunnelList) so the network map can show the same default scope
-// instead of silently displaying every tunnel in the project regardless of
-// which device created it.
-function visibleTunnels() {
+// Tunnels created from this same device — connector_device is set
+// server-side from the same friendly_device_name() this daemon reports at
+// /v1/info. The network map always uses this (never visibleTunnels()
+// below) — it's meant to be this daemon's own view of what it's
+// forwarding, and showing every device's project-wide tunnels there would
+// misrepresent that, regardless of what the separate Tunnels-panel toggle
+// is set to.
+function localTunnels() {
   const deviceName = state.info && state.info.device_name;
-  const isLocal = t => deviceName && t.connector_device === deviceName;
-  const localTunnels = state.tunnels.filter(isLocal);
-  return state.showAllTunnels ? state.tunnels : localTunnels;
+  return state.tunnels.filter(t => deviceName && t.connector_device === deviceName);
+}
+
+// Tunnels shown in the Tunnels list by default are just this device's own;
+// state.showAllTunnels (toggled there) opts back into every tunnel in the
+// project. Only the Tunnels list panel uses this — the network map
+// intentionally does not, see localTunnels() above.
+function visibleTunnels() {
+  return state.showAllTunnels ? state.tunnels : localTunnels();
 }
 
 // Wraps a hostname / IP:port value with a small inline copy button. Used
@@ -656,7 +663,7 @@ function mapDetectChange(key, color) {
 }
 
 function renderNetworkMap() {
-  const tunnels = visibleTunnels();
+  const tunnels = localTunnels();
   const peers = state.peerData;
   const ads = (peers && peers.advertisements) || [];
   const conns = (peers && peers.connections) || [];
