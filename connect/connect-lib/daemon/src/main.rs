@@ -133,6 +133,45 @@ async fn remove_inspector_target(base: &std::path::Path, id: &str) {
     let _ = tokio::fs::remove_file(inspector_target_path(base, id)).await;
 }
 
+/// Free-text note a human attaches to a tunnel via the CLI (`tunnel api note
+/// set/clear`) so it's still obvious what a tunnel is for once there are
+/// 10+ of them running. Deliberately not part of `TunnelSummary`/`state.yml`
+/// — every field there round-trips through Datum Cloud's own
+/// `HTTPProxy`/`Connector` CRDs, and a note has nothing to do with that
+/// resource. Stored the same way as `daemon_inspector_targets/<id>.txt`
+/// above: one small flat file per tunnel id, no JSON wrapper needed for a
+/// single free-text field.
+const NOTE_MAX_BYTES: usize = 2000;
+
+fn note_dir(base: &std::path::Path) -> std::path::PathBuf {
+    base.join("daemon_notes")
+}
+
+fn note_path(base: &std::path::Path, id: &str) -> std::path::PathBuf {
+    note_dir(base).join(format!("{id}.txt"))
+}
+
+async fn save_note(base: &std::path::Path, id: &str, note: &str) -> std::io::Result<()> {
+    if note.is_empty() {
+        return remove_note(base, id).await.map(|_| ());
+    }
+    let dir = note_dir(base);
+    tokio::fs::create_dir_all(&dir).await?;
+    tokio::fs::write(note_path(base, id), note).await
+}
+
+async fn load_note(base: &std::path::Path, id: &str) -> Option<String> {
+    tokio::fs::read_to_string(note_path(base, id)).await.ok()
+}
+
+async fn remove_note(base: &std::path::Path, id: &str) -> std::io::Result<()> {
+    match tokio::fs::remove_file(note_path(base, id)).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "datum-connect-daemon", about = "Local HTTP daemon for Datum Connect tunnels (plugin mode)")]
 struct Args {
@@ -229,11 +268,14 @@ struct TunnelSummaryWithActor {
     #[serde(flatten)]
     tunnel: connect_lib::TunnelSummary,
     last_start_actor: Option<String>,
+    /// See `save_note`/`load_note` — CLI-only, never set from the dashboard.
+    note: Option<String>,
 }
 
 async fn with_last_start_actor(state: &AppState, tunnel: connect_lib::TunnelSummary) -> TunnelSummaryWithActor {
     let last_start_actor = auth::last_actor_for_event(&state.connect_dir, &tunnel.id, "start").await;
-    TunnelSummaryWithActor { tunnel, last_start_actor }
+    let note = load_note(&state.connect_dir, &tunnel.id).await;
+    TunnelSummaryWithActor { tunnel, last_start_actor, note }
 }
 
 async fn list_tunnels(State(state): State<Arc<AppState>>) -> ApiResult<Vec<TunnelSummaryWithActor>> {
@@ -539,10 +581,37 @@ async fn delete_tunnel(
     }
     state.inspectors.lock().await.remove(&id); // dropped here, aborting its task
     remove_inspector_target(&state.connect_dir, &id).await;
+    if let Err(e) = remove_note(&state.connect_dir, &id).await {
+        tracing::warn!(tunnel = %id, "failed to remove note file on delete: {e:#}");
+    }
     auth::delete_tokens_for_tunnel(&state.connect_dir, &id).await;
     auth::append_audit(&state.connect_dir, &state.audit_lock, "delete", &id, "setup").await;
 
     Ok(Json(outcome))
+}
+
+#[derive(Deserialize)]
+struct SetNoteRequest {
+    note: String,
+}
+
+/// CLI-only (see `note` field's doc comment on `TunnelSummaryWithActor`) —
+/// posting an empty string clears the note rather than needing a separate
+/// DELETE route. 404s if the tunnel itself doesn't exist, same check
+/// `revoke`/other id-scoped mutations already use elsewhere in this file.
+async fn set_tunnel_note(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<SetNoteRequest>,
+) -> ApiResult<serde_json::Value> {
+    if state.control.get_active(&id).await.map_err(err_response)?.is_none() {
+        return Err(not_found(&id));
+    }
+    if req.note.len() > NOTE_MAX_BYTES {
+        return Err(err_response(format!("note too long ({} bytes, max {NOTE_MAX_BYTES})", req.note.len())));
+    }
+    save_note(&state.connect_dir, &id, &req.note).await.map_err(err_response)?;
+    Ok(Json(json!({ "id": id, "note": req.note })))
 }
 
 /// Releases a tunnel's `busy` reservation when dropped — covers every exit
@@ -984,6 +1053,7 @@ async fn run() -> n0_error::Result<()> {
     let setup_only = Router::new()
         .route("/v1/tunnels", post(create_tunnel))
         .route("/v1/tunnels/:id", axum::routing::delete(delete_tunnel))
+        .route("/v1/tunnels/:id/note", post(set_tunnel_note))
         .route("/v1/tunnels/:id/tokens", get(auth::list_tokens).post(auth::create_token))
         .route("/v1/tunnels/:id/tokens/:token_id", axum::routing::delete(auth::revoke_token))
         .route("/v1/viewer-token", get(auth::get_viewer_token_status).post(auth::create_viewer_token).delete(auth::revoke_viewer_token))
