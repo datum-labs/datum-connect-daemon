@@ -146,6 +146,10 @@
     text-decoration: none;
     margin-bottom: 16px;
   }
+  .note-box {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px 14px; margin-bottom: 16px; font-size: 13px; white-space: pre-wrap;
+  }
   .portal-link:hover { text-decoration: underline; }
   .step {
     background: var(--panel);
@@ -450,6 +454,7 @@ function renderTunnelList() {
       ${t.connector_ready ? '<span class="badge on">connector ready</span>' : ''}
       ${t.enabled && isAgentActor(t.last_start_actor) ? '<span class="badge agent">🤖 started by agent</span>' : ''}
       ${state.showAllTunnels && !isLocal(t) ? `<div class="meta">on ${escapeHtml(t.connector_device || 'unknown device')}</div>` : ''}
+      ${t.note ? `<div class="meta">📝 ${escapeHtml(t.note)}</div>` : ''}
     </div>
   `).join('');
 
@@ -689,7 +694,11 @@ function renderNetworkMap() {
     const color = t.enabled ? 'accent' : 'dim';
     return {
       id: t.id, label: t.label,
-      caption: (t.hostnames && t.hostnames[0]) || t.endpoint || '(no hostname yet)',
+      // The note (when set) says *why* this tunnel exists -- with 10+
+      // tunnels running, that's more useful on the map than the hostname,
+      // which is just an address. Falls back to the hostname/endpoint when
+      // no note has been set via the CLI.
+      caption: t.note || (t.hostnames && t.hostnames[0]) || t.endpoint || '(no hostname yet)',
       color, justChanged: mapDetectChange('tunnel:' + t.id, color),
     };
   });
@@ -1065,6 +1074,7 @@ function renderDetail(tunnel, progress, traffic, metrics) {
     <div class="detail">
       <h2>${escapeHtml(tunnel ? tunnel.label : state.selected)}</h2>
       <div class="sub">${copyableHost((progress.hostnames || [])[0] || '')}</div>
+      ${tunnel && tunnel.note ? `<div class="note-box">📝 ${escapeHtml(tunnel.note)}</div>` : ''}
       ${startedByHtml}
       ${portalLinkHtml}
       <div class="steps">${stepsHtml}</div>
