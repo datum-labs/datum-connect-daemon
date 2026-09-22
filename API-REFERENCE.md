@@ -31,7 +31,7 @@ Other status codes used throughout: **404** (tunnel/token/exchange not found), *
 ## Tunnels
 
 ### `GET /v1/tunnels` — setup or viewer
-List every tunnel profile in the daemon's project. Returns `TunnelSummary[]`, each with an extra `last_start_actor` field — the credential that last started this tunnel (`"setup"`, `"operate:<token_id>"`, or `null` if it's never been started) — so an agent-started tunnel is always distinguishable from a human-started one, not just "running: true".
+List every tunnel profile in the daemon's project. Returns `TunnelSummary[]`, each with two extra fields: `last_start_actor` — the credential that last started this tunnel (`"setup"`, `"operate:<token_id>"`, or `null` if it's never been started) — so an agent-started tunnel is always distinguishable from a human-started one, not just "running: true"; and `note` — a free-text note set via the CLI (see `POST /v1/tunnels/:id/note` below), or `null` if none has been set.
 
 ### `POST /v1/tunnels` — setup only
 Create a tunnel profile. Does **not** start it.
@@ -74,6 +74,15 @@ Turns the tunnel on: mints/rewires its listen key if needed, starts the heartbea
 
 ### `POST /v1/tunnels/:id/stop` — setup or operate (scoped)
 Turns the tunnel off. Returns the current `TunnelSummary`. Idempotent if already stopped. Also invoked internally by the auto-expiry sweep (see below) — that path logs as `auto_expired`, not `stop`, in the audit log.
+
+### `POST /v1/tunnels/:id/note` — setup only
+Sets (or clears, with an empty string) a free-text note on a tunnel — CLI-only (`tunnel api note set/clear`), so it's still obvious what a tunnel is for once there are many running. Shown read-only in the dashboard and returned by `GET /v1/tunnels`/`GET /v1/tunnels/:id`; there's no dashboard input for it. Capped at 2000 bytes.
+```json
+// request
+{ "note": "spun up to test the notes feature" }
+// response
+{ "id": "tunnel-z9p5k", "note": "spun up to test the notes feature" }
+```
 
 ## Traffic (L7 inspector) — setup or viewer for all of these
 
