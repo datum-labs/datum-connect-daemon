@@ -48,6 +48,21 @@ go build -o datumctl-connect.exe .
 
 If `cargo build` fails with a linker error on Windows, the MSVC Build Tools the `stable-x86_64-pc-windows-msvc` toolchain needs aren't installed — see Prerequisites above.
 
+### Dashboard development
+
+The browser dashboard is a React app built on [`@datum-cloud/datum-ui`](https://github.com/datum-cloud/datum-ui), in `connect/connect-lib/daemon/dashboard/`. Vite builds it into a single self-contained `dist/index.html` (JS, CSS and fonts inlined), which the daemon embeds with `include_str!`. That file is committed, so the `cargo build` above needs no JavaScript tooling.
+
+To change the dashboard you need [Bun](https://bun.sh):
+
+```bash
+cd connect
+task dev:dashboard     # Vite dev server; proxies /v1 to a daemon already running on :47780
+task build:dashboard   # rebuild dist/index.html; commit it with your change
+task check:dashboard   # typecheck + fail if the committed dist/ is stale (what CI runs)
+```
+
+Rebuild the daemon after `build:dashboard` to pick up the new bundle.
+
 ## Auth
 
 The daemon requires a working Datum Cloud credentials helper to start at all, even for peer-to-peer tunnels that never touch Datum Cloud — this is a known limitation (see [README.md](./README.md#status)), not something you can configure around today.

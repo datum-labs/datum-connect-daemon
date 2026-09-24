@@ -6,6 +6,7 @@ on:
       - 'connect-plugin/**/*.go'
       - 'connect-plugin/go.mod'
       - 'connect-plugin/go.sum'
+      - 'connect-lib/daemon/dashboard/**'
 
 jobs:
   testing:
@@ -26,3 +27,22 @@ jobs:
       - name: Test (known-good packages only)
         run: go test -timeout 5m ./internal/daemon ./internal/env ./internal/exec ./internal/pidfile ./internal/state ./internal/svcconfig
         working-directory: connect-plugin
+
+  dashboard:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: connect-lib/daemon/dashboard
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+      - name: Install
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        run: bun run typecheck
+      - name: Build
+        run: bun run build
+      - name: Committed dist/ is up to date
+        run: git diff --exit-code -- dist/ || (echo "::error::dashboard/dist is stale — run 'task build:dashboard' and commit the result" && exit 1)

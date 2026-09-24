@@ -109,6 +109,8 @@ struct AppState {
     /// Operator-configurable hard cap on `/v1/logs/:name/tail` — see
     /// `Args::log_tail_max_lines`.
     log_tail_max_lines: usize,
+    /// When this daemon process started, for the dashboard's uptime.
+    started_at_unix_ms: u128,
 }
 
 fn inspector_target_dir(base: &std::path::Path) -> std::path::PathBuf {
@@ -195,8 +197,33 @@ async fn resolve_listen_key(
     }
 }
 
+/// Human-readable OS details for the dashboard's Device page — e.g.
+/// "Mac OS" / "15.5.0", or "Ubuntu" / "24.04" / "noble". Detecting them
+/// shells out on some platforms (`sw_vers` on macOS), so it's done once
+/// rather than per `/v1/info` request.
+struct OsDetails {
+    name: String,
+    version: String,
+    codename: Option<String>,
+    edition: Option<String>,
+}
+
+static OS_INFO: std::sync::LazyLock<OsDetails> = std::sync::LazyLock::new(|| {
+    let info = os_info::get();
+    OsDetails {
+        name: info.os_type().to_string(),
+        version: info.version().to_string(),
+        codename: info.codename().map(str::to_string),
+        edition: info.edition().map(str::to_string),
+    }
+});
+
+/// The dashboard is a React + datum-ui app under `daemon/dashboard/`, built
+/// by Vite into one self-contained file (JS, CSS and fonts inlined). The
+/// built file is committed so building this crate never needs Node/Bun —
+/// rebuild it with `task build:dashboard` after changing the dashboard.
 async fn dashboard_page() -> axum::response::Html<&'static str> {
-    axum::response::Html(include_str!("dashboard.html"))
+    axum::response::Html(include_str!("../dashboard/dist/index.html"))
 }
 
 /// Non-sensitive daemon metadata the dashboard needs before a token is even
@@ -206,12 +233,27 @@ async fn dashboard_page() -> axum::response::Html<&'static str> {
 /// the project id or portal URL grants no capability by itself — every
 /// real action still goes through the normal auth gate — so this is
 /// unauthenticated, same as the dashboard shell itself.
+///
+/// The device/daemon fields feed the dashboard's Device page. Keep this
+/// endpoint to facts that are harmless to any local process: nothing
+/// path-like (the connect dir embeds the username), no relay config, no
+/// token state — those belong behind the auth gate if they're ever needed.
 async fn get_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(json!({
         "project_id": state.project_id,
         "portal_base_url": "https://cloud.datum.net",
         "log_tail_max_lines": state.log_tail_max_lines,
         "device_name": connect_lib::friendly_device_name(),
+        "hostname": gethostname::gethostname().to_string_lossy(),
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "os_name": OS_INFO.name,
+        "os_version": OS_INFO.version,
+        "os_codename": OS_INFO.codename,
+        "os_edition": OS_INFO.edition,
+        "daemon_version": env!("CARGO_PKG_VERSION"),
+        "started_at_unix_ms": state.started_at_unix_ms,
+        "max_tunnel_hours": state.max_tunnel_runtime.as_secs() / 3600,
     }))
 }
 
@@ -838,6 +880,10 @@ async fn run() -> n0_error::Result<()> {
         peer: peer_state,
         log_sources,
         log_tail_max_lines: args.log_tail_max_lines,
+        started_at_unix_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
     });
 
     // Auto-register the daemon's own log file as a built-in tailable source

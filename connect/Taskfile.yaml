@@ -16,6 +16,8 @@ vars:
     sh: git rev-parse --short HEAD
   GO_LDFLAGS: -X main.version=v0.1.0+{{.GIT_COMMIT}}
 
+  DASHBOARD_DIR: '{{.ROOT_DIR}}/{{.RUST_PROJECT}}/daemon/dashboard'
+
   CARGO_TARGET_DIR: '{{.ROOT_DIR}}/{{.RUST_PROJECT}}/target'
   CARGO_BUILD_FLAGS: -p {{.RUST_BINARY}}
   RELEASE_FLAGS: --release
@@ -64,6 +66,31 @@ tasks:
     cmds:
       - cargo build {{.CARGO_BUILD_FLAGS}} {{.RELEASE_FLAGS}}
     dir: '{{.ROOT_DIR}}/{{.RUST_PROJECT}}'
+
+  # The daemon embeds dashboard/dist/index.html via include_str!, and that
+  # file is committed — rebuild and commit it after changing the dashboard.
+  build:dashboard:
+    desc: "Build the daemon dashboard (React + datum-ui) into dist/index.html"
+    cmds:
+      - bun install --frozen-lockfile
+      - bun run build
+    dir: '{{.DASHBOARD_DIR}}'
+
+  dev:dashboard:
+    desc: "Run the dashboard dev server, proxying /v1 to a daemon on :47780"
+    cmds:
+      - bun install --frozen-lockfile
+      - bun run dev
+    dir: '{{.DASHBOARD_DIR}}'
+
+  check:dashboard:
+    desc: "Typecheck the dashboard and verify the committed dist/ is up to date"
+    cmds:
+      - bun install --frozen-lockfile
+      - bun run typecheck
+      - bun run build
+      - git diff --exit-code -- dist/
+    dir: '{{.DASHBOARD_DIR}}'
 
   # ════════════════════════════════════════════════════════════════════════
   #  Install

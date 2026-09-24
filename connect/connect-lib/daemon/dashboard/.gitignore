@@ -1,0 +1,3 @@
+node_modules/
+# dist/ is intentionally committed — the daemon embeds dist/index.html via
+# include_str!, so building the Rust crate never needs Node/Bun.
