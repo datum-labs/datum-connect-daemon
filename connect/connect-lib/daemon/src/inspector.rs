@@ -188,6 +188,48 @@ fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Headers that describe *this* hop rather than the origin's payload, and so
+/// must not be copied onto the response the inspector emits. `content-length`
+/// and `transfer-encoding` are excluded because hyper frames the teed body
+/// itself — copying the origin's would risk a duplicate or a contradictory
+/// one; the rest carry per-connection semantics that stop at this hop.
+const HOP_BY_HOP_HEADERS: &[&str] = &[
+    "connection",
+    "content-length",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Copies the origin's response headers onto the response this hop emits,
+/// minus the hop-by-hop set.
+///
+/// Without this the inspector silently drops every header the origin sent,
+/// leaving only what hyper synthesises (`content-length`, `date`). That is
+/// far more damaging than it first looks: a `302` arrives with no `Location`
+/// and so does not redirect, and a JavaScript bundle arrives with no
+/// `Content-Type`, which `import()` refuses outright because module loads
+/// require a JavaScript MIME type and cannot fall back to sniffing.
+///
+/// Uses `append` rather than `insert` so headers that legitimately repeat —
+/// `set-cookie` above all — survive intact instead of collapsing to one.
+///
+/// Note these are the *unredacted* values: redaction in [`header_pairs`]
+/// exists to keep secrets out of the captured/displayable copy, and must
+/// never alter what the caller actually receives.
+fn copy_origin_headers(dst: &mut HeaderMap, src: &HeaderMap) {
+    for (name, value) in src.iter() {
+        if HOP_BY_HOP_HEADERS.contains(&name.as_str()) {
+            continue;
+        }
+        dst.append(name.clone(), value.clone());
+    }
+}
+
 fn new_id() -> String {
     use rand::Rng;
     let n: u64 = rand::rng().random();
@@ -288,6 +330,9 @@ async fn proxy_handler(
 
     let status = upstream.status();
     let resp_headers = header_pairs(upstream.headers());
+    // Cloned before `into_body()` consumes `upstream`, and kept unredacted:
+    // this is what the caller actually receives, not the captured copy.
+    let origin_headers = upstream.headers().clone();
     let resp_sink = Arc::new(Mutex::new(CaptureSink::new()));
     let (resp_done_tx, resp_done_rx) = oneshot::channel();
     let tee_resp_body =
@@ -295,6 +340,7 @@ async fn proxy_handler(
 
     let mut out_resp = Response::new(Body::new(tee_resp_body));
     *out_resp.status_mut() = status;
+    copy_origin_headers(out_resp.headers_mut(), &origin_headers);
 
     // Record once BOTH the request body and the response body have
     // genuinely finished streaming (each signaled by its own TeeBody's
@@ -466,6 +512,32 @@ mod tests {
         assert_eq!(get("x-request-id"), Some("abc123"));
     }
 
+    #[test]
+    fn copy_origin_headers_keeps_payload_headers_and_drops_hop_by_hop() {
+        let mut src = HeaderMap::new();
+        src.insert(axum::http::header::CONTENT_TYPE, "text/javascript".parse().unwrap());
+        src.insert(axum::http::header::LOCATION, "/onboarding.html".parse().unwrap());
+        src.insert(axum::http::header::CONTENT_LENGTH, "1234".parse().unwrap());
+        src.insert(axum::http::header::CONNECTION, "keep-alive".parse().unwrap());
+        src.insert("transfer-encoding", "chunked".parse().unwrap());
+        src.append(axum::http::header::SET_COOKIE, "a=1".parse().unwrap());
+        src.append(axum::http::header::SET_COOKIE, "b=2".parse().unwrap());
+
+        let mut dst = HeaderMap::new();
+        copy_origin_headers(&mut dst, &src);
+
+        assert_eq!(dst.get("content-type").unwrap(), "text/javascript");
+        assert_eq!(dst.get("location").unwrap(), "/onboarding.html");
+        assert!(dst.get("content-length").is_none(), "hyper frames the teed body itself");
+        assert!(dst.get("connection").is_none());
+        assert!(dst.get("transfer-encoding").is_none());
+
+        // Repeating headers must not collapse — two Set-Cookie headers in,
+        // two out, or a login flow silently loses a cookie.
+        let cookies: Vec<_> = dst.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies.len(), 2);
+    }
+
     /// Real end-to-end proof, not just the pure-function unit test above:
     /// a genuine secret header sent through the actual inspector proxy path
     /// (1) never appears in what gets captured/would be shown to a viewer,
@@ -532,6 +604,58 @@ mod tests {
             auth_header,
             Some("[redacted]"),
             "the captured/displayable copy must never contain the real secret"
+        );
+    }
+
+    /// The pure-function test above proves the copier; this proves the copier
+    /// is actually wired into the response path — the bug it fixes was
+    /// precisely that it wasn't, so a unit test alone would have passed
+    /// against the broken build.
+    #[tokio::test]
+    async fn origin_response_headers_survive_the_inspector_hop() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        tokio::task::spawn_blocking(move || {
+            let listener = std::net::TcpListener::from(target_listener.into_std().unwrap());
+            listener.set_nonblocking(false).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).unwrap();
+            let body = b"console.log(1)";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nETag: \"abc\"\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+        });
+
+        let real_target: Uri = format!("http://{target_addr}").parse().unwrap();
+        let handle = start(real_target).await.expect("inspector should start");
+        let inspector_addr = handle.local_addr;
+
+        let raw = tokio::task::spawn_blocking(move || {
+            let mut stream = TcpStream::connect(inspector_addr).unwrap();
+            let req = format!(
+                "GET /app.js HTTP/1.1\r\nHost: {inspector_addr}\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(req.as_bytes()).unwrap();
+            let mut resp = Vec::new();
+            let _ = stream.read_to_end(&mut resp);
+            String::from_utf8_lossy(&resp).to_string()
+        })
+        .await
+        .unwrap();
+
+        let lower = raw.to_ascii_lowercase();
+        assert!(
+            lower.contains("content-type: text/javascript"),
+            "Content-Type must reach the caller — `import()` refuses a module without it"
+        );
+        assert!(lower.contains("etag:"), "ETag must survive the hop");
+        assert!(
+            lower.contains("a=1") && lower.contains("b=2"),
+            "both Set-Cookie headers must survive the hop"
         );
     }
 }
