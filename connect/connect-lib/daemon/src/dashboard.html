@@ -16,6 +16,7 @@
     --good: #4fd67a;
     --bad: #ff6b6b;
     --warn: #f5c86b;
+    --hub: #b98eff;
     --mono: "SF Mono", "Cascadia Code", Consolas, monospace;
   }
   * { box-sizing: border-box; }
@@ -195,11 +196,34 @@
   }
   .copy-btn:hover { color: var(--accent); }
   .conn-type { display: inline-block; font-size: 10px; font-family: var(--mono); padding: 1px 6px; border-radius: 4px; margin-left: 6px; }
-  .conn-type.direct { background: rgba(79,214,122,0.15); color: var(--good); }
-  .conn-type.relay { background: rgba(245,200,107,0.15); color: var(--warn); }
-  .conn-type.mixed { background: rgba(245,200,107,0.15); color: var(--warn); }
-  .conn-type.unknown { background: rgba(124,138,153,0.15); color: var(--text-dim); }
+  .conn-type.good { background: rgba(79,214,122,0.15); color: var(--good); }
+  .conn-type.warn { background: rgba(245,200,107,0.15); color: var(--warn); }
+  .conn-type.dim { background: rgba(124,138,153,0.15); color: var(--text-dim); }
   .conn-transitions { color: var(--warn); }
+  .map-card {
+    border: 1px solid var(--border); border-radius: 10px; background: var(--panel);
+    padding: 16px 12px 12px; margin-top: 4px;
+  }
+  .map-card svg { width: 100%; height: auto; display: block; }
+  .map-legend {
+    font-size: 11px; color: var(--text-dim); margin-bottom: 12px;
+    border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2);
+    padding: 8px 12px;
+  }
+  .map-legend-title { font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 6px; }
+  .map-legend-rows { display: flex; flex-wrap: wrap; gap: 16px; }
+  .map-legend .swatch { display: inline-flex; align-items: center; gap: 6px; }
+  .map-legend .line { width: 18px; height: 4px; border-radius: 2px; display: inline-block; }
+  .station-label { fill: var(--text); font-size: 12px; font-family: -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .station-caption { fill: var(--text-dim); font-family: var(--mono); font-size: 10px; }
+  .hub-label { fill: var(--hub); font-weight: 600; }
+  .map-station { cursor: pointer; }
+  .map-station:hover .station-label { fill: var(--accent); }
+  .map-station:hover circle { filter: brightness(1.3); }
+  @keyframes map-flash-line { 0%, 100% { filter: drop-shadow(0 0 0 var(--accent)); } 30% { filter: drop-shadow(0 0 8px var(--accent)); } }
+  @keyframes map-flash-dot { 0%, 100% { stroke-width: 4; filter: drop-shadow(0 0 0 var(--accent)); } 30% { stroke-width: 8; filter: drop-shadow(0 0 8px var(--accent)); } }
+  .map-line.just-changed { animation: map-flash-line 1.8s ease-out; }
+  .map-station.just-changed circle { animation: map-flash-dot 1.8s ease-out; }
   .log-search { width: 100%; max-width: 420px; display: block; margin-bottom: 12px; }
   .overlay {
     position: fixed; inset: 0; background: rgba(0,0,0,0.6);
@@ -244,6 +268,8 @@
 
 <main>
   <div class="col" id="tunnel-list-col">
+    <div class="section-title">Network map</div>
+    <div id="map-nav"></div>
     <div class="section-title">Tunnels</div>
     <div id="tunnel-list"><div class="empty">Enter a token to connect</div></div>
     <div class="section-title">Peer tunnels (P2P, no Datum involved)</div>
@@ -260,7 +286,7 @@
 <div id="modal-root"></div>
 
 <script>
-const state = { token: localStorage.getItem('dc_token') || '', tunnels: [], selected: null, traffic: [], info: null, logSources: [], selectedLog: null, logLines: [], logSearch: '', peerData: null, selectedPeer: null, showAllTunnels: false };
+const state = { token: localStorage.getItem('dc_token') || '', tunnels: [], tunnelsLoaded: false, selected: null, info: null, logSources: [], selectedLog: null, logLines: [], logSearch: '', peerData: null, selectedPeer: null, showAllTunnels: false, viewingMap: false, mapPrevColors: {} };
 
 function humanizeBytes(bytes) {
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -274,6 +300,7 @@ fetch('/v1/info').then(r => r.json()).then(info => { state.info = info; renderLo
 
 const $ = (sel) => document.querySelector(sel);
 const tunnelListEl = $('#tunnel-list');
+const mapNavEl = $('#map-nav');
 const peerListEl = $('#peer-list');
 const logsListEl = $('#logs-list');
 const logsCaptionEl = $('#logs-caption');
@@ -299,6 +326,48 @@ function toast(msg, kind, durationMs) {
 
 function isAgentActor(actor) {
   return !!actor && actor.startsWith('operate:');
+}
+
+// Single source of truth for "how good is this P2P path" — direct is good,
+// relay/mixed both degrade to the same warning tier, and anything else (no
+// path yet, or an iroh ConnectionType this dashboard doesn't recognize) is
+// dim/unknown. Both the Peer tunnels badge (via the .conn-type.good/warn/dim
+// CSS classes) and the network map's line color use this same tier, so a
+// new conn_type value only needs updating in one place.
+function connTypeSeverity(connType) {
+  if (connType === 'direct') return 'good';
+  if (connType === 'relay' || connType === 'mixed') return 'warn';
+  return 'dim';
+}
+
+// Re-binds click handlers on elements just inserted via an `.innerHTML`
+// assignment — every list-then-detail section on this page (tunnels,
+// peers, logs, map stations, traffic rows) replaces its container's whole
+// subtree on each render, discarding old elements (and their listeners)
+// along with it, so this always runs against fresh nodes rather than
+// accumulating duplicate bindings.
+function bindClicks(root, selector, handler) {
+  root.querySelectorAll(selector).forEach(el => el.addEventListener('click', () => handler(el)));
+}
+
+// Tunnels created from this same device — connector_device is set
+// server-side from the same friendly_device_name() this daemon reports at
+// /v1/info. The network map always uses this (never visibleTunnels()
+// below) — it's meant to be this daemon's own view of what it's
+// forwarding, and showing every device's project-wide tunnels there would
+// misrepresent that, regardless of what the separate Tunnels-panel toggle
+// is set to.
+function localTunnels() {
+  const deviceName = state.info && state.info.device_name;
+  return state.tunnels.filter(t => deviceName && t.connector_device === deviceName);
+}
+
+// Tunnels shown in the Tunnels list by default are just this device's own;
+// state.showAllTunnels (toggled there) opts back into every tunnel in the
+// project. Only the Tunnels list panel uses this — the network map
+// intentionally does not, see localTunnels() above.
+function visibleTunnels() {
+  return state.showAllTunnels ? state.tunnels : localTunnels();
 }
 
 // Wraps a hostname / IP:port value with a small inline copy button. Used
@@ -374,7 +443,7 @@ function renderTunnelList() {
   const list = !shown.length
     ? '<div class="empty">No tunnels on this device</div>'
     : shown.map(t => `
-    <div class="tunnel-item ${state.selected === t.id ? 'active' : ''}" data-id="${t.id}">
+    <div class="tunnel-item ${state.selected === t.id ? 'active' : ''}" data-id="${escapeHtml(t.id)}">
       <div class="label">${escapeHtml(t.label)}</div>
       <div class="host">${(t.hostnames && t.hostnames[0]) ? copyableHost(t.hostnames[0]) : (t.endpoint ? copyableHost(t.endpoint) : '(no hostname yet)')}</div>
       <span class="badge ${t.enabled ? 'on' : 'off'}">${t.enabled ? 'ON' : 'OFF'}</span>
@@ -392,9 +461,7 @@ function renderTunnelList() {
       renderTunnelList();
     });
   }
-  tunnelListEl.querySelectorAll('.tunnel-item').forEach(el => {
-    el.addEventListener('click', () => selectTunnel(el.dataset.id));
-  });
+  bindClicks(tunnelListEl, '.tunnel-item', el => selectTunnel(el.dataset.id));
 }
 
 function renderPeerList(data) {
@@ -431,8 +498,8 @@ function renderPeerList(data) {
   // "relay"/"mixed" mean it's bouncing through (or partly through) a relay
   // server. See NOTES.md's "what does iroh give us" discussion.
   data.connections.forEach(c => {
-    const typeClass = c.conn_type || 'unknown';
-    const typeBadge = `<span class="conn-type ${escapeHtml(typeClass)}">${escapeHtml(typeClass)}</span>`;
+    const rawType = c.conn_type || 'unknown';
+    const typeBadge = `<span class="conn-type ${connTypeSeverity(c.conn_type)}">${escapeHtml(rawType)}</span>`;
     const latency = (c.latency_ms != null) ? ` · ${c.latency_ms}ms` : '';
     const detail = c.conn_detail ? ` (${escapeHtml(c.conn_detail)})` : '';
     // transition_count > 0 means this connection has flipped between
@@ -462,20 +529,38 @@ function renderPeerList(data) {
   }
 
   peerListEl.innerHTML = parts.join('');
-  peerListEl.querySelectorAll('[data-peer-kind]').forEach(el => {
-    el.addEventListener('click', () => selectPeer(el.dataset.peerKind, el.dataset.peerId));
-  });
+  bindClicks(peerListEl, '[data-peer-kind]', el => selectPeer(el.dataset.peerKind, el.dataset.peerId));
+}
+
+// The four `select*` entry points (this one, selectTunnel, selectLog,
+// selectMap) all pick exactly one of {selected, selectedLog, selectedPeer,
+// viewingMap} and clear the rest, then re-render every left-nav panel so
+// the newly-picked item is the only one shown active. `keep` is whichever
+// field the caller already set to its new value before calling this.
+function resetSelectionExcept(keep) {
+  if (keep !== 'selected') state.selected = null;
+  if (keep !== 'selectedLog') state.selectedLog = null;
+  if (keep !== 'selectedPeer') state.selectedPeer = null;
+  if (keep !== 'viewingMap') state.viewingMap = false;
+  // Always reset, even when re-selecting the same log: a fresh selection
+  // (or a switch away from log-viewing entirely) should always drop the
+  // filter box and force a clean tail fetch rather than showing stale
+  // filtered lines from whatever was selected before.
+  state.logLines = [];
+  state.logSearch = '';
+}
+
+function renderNavPanels() {
+  renderTunnelList();
+  renderLogList();
+  renderMapNav();
+  renderPeerList(state.peerData);
 }
 
 function selectPeer(kind, id) {
   state.selectedPeer = { kind, id };
-  state.selected = null;
-  state.selectedLog = null;
-  state.logLines = [];
-  state.logSearch = '';
-  renderTunnelList();
-  renderLogList();
-  renderPeerList(state.peerData);
+  resetSelectionExcept('selectedPeer');
+  renderNavPanels();
   renderPeerDetail();
 }
 
@@ -506,13 +591,13 @@ function renderPeerDetail() {
 
   const c = state.peerData.connections.find(x => x.id === id);
   if (!c) { deselectMissingPeer(); return; }
-  const typeClass = c.conn_type || 'unknown';
+  const rawType = c.conn_type || 'unknown';
   detailEl.innerHTML = `
     <div class="detail">
       <h2>↓ P2P connection</h2>
       <div class="sub">${copyableHost(c.bound_addr)} → ${copyableHost(c.target)}</div>
       <div class="stat-row">
-        <div class="stat"><div class="label">Type</div><div class="value"><span class="conn-type ${escapeHtml(typeClass)}">${escapeHtml(typeClass)}</span></div></div>
+        <div class="stat"><div class="label">Type</div><div class="value"><span class="conn-type ${connTypeSeverity(c.conn_type)}">${escapeHtml(rawType)}</span></div></div>
         <div class="stat"><div class="label">Latency</div><div class="value">${c.latency_ms != null ? c.latency_ms + 'ms' : '—'}</div></div>
         <div class="stat"><div class="label">Type changes</div><div class="value">${c.transition_count}</div></div>
       </div>
@@ -532,6 +617,237 @@ function deselectMissingPeer() {
   detailEl.innerHTML = '<div class="empty">Select a tunnel, log, or peer connection</div>';
 }
 
+// Network map — a live "subway map" of this daemon's own tunnels, peer
+// connections, and logs, adapted from the hand-drawn demo pages (see
+// ../ec2-zero-trust-ssh/) which used the same stations/lines/interchange
+// convention with hardcoded data. Here the stations and lines are computed
+// from whatever /v1/tunnels, /v1/peers, and /v1/logs already returned on
+// the last 3s poll — no new backend endpoint.
+function renderMapNav() {
+  mapNavEl.innerHTML = `
+    <div class="tunnel-item ${state.viewingMap ? 'active' : ''}" id="map-nav-item">
+      <div class="label">Live network map</div>
+      <div class="host">Tunnels + peer connections, drawn live</div>
+    </div>
+  `;
+  $('#map-nav-item').addEventListener('click', selectMap);
+}
+
+function selectMap() {
+  state.viewingMap = true;
+  resetSelectionExcept('viewingMap');
+  renderNavPanels();
+  renderNetworkMap();
+}
+
+// Colors intentionally reuse the same --good/--warn/--accent/--text/--text-dim
+// tokens (and thresholds) as the conn-type badges in the Peer tunnels
+// panel and the ON/OFF badges in the Tunnels panel, rather than the demo
+// pages' separate GitHub-derived palette, so the map reads as part of this
+// UI rather than a reskin.
+function mapLineColor(kind) {
+  return { good: 'var(--good)', warn: 'var(--warn)', accent: 'var(--accent)', text: 'var(--text)', dim: 'var(--text-dim)' }[kind] || 'var(--text-dim)';
+}
+
+// Tracks each station's last-seen color across polls (keyed by a namespaced
+// id, e.g. "peer-conn:c1") so a real state change (relay -> direct, a
+// tunnel turning off, a log file appearing) can be flagged with
+// `justChanged` and given a one-shot flash — see .just-changed in the
+// <style> block. A first sighting of a key never flashes (prev is
+// undefined), only an actual change from one poll to the next.
+function mapDetectChange(key, color) {
+  const prev = state.mapPrevColors[key];
+  const justChanged = prev !== undefined && prev !== color;
+  state.mapPrevColors[key] = color;
+  return justChanged;
+}
+
+function renderNetworkMap() {
+  const tunnels = localTunnels();
+  const peers = state.peerData;
+  const ads = (peers && peers.advertisements) || [];
+  const conns = (peers && peers.connections) || [];
+  const logs = state.logSources || [];
+
+  const peerItems = ads.map(a => {
+    const color = a.enabled ? 'good' : 'dim';
+    return {
+      peerKind: 'ad', id: a.resource_id, label: a.label,
+      caption: a.enabled ? 'advertised — reachable by peers with a ticket' : 'revoked',
+      color, justChanged: mapDetectChange('peer-ad:' + a.resource_id, color),
+    };
+  }).concat(conns.map(c => {
+    const color = connTypeSeverity(c.conn_type);
+    return {
+      peerKind: 'conn', id: c.id, label: c.target,
+      caption: `via ${c.bound_addr}${c.latency_ms != null ? ' · ' + c.latency_ms + 'ms' : ''}`,
+      color, justChanged: mapDetectChange('peer-conn:' + c.id, color),
+    };
+  }));
+
+  const tunnelItems = tunnels.map(t => {
+    const color = t.enabled ? 'accent' : 'dim';
+    return {
+      id: t.id, label: t.label,
+      caption: (t.hostnames && t.hostnames[0]) || t.endpoint || '(no hostname yet)',
+      color, justChanged: mapDetectChange('tunnel:' + t.id, color),
+    };
+  });
+
+  const logItems = logs.map(s => {
+    const color = s.exists ? 'text' : 'dim';
+    return {
+      id: s.name, label: s.name,
+      caption: s.exists ? humanizeBytes(s.size_bytes) : '(no file yet)',
+      color, justChanged: mapDetectChange('log:' + s.name, color),
+    };
+  });
+
+  if (!peerItems.length && !tunnelItems.length && !logItems.length) {
+    detailEl.innerHTML = `
+      <div class="detail">
+        <h2>Network map</h2>
+        <div class="empty">No tunnels, peer connections, or logs yet — create one to see it here.</div>
+      </div>
+    `;
+    return;
+  }
+
+  const ROW_H = 68, TOP_PAD = 46, BLOCK_GAP = 40;
+  const HUB_X = 90, INTERCHANGE_X = 330, STATION_X = 620, LABEL_X = 645;
+  // Logs aren't traffic in or out of the daemon, so they're drawn going out
+  // the *other* side of the hub (negative x) rather than sharing the
+  // tunnels/peers side — a viewer should never mistake a log source for
+  // another network path. VIEW_MIN_X extends the SVG's viewBox left to make
+  // room; every coordinate on the right (HUB_X onward) is unchanged.
+  const LOG_STATION_X = -140, LOG_LABEL_X = -165;
+  const VIEW_MIN_X = -280, VIEW_MAX_X = 900;
+
+  // Each block is a vertically-stacked group of stations. 'interchange'
+  // blocks (today: only proxy-mode tunnels) route through a shared node
+  // between the hub and their stations; plain 'spoke' blocks (peer
+  // connections, log sources) go straight from the hub. `side` picks which
+  // half of the hub a block's stations sit on. Stacked in this order —
+  // peers, tunnels, logs — and laid out generically so a future block (e.g.
+  // VPC-landed tunnels, see GVPC-EDGE-PLAN.md) is just another entry here
+  // rather than more copy-pasted layout math.
+  const blocks = [];
+  if (peerItems.length) blocks.push({ kind: 'spoke', stationType: 'peer', side: 'right', items: peerItems });
+  if (tunnelItems.length) blocks.push({ kind: 'interchange', stationType: 'tunnel', side: 'right', items: tunnelItems, interchangeLabel: 'Datum Cloud ALB' });
+  if (logItems.length) blocks.push({ kind: 'spoke', stationType: 'log', side: 'left', items: logItems });
+
+  // Each side's blocks stack and center independently — logs (left) aren't
+  // just "whatever's left over" underneath peers+tunnels (right); a tall
+  // right side shouldn't push the left side off-center from the hub, and
+  // vice versa.
+  const bySide = { left: [], right: [] };
+  blocks.forEach(b => bySide[b.side].push(b));
+  function stackSide(sideBlocks) {
+    let y = 0;
+    sideBlocks.forEach(b => {
+      b.height = b.items.length * ROW_H;
+      b.relTop = y;
+      y += b.height + BLOCK_GAP;
+    });
+    return Math.max(y - BLOCK_GAP, 0);
+  }
+  const rightHeight = stackSide(bySide.right);
+  const leftHeight = stackSide(bySide.left);
+  const totalH = Math.max(Math.max(rightHeight, leftHeight) + TOP_PAD * 2, 160);
+  const hubY = totalH / 2;
+  [['right', rightHeight], ['left', leftHeight]].forEach(([sideName, sideHeight]) => {
+    const startY = hubY - sideHeight / 2;
+    bySide[sideName].forEach(b => {
+      b.top = startY + b.relTop;
+      b.midY = b.top + b.height / 2;
+    });
+  });
+
+  const parts = [];
+
+  // Lines first, so station circles/labels sit on top of them.
+  blocks.forEach(block => {
+    const stationX = block.side === 'left' ? LOG_STATION_X : STATION_X;
+    const fromX = block.kind === 'interchange' ? INTERCHANGE_X : HUB_X;
+    const fromY = block.kind === 'interchange' ? block.midY : hubY;
+    if (block.kind === 'interchange') {
+      parts.push(`<polyline points="${HUB_X},${hubY} ${INTERCHANGE_X},${block.midY}" stroke="var(--accent)" stroke-width="5" fill="none" stroke-linecap="round"/>`);
+    }
+    block.items.forEach((item, i) => {
+      const y = block.top + i * ROW_H + ROW_H / 2;
+      const c = mapLineColor(item.color);
+      const flashClass = item.justChanged ? 'just-changed' : '';
+      parts.push(`<polyline class="map-line ${flashClass}" points="${fromX},${fromY} ${stationX},${y}" stroke="${c}" stroke-width="5" fill="none" stroke-linecap="round" opacity="${item.color === 'dim' ? 0.4 : 1}"/>`);
+    });
+  });
+
+  // Hub, drawn after lines so it sits on top of them. Given its own color
+  // (--hub) rather than the neutral --text used for every other label, so
+  // it reads as "the one thing everything connects to" at a glance instead
+  // of blending in with an ordinary station.
+  parts.push(`
+    <circle cx="${HUB_X}" cy="${hubY}" r="10" fill="var(--bg)" stroke="var(--hub)" stroke-width="4"/>
+    <text x="${HUB_X}" y="${hubY - 20}" text-anchor="middle" class="station-label hub-label">This daemon</text>
+  `);
+
+  blocks.forEach(block => {
+    if (block.kind === 'interchange') {
+      // Double-ring marker, same convention as the demo pages' "ring =
+      // interchange stop" for the Datum Cloud ALB.
+      parts.push(`
+        <circle cx="${INTERCHANGE_X}" cy="${block.midY}" r="11" fill="var(--panel-2)" stroke="var(--accent)" stroke-width="4"/>
+        <circle cx="${INTERCHANGE_X}" cy="${block.midY}" r="5" fill="var(--accent)"/>
+        <text x="${INTERCHANGE_X}" y="${block.midY - 20}" text-anchor="middle" class="station-label">${escapeHtml(block.interchangeLabel)}</text>
+      `);
+    }
+    block.items.forEach((item, i) => {
+      const y = block.top + i * ROW_H + ROW_H / 2;
+      const c = mapLineColor(item.color);
+      const stationX = block.side === 'left' ? LOG_STATION_X : STATION_X;
+      const labelX = block.side === 'left' ? LOG_LABEL_X : LABEL_X;
+      const anchor = block.side === 'left' ? 'end' : 'start';
+      const dataAttrs = block.stationType === 'peer'
+        ? `data-station-type="peer" data-peer-kind="${escapeHtml(item.peerKind)}" data-id="${escapeHtml(item.id)}"`
+        : `data-station-type="${block.stationType}" data-id="${escapeHtml(item.id)}"`;
+      parts.push(`
+        <g class="map-station ${item.justChanged ? 'just-changed' : ''}" ${dataAttrs}>
+          <circle cx="${stationX}" cy="${y}" r="9" fill="var(--bg)" stroke="${c}" stroke-width="4"/>
+          <text x="${labelX}" y="${y - 6}" text-anchor="${anchor}" class="station-label">${escapeHtml(item.label)}</text>
+          <text x="${labelX}" y="${y + 12}" text-anchor="${anchor}" class="station-caption">${escapeHtml(item.caption)}</text>
+        </g>
+      `);
+    });
+  });
+
+  detailEl.innerHTML = `
+    <div class="detail">
+      <h2>Network map</h2>
+      <div class="sub">Live view of this daemon's own tunnels, peer connections, and logs</div>
+      <div class="map-card">
+        <div class="map-legend">
+          <div class="map-legend-title">Legend</div>
+          <div class="map-legend-rows">
+            <span class="swatch"><span class="line" style="background:var(--hub)"></span> This daemon</span>
+            <span class="swatch"><span class="line" style="background:var(--good)"></span> Direct P2P / advertising</span>
+            <span class="swatch"><span class="line" style="background:var(--warn)"></span> P2P via relay</span>
+            <span class="swatch"><span class="line" style="background:var(--accent)"></span> ALB tunnel — Application Load Balancer (via Datum Cloud)</span>
+            <span class="swatch"><span class="line" style="background:var(--text)"></span> Log source</span>
+            <span class="swatch"><span class="line" style="background:var(--text-dim)"></span> Off / revoked / missing</span>
+          </div>
+        </div>
+        <svg viewBox="${VIEW_MIN_X} 0 ${VIEW_MAX_X - VIEW_MIN_X} ${totalH}" preserveAspectRatio="xMidYMid meet">${parts.join('')}</svg>
+      </div>
+    </div>
+  `;
+
+  // Clicking a station jumps to that item's own detail view — the same
+  // place clicking it in the Tunnels/Peer tunnels/Logs list would land —
+  // rather than duplicating that view here.
+  bindClicks(detailEl, '.map-station[data-station-type="tunnel"]', el => selectTunnel(el.dataset.id));
+  bindClicks(detailEl, '.map-station[data-station-type="peer"]', el => selectPeer(el.dataset.peerKind, el.dataset.id));
+  bindClicks(detailEl, '.map-station[data-station-type="log"]', el => selectLog(el.dataset.id));
+}
+
 async function refreshPeers() {
   if (!state.token) {
     peerListEl.innerHTML = '<div class="peer-section-empty">—</div>';
@@ -542,6 +858,7 @@ async function refreshPeers() {
     state.peerData = await api('/v1/peers');
     renderPeerList(state.peerData);
     if (state.selectedPeer) renderPeerDetail();
+    if (state.viewingMap) renderNetworkMap();
   } catch (e) {
     peerListEl.innerHTML = `<div class="peer-section-empty">${escapeHtml(e.message)}</div>`;
   }
@@ -582,9 +899,7 @@ function renderLogList() {
       <div class="host">${src.exists ? humanizeBytes(src.size_bytes) : '(no file yet)'}</div>
     </div>
   `).join('');
-  logsListEl.querySelectorAll('[data-log]').forEach(el => {
-    el.addEventListener('click', () => selectLog(el.dataset.log));
-  });
+  bindClicks(logsListEl, '[data-log]', el => selectLog(el.dataset.log));
 }
 
 // Bumped on every selectLog call so an in-flight tail fetch for a
@@ -597,13 +912,8 @@ let logDetailGeneration = 0;
 async function selectLog(name) {
   state.selectedLog = name;
   logDetailGeneration++;
-  state.selected = null; // right pane shows one thing at a time
-  state.selectedPeer = null;
-  state.logLines = [];
-  state.logSearch = '';
-  renderTunnelList();
-  renderLogList();
-  if (state.peerData) renderPeerList(state.peerData);
+  resetSelectionExcept('selectedLog');
+  renderNavPanels();
   const src = state.logSources.find(s => s.name === name);
   detailEl.innerHTML = `
     <div class="detail">
@@ -672,9 +982,11 @@ async function refreshLogs() {
     state.selectedLog = null;
     state.logLines = [];
     state.logSearch = '';
-    if (!state.selected && !state.selectedPeer) detailEl.innerHTML = '<div class="empty">Select a tunnel, log, or peer connection</div>';
+    if (state.viewingMap) renderNetworkMap();
+    else if (!state.selected && !state.selectedPeer) detailEl.innerHTML = '<div class="empty">Select a tunnel, log, or peer connection</div>';
     return;
   }
+  if (state.viewingMap) renderNetworkMap();
   await refreshLogDetail();
 }
 
@@ -684,13 +996,8 @@ function escapeHtml(s) {
 
 async function selectTunnel(id) {
   state.selected = id;
-  state.selectedLog = null; // right pane shows one thing at a time
-  state.selectedPeer = null;
-  state.logLines = [];
-  state.logSearch = '';
-  renderTunnelList();
-  renderLogList();
-  if (state.peerData) renderPeerList(state.peerData);
+  resetSelectionExcept('selected');
+  renderNavPanels();
   await refreshDetail();
 }
 
@@ -702,7 +1009,6 @@ async function refreshDetail() {
       api('/v1/tunnels/' + state.selected + '/traffic'),
       api('/v1/tunnels/' + state.selected + '/metrics').catch(() => null),
     ]);
-    state.traffic = traffic;
     const tunnel = state.tunnels.find(t => t.id === state.selected);
     renderDetail(tunnel, progress, traffic, metrics);
   } catch (e) {
@@ -725,7 +1031,7 @@ function renderDetail(tunnel, progress, traffic, metrics) {
 
   const url = portalUrl(tunnel);
   const portalLinkHtml = url
-    ? `<a class="portal-link" href="${url}" target="_blank" rel="noopener">Open in cloud.datum.net (WAF, routing, etc.) ↗</a>`
+    ? `<a class="portal-link" href="${escapeHtml(url)}" target="_blank" rel="noopener">Open in cloud.datum.net (WAF, routing, etc.) ↗</a>`
     : '';
 
   const statsHtml = metrics ? `
@@ -742,7 +1048,7 @@ function renderDetail(tunnel, progress, traffic, metrics) {
 
   const trafficRows = traffic.length
     ? traffic.slice().reverse().map(ex => `
-        <tr class="clickable" data-ex="${ex.id}">
+        <tr class="clickable" data-ex="${escapeHtml(ex.id)}">
           <td class="method">${escapeHtml(ex.method)}</td>
           <td>${escapeHtml(ex.path)}</td>
           <td><span class="status-code ${statusClass(ex.response_status)}">${ex.response_status ?? '—'}</span></td>
@@ -770,9 +1076,7 @@ function renderDetail(tunnel, progress, traffic, metrics) {
       </table>
     </div>
   `;
-  detailEl.querySelectorAll('tr[data-ex]').forEach(el => {
-    el.addEventListener('click', () => openExchange(el.dataset.ex));
-  });
+  bindClicks(detailEl, 'tr[data-ex]', el => openExchange(el.dataset.ex));
 }
 
 async function openExchange(exchangeId) {
@@ -840,7 +1144,9 @@ async function refreshTunnels() {
   }
   try {
     const previousTunnels = state.tunnels;
+    const hadLoadedBefore = state.tunnelsLoaded;
     state.tunnels = await api('/v1/tunnels');
+    state.tunnelsLoaded = true;
     connDot.className = 'dot ok';
     // Visible signal: notice the moment an agent (an operate token, not a
     // human's setup token) turns a tunnel on — compared against the
@@ -850,21 +1156,29 @@ async function refreshTunnels() {
     // toast is gone. See NOTES.md's "agent-friendly, human stays in
     // control" discussion, 2026-09-08 — picked over a heavier OS-level
     // notification since this reuses machinery the dashboard already has.
-    state.tunnels.forEach(t => {
-      const was = previousTunnels.find(p => p.id === t.id);
-      const justTurnedOn = t.enabled && (!was || !was.enabled);
-      if (justTurnedOn && isAgentActor(t.last_start_actor)) {
-        toast(`Agent started tunnel "${t.label}"`, 'warn', 10000);
-      }
-    });
+    // Only compares once a real previous poll exists — on the very first
+    // load (or right after reconnecting), `previousTunnels` is empty, so
+    // every already-enabled agent-started tunnel would otherwise look like
+    // it "just" turned on.
+    if (hadLoadedBefore) {
+      state.tunnels.forEach(t => {
+        const was = previousTunnels.find(p => p.id === t.id);
+        const justTurnedOn = t.enabled && (!was || !was.enabled);
+        if (justTurnedOn && isAgentActor(t.last_start_actor)) {
+          toast(`Agent started tunnel "${t.label}"`, 'warn', 10000);
+        }
+      });
+    }
     renderTunnelList();
     if (state.selected) await refreshDetail();
+    if (state.viewingMap) renderNetworkMap();
   } catch (e) {
     connDot.className = 'dot bad';
     tunnelListEl.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
   }
 }
 
+renderMapNav();
 refreshTunnels();
 refreshPeers();
 refreshLogs();
