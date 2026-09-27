@@ -85,7 +85,10 @@ jobs:
         run: |
           BIN=connect/connect-lib/target/release/datum-connect-daemon
           file "$BIN" || true
-          ./connect/scripts/check-glibc-max.sh "$BIN" "$TARGET_GLIBC"
+          # Invoked via bash rather than executed directly: the exec bit does
+          # not survive a commit made from Windows, and a gate that silently
+          # stops running is worse than no gate.
+          bash ./connect/scripts/check-glibc-max.sh "$BIN" "$TARGET_GLIBC"
 
       - name: Upload the binary
         uses: actions/upload-artifact@v4
