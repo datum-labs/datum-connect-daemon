@@ -5,7 +5,7 @@ use arc_swap::ArcSwap;
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Errors that can occur when constructing an [`ExternalTokenSource`] from environment.
 #[derive(Debug, thiserror::Error)]
@@ -22,6 +22,12 @@ pub enum ExternalTokenError {
     JwtParse(#[source] serde_json::Error),
 }
 
+/// How many consecutive no-op forced refreshes before the credential is treated
+/// as rejected-and-unrenewable. Small on purpose: each one is a round trip to a
+/// subprocess prompted by a real 401, and once two in a row have changed
+/// nothing, a third is not going to either.
+const INEFFECTIVE_FORCED_LIMIT: u32 = 3;
+
 /// Manages a bearer token provided from an external source (credentials helper + refresh loop).
 ///
 /// Used in plugin mode. The token is obtained at startup by executing the
@@ -32,6 +38,16 @@ pub struct ExternalTokenSource {
     token: std::sync::Arc<ArcSwap<SecretString>>,
     token_tx: std::sync::Arc<watch::Sender<String>>,
     refresh_trigger: std::sync::Arc<watch::Sender<u64>>,
+    /// Consecutive forced refreshes that returned the *same* token.
+    ///
+    /// A forced refresh happens because something observed a 401. If the
+    /// helper then hands back a byte-identical token, the credential cannot
+    /// be renewed by asking again: the helper caches on expiry, and expiry is
+    /// not why the token was rejected (revocation, session invalidation,
+    /// server-side rotation, an audience change). Retrying it against an
+    /// endpoint that just refused it cannot succeed, so this counter exists
+    /// to recognise that state instead of looping on it forever.
+    ineffective_forced: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl std::fmt::Debug for ExternalTokenSource {
@@ -77,12 +93,23 @@ impl ExternalTokenSource {
             ))),
             token_tx: std::sync::Arc::new(token_tx),
             refresh_trigger: std::sync::Arc::new(refresh_tx),
+            ineffective_forced: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         })
     }
 
     /// Returns the current token as a plain `String`.
     pub fn token(&self) -> String {
         self.token.load_full().expose_secret().to_string()
+    }
+
+    /// How many consecutive forced refreshes have returned an unchanged token.
+    ///
+    /// Non-zero means something is rejecting the current credential while the
+    /// helper keeps handing back the same one. Callers should treat a sustained
+    /// non-zero value as "credential rejected and not renewable by retrying",
+    /// which is operator-actionable, rather than as a transient blip.
+    pub fn ineffective_forced_refreshes(&self) -> u32 {
+        self.ineffective_forced.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Returns a watch channel subscriber for token updates.
@@ -213,11 +240,54 @@ impl ExternalTokenSource {
                 }
             };
 
+            // Once the credential is known to be unrenewable, stop re-running
+            // the helper for every 401. It would return the same token it
+            // already returned, which is what produced the endless retry loop
+            // this guard exists to break. The proactive timer is deliberately
+            // still honoured: the operator may log in again at any point, and
+            // that path is how the daemon notices.
+            if forced && self.ineffective_forced_refreshes() >= INEFFECTIVE_FORCED_LIMIT {
+                debug!(
+                    "token refresh: ignoring forced refresh — credential is rejected and                      unrenewable; waiting for the proactive timer or a new login"
+                );
+                continue;
+            }
+
             // Execute helper to get a fresh token
             match Self::exec_helper(&helper, &session) {
                 Ok(new_token) => {
-                    let prev_exp = parse_jwt_expiry(&self.token()).ok().flatten();
+                    let previous = self.token();
+                    let prev_exp = parse_jwt_expiry(&previous).ok().flatten();
                     let new_exp = parse_jwt_expiry(&new_token).ok().flatten();
+
+                    // A forced refresh that changes nothing is the signature of
+                    // a credential rejected for a reason other than expiry: the
+                    // helper sees a token with life left and returns its cached
+                    // copy, so asking again is futile. Count those; any genuinely
+                    // new token clears the count.
+                    if new_token == previous {
+                        if forced {
+                            let seen = self
+                                .ineffective_forced
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                + 1;
+                            if seen == INEFFECTIVE_FORCED_LIMIT {
+                                error!(
+                                    consecutive = seen,
+                                    "token refresh: the credentials helper keeps returning the                                      same token after a 401 — the credential is rejected and                                      cannot be renewed by retrying. Tunnels will stay down until                                      the operator logs in again."
+                                );
+                            } else {
+                                warn!(
+                                    consecutive = seen,
+                                    "token refresh: forced refresh returned an unchanged token"
+                                );
+                            }
+                        }
+                    } else {
+                        self.ineffective_forced
+                            .store(0, std::sync::atomic::Ordering::Relaxed);
+                    }
+
                     self.swap_token(new_token.clone());
                     backoff = std::time::Duration::from_secs(5); // Reset backoff
 
@@ -389,6 +459,58 @@ mod tests {
         assert!(matches!(result, Err(ExternalTokenError::MissingHelper)));
     }
 
+    /// The failure this guards against, reproduced in miniature: a token is
+    /// rejected while still well inside its `exp`, so the helper — which
+    /// caches on expiry — hands back the identical token every time it is
+    /// asked. Before this counter existed that produced an unbounded retry
+    /// loop (observed at 1089 consecutive attempts in the field) with nothing
+    /// escalating and nothing surfaced.
+    ///
+    /// Built by hand rather than via `setup_plugin_env()` so it does not
+    /// depend on the shell-script fake helper, which cannot execute on
+    /// Windows.
+    #[test]
+    fn unchanged_forced_refreshes_latch_then_clear_on_recovery() {
+        let initial = make_jwt_with_exp(9999999999);
+        let (token_tx, _) = watch::channel(initial.clone());
+        let (refresh_tx, _) = watch::channel(0u64);
+        let source = ExternalTokenSource {
+            token: std::sync::Arc::new(ArcSwap::from_pointee(SecretString::new(
+                initial.clone().into(),
+            ))),
+            token_tx: std::sync::Arc::new(token_tx),
+            refresh_trigger: std::sync::Arc::new(refresh_tx),
+            ineffective_forced: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        };
+
+        assert_eq!(source.ineffective_forced_refreshes(), 0, "starts clean");
+
+        // Each forced refresh comes back with the token it already had.
+        for expected in 1..=INEFFECTIVE_FORCED_LIMIT {
+            source
+                .ineffective_forced
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(source.ineffective_forced_refreshes(), expected);
+        }
+        assert!(
+            source.ineffective_forced_refreshes() >= INEFFECTIVE_FORCED_LIMIT,
+            "at the limit the loop stops re-running the helper for every 401"
+        );
+
+        // A genuinely different token means the credential recovered — the
+        // operator logged in again — and the latch must clear, or the daemon
+        // would stay stuck in the failed state after auth came back.
+        let fresh = make_jwt_with_exp(8888888888);
+        assert_ne!(fresh, initial);
+        source
+            .ineffective_forced
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        source.swap_token(fresh.clone());
+
+        assert_eq!(source.token(), fresh);
+        assert_eq!(source.ineffective_forced_refreshes(), 0, "recovery clears the latch");
+    }
+
     #[test]
     fn swap_token_updates_and_notifies_watch() {
         let (_dir, source) = setup_plugin_env();
@@ -504,6 +626,7 @@ mod tests {
             ))),
             token_tx: std::sync::Arc::new(token_tx),
             refresh_trigger: std::sync::Arc::new(refresh_tx),
+            ineffective_forced: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
 
         let rx = source.watch();
