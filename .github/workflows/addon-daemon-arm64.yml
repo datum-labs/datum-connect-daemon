@@ -1,0 +1,95 @@
+# Builds the daemon for the Home Assistant Green appliance.
+#
+# Two things make this different from connect/.github/workflows/release.yml,
+# which is vendored from another repo and is NOT a drop-in for this:
+#
+#   1. It builds `-p datum-connect-daemon`, not `-p datum-connect` (the older
+#      single-shot CLI). The add-on runs the daemon.
+#   2. It builds inside a bookworm container on a native arm64 runner, so the
+#      glibc it links against is the appliance's (2.36) by construction.
+#      release.yml cross-compiles on ubuntu-latest, whose aarch64 toolchain
+#      links 2.39 — those binaries cannot start on HAOS.
+#
+# Native arm64 rather than QEMU is deliberate: 565 crates including aws-lc-sys
+# under emulation turns a coffee-length build into an hours-long one, and this
+# is a step we expect to iterate on.
+name: Build add-on daemon (arm64)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'connect/connect-lib/**'
+      - 'connect/scripts/check-glibc-max.sh'
+      - '.github/workflows/addon-daemon-arm64.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'connect/connect-lib/**'
+      - '.github/workflows/addon-daemon-arm64.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+  # The appliance's glibc. Home Assistant OS tracks Debian bookworm.
+  TARGET_GLIBC: '2.36'
+
+jobs:
+  build:
+    name: aarch64 / bookworm
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: rust:1-bookworm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        # aws-lc-sys needs cmake and a C toolchain; binutils gives us objdump
+        # for the glibc gate below.
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake perl pkg-config binutils
+
+      - name: Confirm we are actually on arm64 and on bookworm
+        # Cheap, and it fails loudly rather than silently producing an x86
+        # binary or linking a newer glibc if the runner image ever changes.
+        run: |
+          arch=$(uname -m)
+          echo "arch: $arch"
+          ldd --version | head -1
+          . /etc/os-release && echo "base: $PRETTY_NAME"
+          [ "$arch" = "aarch64" ] || { echo "expected aarch64, got $arch" >&2; exit 1; }
+          case "$VERSION_CODENAME" in
+            bookworm) ;;
+            *) echo "expected bookworm, got $VERSION_CODENAME" >&2; exit 1 ;;
+          esac
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            connect/connect-lib/target
+          key: arm64-bookworm-cargo-${{ hashFiles('connect/connect-lib/**/Cargo.lock') }}
+          restore-keys: arm64-bookworm-cargo-
+
+      - name: Build the daemon
+        working-directory: connect/connect-lib
+        run: cargo build --release -p datum-connect-daemon
+
+      - name: Verify it can run on the appliance
+        # The failure this catches is a runtime loader error on the device,
+        # which is expensive to diagnose from a box you have to walk over to.
+        run: |
+          BIN=connect/connect-lib/target/release/datum-connect-daemon
+          file "$BIN" || true
+          ./connect/scripts/check-glibc-max.sh "$BIN" "$TARGET_GLIBC"
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: datum-connect-daemon-linux-arm64
+          path: connect/connect-lib/target/release/datum-connect-daemon
+          if-no-files-found: error
