@@ -1,0 +1,5 @@
+# Bookworm-based, matching the glibc the daemon binary is built against.
+# See .github/workflows/addon-daemon-arm64.yml — the binary is gated at build
+# time to require nothing newer than glibc 2.36.
+build_from:
+  aarch64: ghcr.io/home-assistant/aarch64-base-debian:bookworm

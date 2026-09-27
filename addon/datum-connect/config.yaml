@@ -1,0 +1,50 @@
+# Home Assistant add-on manifest for the Datum Connect daemon.
+#
+# Reaches this Home Assistant from anywhere through a Datum tunnel, with no
+# inbound ports opened on the router.
+name: Datum Connect
+version: "0.1.0"
+slug: datum_connect
+description: >-
+  Reach this Home Assistant from anywhere over a Datum tunnel, with no inbound
+  ports open on your router.
+url: https://github.com/datum-labs/datum-connect-daemon
+arch:
+  - aarch64
+
+# We exec the daemon as the container's main process and want the Supervisor's
+# restart-on-failure to act on *it*, not on an init shim that outlives it.
+init: false
+
+# So that 127.0.0.1 inside the container is the host's loopback, which is how
+# the daemon reaches Home Assistant on :8123 without a mapped port, and how the
+# watchdog below reaches the daemon's own API.
+host_network: true
+
+startup: services
+boot: auto
+
+# The Supervisor restarts the add-on if this stops answering. Note this only
+# proves the daemon's local API is alive — it says nothing about whether the
+# tunnel is actually serving, which is a separate failure mode (see DOCS.md).
+watchdog: "tcp://[HOST]:[PORT:47780]"
+
+options:
+  project: ""
+  service_account_key: ""
+  target: "http://127.0.0.1:8123"
+  tunnel_label: "home-assistant"
+  log_level: "info"
+
+schema:
+  # The Datum project the tunnel is created in.
+  project: "str"
+  # Service account credential. `password` keeps it out of the UI in plaintext
+  # and out of add-on config exports. A human session token must not be used
+  # here: they are short-lived, and an appliance that loses auth goes dark with
+  # no symptom other than a 503 from the edge.
+  service_account_key: "password"
+  # What the tunnel points at. Defaults to Home Assistant on this host.
+  target: "str"
+  tunnel_label: "str?"
+  log_level: "list(trace|debug|info|warn|error)?"
