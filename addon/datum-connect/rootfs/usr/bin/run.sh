@@ -13,6 +13,7 @@ CONNECT_DIR=/data/connect
 CREDENTIALS_HELPER=/usr/bin/sa-credentials-helper.sh
 
 PROJECT="$(bashio::config 'project')"
+KEY_FILE="$(bashio::config 'service_account_key_file')"
 TARGET="$(bashio::config 'target')"
 LABEL="$(bashio::config 'tunnel_label')"
 LOG_LEVEL="$(bashio::config 'log_level')"
@@ -20,15 +21,18 @@ LOG_LEVEL="$(bashio::config 'log_level')"
 if bashio::var.is_empty "${PROJECT}"; then
     bashio::exit.nok "No 'project' configured. Set the Datum project this tunnel belongs to in the add-on configuration."
 fi
-if ! bashio::config.has_value 'service_account_key'; then
-    bashio::exit.nok "No 'service_account_key' configured. This add-on needs a service account credential — a personal login token will expire and take the tunnel down with it."
+if [ ! -s "${KEY_FILE}" ]; then
+    bashio::exit.nok "No service account key at ${KEY_FILE}. Download one from Datum and place it there — the Samba or File Editor add-on can put it in /share."
 fi
 
-# Written to /data, which persists across add-on restarts and Home Assistant
-# updates but is not part of an add-on config export.
+# Checked here rather than left for the daemon to fail on later: a wrong file
+# in the right place is a confusing failure, and this is cheap.
+if ! jq -e 'select(.type == "datum_service_account") | .client_id, .private_key, .scope' "${KEY_FILE}" >/dev/null 2>&1; then
+    bashio::exit.nok "${KEY_FILE} is not a Datum service account key (expected a JSON file with type, client_id, private_key and scope). A personal login token will not work here."
+fi
+
 mkdir -p "${CONNECT_DIR}"
-install -m 600 /dev/null /data/service-account.key
-bashio::config 'service_account_key' > /data/service-account.key
+export DATUM_SA_KEY_FILE="${KEY_FILE}"
 
 export DATUM_PLUGIN_MODE=1
 export DATUM_PROJECT="${PROJECT}"

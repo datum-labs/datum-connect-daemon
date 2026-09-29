@@ -31,7 +31,7 @@ watchdog: "tcp://[HOST]:[PORT:47780]"
 
 options:
   project: ""
-  service_account_key: ""
+  service_account_key_file: "/share/datum-service-account.json"
   target: "http://127.0.0.1:8123"
   tunnel_label: "home-assistant"
   log_level: "info"
@@ -39,11 +39,15 @@ options:
 schema:
   # The Datum project the tunnel is created in.
   project: "str"
-  # Service account credential. `password` keeps it out of the UI in plaintext
-  # and out of add-on config exports. A human session token must not be used
-  # here: they are short-lived, and an appliance that loses auth goes dark with
-  # no symptom other than a 503 from the edge.
-  service_account_key: "password"
+  # Path to the service account credential JSON, as downloaded from Datum.
+  # A path rather than an inline value: the file is ~2KB and contains an RSA
+  # private key, which does not belong pasted into a UI text field or carried
+  # around inside an add-on configuration export.
+  #
+  # It must be a service account, not a token from a personal login. Personal
+  # sessions expire within days, cannot be renewed without a browser, and an
+  # appliance that loses auth goes dark with no symptom but a failing hostname.
+  service_account_key_file: "str"
   # What the tunnel points at. Defaults to Home Assistant on this host.
   target: "str"
   tunnel_label: "str?"

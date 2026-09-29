@@ -24,22 +24,31 @@ does need the daemon binary present before you install it.
 | Option | What it is |
 |---|---|
 | `project` | The Datum project the tunnel is created in. Required. |
-| `service_account_key` | A service account credential. Required. |
+| `service_account_key_file` | Path to the Datum service account JSON. Defaults to `/share/datum-service-account.json`. Required. |
 | `target` | What the tunnel points at. Defaults to Home Assistant on this host. |
 | `tunnel_label` | A name for the tunnel, to recognise it in the dashboard. |
 | `log_level` | Daemon log verbosity. Leave at `info` unless diagnosing something. |
 
 ### Use a service account, not your own login
 
-The credential must be a service account, not a token from your own
-`datumctl` session. This is not a style preference. A personal session token
-was observed being refused roughly two and a half hours *before* the expiry it
-advertised, and the credentials helper — which decides whether to refresh
-based on that expiry — kept handing the daemon the same dead token. The tunnel
-served errors for about 36 hours while every local signal reported healthy.
+Download the service account credential JSON from Datum and place it where the
+add-on can read it — `/share` is reachable from the Samba and File Editor
+add-ons. Then point `service_account_key_file` at it.
 
-An appliance sitting in a house with nobody watching the logs fails exactly
-that way, and the only visible symptom is that the hostname stops working.
+It must be a service account. This is not a style preference; both failure
+modes have been observed on a real daemon within four days of each other. A
+personal session token was refused roughly two and a half hours *before* the
+expiry it advertised, while the credentials helper kept handing the daemon the
+same dead token — the tunnel served errors for about 36 hours with every local
+signal reporting healthy. Two days later the login expired outright and could
+only be restored by a human at a browser.
+
+An appliance in a house with nobody watching the logs fails exactly those ways,
+and the only visible symptom is that the hostname stops working.
+
+A service account avoids both. The add-on signs a short-lived assertion with
+the key and exchanges it for an access token on every request the daemon makes
+for one, so there is no browser step and no cached token to get stuck on.
 
 ## Why the binary is not built here
 
