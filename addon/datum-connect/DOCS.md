@@ -17,13 +17,12 @@ Home Assistant OS does not allow that — and nothing is built on the device.
    `https://github.com/datum-labs/datum-connect-daemon`.
 2. **Install.** Find **Datum Connect** in the store and click **Install**.
    This downloads a prebuilt image.
-3. **Add the service account key.** Put the key JSON from Datum at
-   `/share/datum-service-account.json`. The **File Editor** or **Samba**
-   add-on can do this from your browser or computer — see below for why this
-   must be a service account.
-4. **Configure.** On the add-on's **Configuration** tab, set `project` to your
-   Datum project.
-5. **Let Home Assistant accept proxied requests.** Home Assistant rejects
+3. **Add the service account key.** Open the key file you downloaded from
+   Datum in any text editor, copy all of it, braces included, and paste it
+   into **service_account_key** on the add-on's **Configuration** tab. Click
+   **Save**. The project is read from the key, so there's nothing else to
+   fill in. See below for why this must be a service account.
+4. **Let Home Assistant accept proxied requests.** Home Assistant rejects
    requests that arrive through a proxy it does not trust, and every request
    through the tunnel does. Without this step the public address returns
    `400: Bad Request`. Go to **Settings → System → Network**, turn on
@@ -34,7 +33,7 @@ Home Assistant OS does not allow that — and nothing is built on the device.
    Don't use an `http:` block in `configuration.yaml` for this. Current Home
    Assistant ignores it once the setting has moved into its own storage, and
    warns that it stops working altogether in 2027.2.
-6. **Start.** Click **Start**. The add-on creates the tunnel on first start
+5. **Start.** Click **Start**. The add-on creates the tunnel on first start
    and logs its address:
    `Home Assistant is reachable at https://<name>.datumproxy.net`.
    Later restarts reuse the same tunnel and address.
@@ -45,17 +44,21 @@ Updates appear as an **Update** button on the add-on, like any other add-on.
 
 | Option | What it is |
 |---|---|
-| `project` | The Datum project the tunnel is created in. Required. |
-| `service_account_key_file` | Path to the Datum service account JSON. Defaults to `/share/datum-service-account.json`. Required. |
+| `service_account_key` | The service account key JSON, pasted whole. Hidden in the UI and stored only in the add-on's private storage. |
+| `project` | The Datum project the tunnel is created in. Leave empty to use the project the key belongs to. |
+| `service_account_key_file` | Where to read the key from if `service_account_key` is empty. Defaults to `/share/datum-service-account.json`, for installs that already placed a file there. |
 | `target` | What the tunnel points at. Leave empty for this Home Assistant: the add-on asks Home Assistant which port it uses. Must be plain HTTP. |
 | `tunnel_label` | A name for the tunnel, to recognise it in the dashboard. The tunnel is found again by this name on every start, so changing it creates a new tunnel with a new address. |
 | `log_level` | Daemon log verbosity. Leave at `info` unless diagnosing something. |
 
 ### Use a service account, not your own login
 
-Download the service account credential JSON from Datum and place it where the
-add-on can read it — `/share` is reachable from the Samba and File Editor
-add-ons. Then point `service_account_key_file` at it.
+Create a service account in your Datum project, download its key JSON, and
+paste the key into `service_account_key`.
+
+The key is in your Home Assistant backups, whether pasted or placed in `/share`, so treat backups as
+containing a credential. If one leaks, delete the key in Datum and create a
+new one.
 
 It must be a service account. This is not a style preference; both failure
 modes have been observed on a real daemon within four days of each other. A
@@ -114,7 +117,7 @@ different target, also change `tunnel_label`, because an existing tunnel keeps
 the target it was created with.
 
 **The public address returns `400: Bad Request`.** Home Assistant doesn't
-trust the proxy yet. See step 5 of "Installing".
+trust the proxy yet. See step 4 of "Installing".
 
 **Every request fails with "not set-up for reverse proxies", or Home Assistant
 warns "HTTP YAML configuration is ignored after migration".** Home Assistant

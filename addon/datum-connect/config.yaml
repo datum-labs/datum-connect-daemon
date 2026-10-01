@@ -51,6 +51,8 @@ map:
 hassio_api: true
 
 options:
+  service_account_key: ""
+  # Empty means "the project the service account key belongs to".
   project: ""
   service_account_key_file: "/share/datum-service-account.json"
   # Empty means "this Home Assistant, on whatever port it uses".
@@ -59,17 +61,22 @@ options:
   log_level: "info"
 
 schema:
-  # The Datum project the tunnel is created in.
-  project: "str"
-  # Path to the service account credential JSON, as downloaded from Datum.
-  # A path rather than an inline value: the file is ~2KB and contains an RSA
-  # private key, which does not belong pasted into a UI text field or carried
-  # around inside an add-on configuration export.
+  # The service account key JSON, pasted whole into a masked field. This is
+  # the easy path: no File Editor, no file to place. It used to be avoided
+  # to keep the private key out of Home Assistant backups, but backups
+  # include /share too, where the file-based key lives, so a file was never
+  # better protected than this.
   #
   # It must be a service account, not a token from a personal login. Personal
   # sessions expire within days, cannot be renewed without a browser, and an
   # appliance that loses auth goes dark with no symptom but a failing hostname.
-  service_account_key_file: "str"
+  service_account_key: "password?"
+  # The Datum project the tunnel is created in. Left empty, it is read from
+  # the key: a service account's client_email is <name>@<project>.identity...
+  project: "str?"
+  # Where to read the key from when service_account_key is empty. Kept for
+  # installs that already placed a file.
+  service_account_key_file: "str?"
   # What the tunnel points at. Empty detects Home Assistant's own port.
   target: "str?"
   tunnel_label: "str?"
