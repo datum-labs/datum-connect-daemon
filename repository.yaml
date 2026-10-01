@@ -1,0 +1,9 @@
+# Makes this repository installable as a Home Assistant add-on repository:
+# Settings → Add-ons → Add-on Store → ⋮ → Repositories, then paste
+# https://github.com/datum-labs/datum-connect-daemon
+#
+# The Supervisor scans the repository for add-on folders (anything holding a
+# config.yaml), so addon/datum-connect/ is found without being listed here.
+name: Datum Connect
+url: https://github.com/datum-labs/datum-connect-daemon
+maintainer: Datum <https://datum.net>
