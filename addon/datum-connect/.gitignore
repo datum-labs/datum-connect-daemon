@@ -1,0 +1,4 @@
+# The daemon binary is a CI artifact, not source. Fetch it from the
+# `datum-connect-daemon-linux-arm64` artifact of the arm64 build workflow, or
+# from a release, and drop it at bin/datum-connect-daemon. See DOCS.md.
+bin/datum-connect-daemon
