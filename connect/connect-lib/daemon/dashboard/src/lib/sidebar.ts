@@ -1,6 +1,6 @@
 import type { Advertisement, Info, LogSource, PeerConnection, Tunnel } from '@/api';
 
-export type SidebarTab = 'tunnels' | 'peers' | 'logs';
+export type SidebarTab = 'tunnels' | 'peers' | 'logs' | 'map';
 export type TunnelScope = 'device' | 'all';
 
 export const TUNNEL_SORTS = { name: 'Name', status: 'Status', hostname: 'Hostname' } as const;
@@ -46,7 +46,7 @@ export function visibleTunnels(
 ): Tunnel[] {
   return tunnels
     .filter((t) => opts.scope === 'all' || isLocalTunnel(opts.info, t))
-    .filter((t) => matches(opts.query, t.label, t.endpoint, t.connector_device, ...t.hostnames))
+    .filter((t) => matches(opts.query, t.label, t.endpoint, t.connector_device, t.note, ...t.hostnames))
     .sort((a, b) => {
       if (opts.sort === 'status') return tunnelRank(a) - tunnelRank(b) || byName(a.label, b.label);
       if (opts.sort === 'hostname') return byName(tunnelHost(a), tunnelHost(b));

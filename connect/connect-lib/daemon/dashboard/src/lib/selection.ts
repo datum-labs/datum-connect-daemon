@@ -9,10 +9,11 @@ export type Selection =
   | { kind: 'peer-ad'; id: string }
   | { kind: 'peer-conn'; id: string }
   | { kind: 'device' }
+  | { kind: 'map' }
   | null;
 
 export function isSelected(selection: Selection, kind: NonNullable<Selection>['kind'], key: string): boolean {
   if (!selection || selection.kind !== kind) return false;
-  if (selection.kind === 'device') return true;
+  if (selection.kind === 'device' || selection.kind === 'map') return true;
   return (selection.kind === 'log' ? selection.name : selection.id) === key;
 }

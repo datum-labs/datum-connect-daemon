@@ -37,6 +37,8 @@ export interface Tunnel {
   connector_device: string | null;
   /** `setup` (a human), `operate:<token_id>` (an agent), or null. */
   last_start_actor: string | null;
+  /** Free-text "why this exists", set only via the CLI (`tunnel api note set`). */
+  note?: string | null;
 }
 
 export interface ProgressStep {

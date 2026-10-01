@@ -6,7 +6,7 @@ import { isSelected, type Selection } from '@/lib/selection';
 import { isLocalTunnel } from '@/lib/sidebar';
 import { SidebarMenu } from '@datum-cloud/datum-ui/sidebar';
 import { Tooltip } from '@datum-cloud/datum-ui/tooltip';
-import { BotIcon } from 'lucide-react';
+import { BotIcon, StickyNoteIcon } from 'lucide-react';
 
 function tunnelStatus(t: Tunnel) {
   if (t.enabled && t.connector_ready) return { tone: 'success', label: 'On · connector ready' } as const;
@@ -47,7 +47,19 @@ export function TunnelList({
               )
             }
             subtitle={host ? <TextCopy value={host} /> : '(no hostname yet)'}
-            meta={!isLocalTunnel(info, t) && `on ${t.connector_device || 'unknown device'}`}
+            meta={
+              (t.note || !isLocalTunnel(info, t)) && (
+                <div className="flex min-w-0 flex-col gap-0.5">
+                  {t.note && (
+                    <span className="flex min-w-0 items-center gap-1">
+                      <StickyNoteIcon className="size-3 shrink-0" />
+                      <span className="truncate">{t.note}</span>
+                    </span>
+                  )}
+                  {!isLocalTunnel(info, t) && <span>on {t.connector_device || 'unknown device'}</span>}
+                </div>
+              )
+            }
           />
         );
       })}

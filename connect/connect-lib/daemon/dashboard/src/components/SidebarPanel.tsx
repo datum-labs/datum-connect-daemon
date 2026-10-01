@@ -38,7 +38,7 @@ import { useState } from 'react';
 
 type Dashboard = ReturnType<typeof useDashboard>;
 
-const TABS = ['tunnels', 'peers', 'logs'] as const;
+export const TABS = ['tunnels', 'peers', 'logs', 'map'] as const;
 
 /**
  * Gate shared by all three tabs: no token → prompt, first poll in flight →
@@ -72,20 +72,23 @@ function count<T>(data: Loadable<T>, n: (d: T) => number): number | null {
 
 export function SidebarPanel({
   d,
+  tab,
+  onTabChange,
   selection,
   onSelect,
 }: {
   d: Dashboard;
+  tab: SidebarTab;
+  onTabChange: (tab: SidebarTab) => void;
   selection: Selection;
   onSelect: (selection: Selection) => void;
 }) {
   const hasToken = !!d.token;
-  const [tab, setTab] = useStoredState<SidebarTab>('dc_sidebar_tab', 'tunnels', TABS);
   const [tunnelSort, setTunnelSort] = useStoredState<TunnelSort>('dc_sort_tunnels', 'status', ['name', 'status', 'hostname']);
   const [peerSort, setPeerSort] = useStoredState<PeerSort>('dc_sort_peers', 'name', ['name', 'traffic']);
   const [logSort, setLogSort] = useStoredState<LogSort>('dc_sort_logs', 'name', ['name', 'size']);
   const [scope, setScope] = useStoredState<TunnelScope>('dc_tunnel_scope', 'device', ['device', 'all']);
-  const [queries, setQueries] = useState<Record<SidebarTab, string>>({ tunnels: '', peers: '', logs: '' });
+  const [queries, setQueries] = useState<Record<SidebarTab, string>>({ tunnels: '', peers: '', logs: '', map: '' });
   const query = queries[tab];
   const setQuery = (q: string) => setQueries((prev) => ({ ...prev, [tab]: q }));
 
@@ -96,11 +99,12 @@ export function SidebarPanel({
   return (
     <Sidebar collapsible="none" className="h-full">
       <SidebarHeader className="gap-3 border-b p-0 pt-3">
-        <Tabs value={tab} onValueChange={(v) => setTab(v as SidebarTab)} className="px-2">
+        <Tabs value={tab} onValueChange={(v) => onTabChange(v as SidebarTab)} className="px-2">
           <TabsList variant="line" className="w-full">
             <TabTrigger value="tunnels" label="Tunnels" count={tunnelCount} />
             <TabTrigger value="peers" label="Peers" count={peerCount} />
             <TabTrigger value="logs" label="Logs" count={logCount} />
+            <TabTrigger value="map" label="Map" count={null} />
           </TabsList>
         </Tabs>
         {hasToken && tab === 'tunnels' && (
@@ -190,6 +194,11 @@ export function SidebarPanel({
             }}
           </Gate>
         )}
+        {tab === 'map' && (
+          <Gate hasToken={hasToken} data={d.tunnels}>
+            {(all) => <MapSummary d={d} localTunnels={all.filter((t) => isLocalTunnel(d.info, t)).length} />}
+          </Gate>
+        )}
       </SidebarContent>
 
       <SidebarFooter className="gap-2 border-t px-2 py-2">
@@ -201,6 +210,23 @@ export function SidebarPanel({
         />
       </SidebarFooter>
     </Sidebar>
+  );
+}
+
+/** What the map is drawing — the map itself fills the detail pane. */
+function MapSummary({ d, localTunnels }: { d: Dashboard; localTunnels: number }) {
+  const peers = count(d.peers, (p) => p.advertisements.length + p.connections.length) ?? 0;
+  const logs = count(d.logSources, (l) => l.length) ?? 0;
+  return (
+    <div className="flex flex-col gap-2 px-2 py-3">
+      <Text as="p" size="xs" textColor="muted" className="leading-snug">
+        Live map of this daemon: {localTunnels} tunnel{localTunnels === 1 ? '' : 's'}, {peers} peer
+        {peers === 1 ? '' : 's'}, {logs} log{logs === 1 ? '' : 's'}. Click a station to open it.
+      </Text>
+      <Text as="p" size="xs" textColor="muted" className="leading-snug">
+        Always shows this device's own tunnels, whatever the Tunnels tab is set to.
+      </Text>
+    </div>
   );
 }
 

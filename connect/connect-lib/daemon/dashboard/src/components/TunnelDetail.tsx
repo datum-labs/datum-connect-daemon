@@ -12,7 +12,7 @@ import { Card } from '@datum-cloud/datum-ui/card';
 import { Skeleton } from '@datum-cloud/datum-ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@datum-cloud/datum-ui/table';
 import { Text } from '@datum-cloud/datum-ui/typography';
-import { BotIcon, ExternalLinkIcon } from 'lucide-react';
+import { BotIcon, ExternalLinkIcon, StickyNoteIcon } from 'lucide-react';
 import { useState } from 'react';
 
 interface Detail {
@@ -76,6 +76,14 @@ export function TunnelDetail({
       description={
         <div className="flex flex-col gap-2 pt-1">
           {hostname && <TextCopy value={hostname} className="text-sm" />}
+          {tunnel?.note && (
+            // Read-only: notes are set via the CLI (`tunnel api note set`),
+            // never from the dashboard.
+            <Card size="sm" className="text-foreground flex-row items-start gap-2 px-3 py-2 text-sm">
+              <StickyNoteIcon className="text-muted-foreground mt-0.5 size-3.5 shrink-0" />
+              <span className="whitespace-pre-wrap">{tunnel.note}</span>
+            </Card>
+          )}
           {tunnel?.enabled && isAgentActor(tunnel.last_start_actor) && (
             <div>
               <ToneBadge tone="warning" icon={<BotIcon className="size-3" />}>
