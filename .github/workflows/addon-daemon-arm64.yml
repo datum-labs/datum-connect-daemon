@@ -21,11 +21,13 @@ on:
     paths:
       - 'connect/connect-lib/**'
       - 'connect/scripts/check-glibc-max.sh'
+      - 'addon/**'
       - '.github/workflows/addon-daemon-arm64.yml'
   push:
     branches: [main]
     paths:
       - 'connect/connect-lib/**'
+      - 'addon/**'
       - '.github/workflows/addon-daemon-arm64.yml'
 
 env:
@@ -96,3 +98,81 @@ jobs:
           name: datum-connect-daemon-linux-arm64
           path: connect/connect-lib/target/release/datum-connect-daemon
           if-no-files-found: error
+
+  # Packages the binary into the add-on image the Supervisor pulls, so the
+  # add-on installs from the store with nothing copied onto the device.
+  #
+  # Built on every run so a broken Dockerfile fails the PR, but only pushed
+  # from main (or a manual run), and never over an existing tag: a tag the
+  # Supervisor has already pulled must not change underneath it. Shipping an
+  # update means bumping `version` in config.yaml.
+  image:
+    name: add-on image
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    env:
+      ADDON_DIR: addon/datum-connect
+      IMAGE: ghcr.io/datum-labs/aarch64-addon-datum-connect
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch the daemon binary
+        uses: actions/download-artifact@v4
+        with:
+          name: datum-connect-daemon-linux-arm64
+          path: ${{ env.ADDON_DIR }}/bin
+
+      - name: Read version and base image
+        id: meta
+        # sed rather than yq: the arm runner image does not promise yq.
+        run: |
+          version=$(sed -n 's/^version: *"\{0,1\}\([^"]*\)"\{0,1\} *$/\1/p' "$ADDON_DIR/config.yaml")
+          build_from=$(sed -n 's/^ *aarch64: *//p' "$ADDON_DIR/build.yaml")
+          [ -n "$version" ] || { echo "no version in config.yaml" >&2; exit 1; }
+          [ -n "$build_from" ] || { echo "no aarch64 base in build.yaml" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build_from=$build_from" >> "$GITHUB_OUTPUT"
+          echo "version $version, base $build_from"
+
+      - name: Build
+        # The io.hass.* labels are the ones HA's own builder stamps on add-on
+        # images; the source label links the package to this public repo.
+        run: |
+          docker build "$ADDON_DIR" \
+            --build-arg BUILD_FROM="${{ steps.meta.outputs.build_from }}" \
+            --label io.hass.type=addon \
+            --label io.hass.arch=aarch64 \
+            --label io.hass.version="${{ steps.meta.outputs.version }}" \
+            --label org.opencontainers.image.source="https://github.com/${{ github.repository }}" \
+            -t "$IMAGE:${{ steps.meta.outputs.version }}"
+
+      - name: Smoke-test the image
+        # The binary must load inside the real base image, not just pass the
+        # glibc gate on the build box.
+        run: |
+          docker run --rm --entrypoint /usr/bin/datum-connect-daemon \
+            "$IMAGE:${{ steps.meta.outputs.version }}" --help >/dev/null
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        if: github.event_name != 'pull_request'
+        run: |
+          tag="$IMAGE:${{ steps.meta.outputs.version }}"
+          if docker manifest inspect "$tag" >/dev/null 2>&1; then
+            echo "::warning::$tag already exists and was not overwritten. Bump version in $ADDON_DIR/config.yaml to publish this change."
+            exit 0
+          fi
+          docker push "$tag"
+          docker tag "$tag" "$IMAGE:latest"
+          docker push "$IMAGE:latest"

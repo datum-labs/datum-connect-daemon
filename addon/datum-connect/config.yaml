@@ -12,6 +12,16 @@ url: https://github.com/datum-labs/datum-connect-daemon
 arch:
   - aarch64
 
+# A prebuilt image, so the Supervisor pulls rather than builds. Building on the
+# device is not an option here (see the Dockerfile), and pulling is what lets
+# this install from the add-on store with no files copied onto the box.
+# Published by .github/workflows/addon-daemon-arm64.yml, tagged with `version`
+# above — bump `version` to ship an update; the Supervisor offers it as one.
+#
+# For local development from /addons/, delete this line and the Supervisor
+# builds from the Dockerfile instead (with the binary placed in bin/).
+image: "ghcr.io/datum-labs/{arch}-addon-datum-connect"
+
 # We exec the daemon as the container's main process and want the Supervisor's
 # restart-on-failure to act on *it*, not on an init shim that outlives it.
 init: false

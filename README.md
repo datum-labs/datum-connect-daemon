@@ -71,6 +71,14 @@ Or open `http://127.0.0.1:47780/` for the browser dashboard and paste in the sam
 
 The `docker/` demo app is a disposable target to tunnel to instead of a bare `python -m http.server`. `docker compose up --build` in `docker/`, then point a tunnel at `127.0.0.1:3000`.
 
+## Home Assistant add-on
+
+This repository is also a Home Assistant add-on repository. The daemon runs on a Home Assistant box as the **Datum Connect** add-on, installed entirely from the Home Assistant UI.
+
+[![Add this repository to your Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fdatum-labs%2Fdatum-connect-daemon)
+
+Setup steps are in [`addon/datum-connect/DOCS.md`](addon/datum-connect/DOCS.md).
+
 ## License
 
 AGPLv3 — see [LICENSE](./LICENSE). This repository also vendors a copy of [`datum-cloud/connect`](https://github.com/datum-cloud/connect) (also AGPLv3) under `connect/` — see [`connect/LICENSE`](./connect/LICENSE).
