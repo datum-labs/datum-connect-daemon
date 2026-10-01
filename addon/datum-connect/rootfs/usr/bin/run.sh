@@ -60,25 +60,33 @@ DAEMON_PID=$!
 # including while the tunnel setup below is still running.
 trap 'kill -TERM "${DAEMON_PID}" 2>/dev/null || true' TERM INT
 
-# The daemon answers HTTP slightly before it finishes writing setup.token, so
-# waiting on the port alone races and yields a 401 on the first call. Wait for
-# the token file itself — this is documented in deploy/daytona-poc.
+# Wait for both the setup token and the API itself. Neither one alone is
+# enough, and which arrives first varies: deploy/daytona-poc saw the port
+# answer before the token was written, while on the Green the token was
+# written first and the listener only bound after the daemon finished
+# reconciling existing tunnels against Datum Cloud — ~0.5s with ten tunnels,
+# longer with more. GET /v1/info needs no auth, so it is a clean readiness
+# probe.
+API="http://127.0.0.1:${PORT}/v1"
 TOKEN_FILE="${CONNECT_DIR}/daemon_auth/setup.token"
-for _ in $(seq 1 30); do
-    [ -s "${TOKEN_FILE}" ] && break
+READY=false
+for _ in $(seq 1 60); do
+    if [ -s "${TOKEN_FILE}" ] && curl -sf -o /dev/null "${API}/info"; then
+        READY=true
+        break
+    fi
     if ! kill -0 "${DAEMON_PID}" 2>/dev/null; then
         bashio::exit.nok "Daemon exited during startup. Check the log above."
     fi
     sleep 1
 done
 
-if [ ! -s "${TOKEN_FILE}" ]; then
-    bashio::exit.nok "Daemon never finished starting (no setup token after 30s)."
+if [ "${READY}" != true ]; then
+    bashio::exit.nok "Daemon never finished starting (API not answering after 60s). Check the log above."
 fi
 
 bashio::log.info "Daemon up (pid ${DAEMON_PID})"
 
-API="http://127.0.0.1:${PORT}/v1"
 AUTH="Authorization: Bearer $(cat "${TOKEN_FILE}")"
 
 # Ensure the tunnel exists and is on. Without this the add-on starts a daemon
@@ -88,9 +96,21 @@ AUTH="Authorization: Bearer $(cat "${TOKEN_FILE}")"
 # Idempotent across restarts: the tunnel is found again by its label, and the
 # daemon persists it, so a restart re-uses the same public hostname rather than
 # minting a new one each boot.
-if ! TUNNELS=$(curl -sf "${API}/tunnels" -H "${AUTH}"); then
-    bashio::exit.nok "Could not list tunnels. The daemon is up but cannot reach Datum Cloud — usually the service account key or project is wrong. Check the log above."
-fi
+# Keep the status and body apart: a 401/403 here means the service account is
+# not allowed into the project, anything else is not a credential problem, and
+# telling the user to recheck their key for a non-credential failure sends
+# them the wrong way.
+TUNNELS_FILE=$(mktemp)
+STATUS=$(curl -s -o "${TUNNELS_FILE}" -w '%{http_code}' "${API}/tunnels" -H "${AUTH}" || true)
+TUNNELS=$(cat "${TUNNELS_FILE}")
+rm -f "${TUNNELS_FILE}"
+case "${STATUS}" in
+    200) ;;
+    401|403)
+        bashio::exit.nok "Datum Cloud refused the service account for project ${PROJECT} (HTTP ${STATUS}). Check that the key belongs to this project. Response: ${TUNNELS}" ;;
+    *)
+        bashio::exit.nok "Could not list tunnels (HTTP ${STATUS:-no response}). Response: ${TUNNELS}" ;;
+esac
 TUNNEL_ID=$(jq -r --arg l "${LABEL}" 'map(select(.label == $l)) | first | .id // empty' <<<"${TUNNELS}")
 
 if [ -z "${TUNNEL_ID}" ]; then
