@@ -51,6 +51,26 @@ if bashio::var.is_empty "${LABEL}" || [ "${LABEL}" = "null" ]; then
     LABEL="home-assistant"
 fi
 
+# No target set means "this Home Assistant". Ask the Supervisor which port it
+# serves on rather than assuming 8123: the first real install was on port 80,
+# and the hard-coded default produced a 502 at the public hostname.
+if bashio::var.is_empty "${TARGET}" || [ "${TARGET}" = "null" ]; then
+    HA_PORT=$(bashio::core.port 2>/dev/null || true)
+    HA_SSL=$(bashio::core.ssl 2>/dev/null || true)
+    if bashio::var.is_empty "${HA_PORT}" || [ "${HA_PORT}" = "null" ]; then
+        HA_PORT=8123
+        bashio::log.warning "Could not ask the Supervisor for Home Assistant's port; assuming ${HA_PORT}. Set 'target' if that is wrong."
+    fi
+    # The daemon forwards plain HTTP only. Home Assistant serving TLS itself
+    # (ssl_certificate set) would fail every request with a 502 that says
+    # nothing about why, so stop here and say it instead.
+    if bashio::var.true "${HA_SSL}"; then
+        bashio::exit.nok "Home Assistant serves HTTPS directly on port ${HA_PORT}, and this add-on can only forward plain HTTP. Set 'target' to a plain-HTTP address for Home Assistant, or remove its own certificate settings. Datum's edge provides HTTPS either way."
+    fi
+    TARGET="http://127.0.0.1:${HA_PORT}"
+    bashio::log.info "Detected Home Assistant on port ${HA_PORT}"
+fi
+
 bashio::log.info "Starting Datum Connect daemon (project ${PROJECT}, target ${TARGET})"
 
 /usr/bin/datum-connect-daemon --port "${PORT}" &

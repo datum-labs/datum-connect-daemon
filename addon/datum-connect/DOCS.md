@@ -24,11 +24,16 @@ Home Assistant OS does not allow that — and nothing is built on the device.
 4. **Configure.** On the add-on's **Configuration** tab, set `project` to your
    Datum project.
 5. **Let Home Assistant accept proxied requests.** Home Assistant rejects
-   requests that arrive through a proxy it does not trust, and every
-   request through the tunnel does. Add `127.0.0.1` as a trusted proxy with
-   `use_x_forwarded_for` on. If you add it with an `http:` block in
-   `configuration.yaml` and requests still fail with "not set-up for reverse
-   proxies", see "Diagnosing" below.
+   requests that arrive through a proxy it does not trust, and every request
+   through the tunnel does. Without this step the public address returns
+   `400: Bad Request`. Go to **Settings → System → Network**, turn on
+   **Use X-Forwarded-For**, and add `127.0.0.1` and `::1` as trusted proxies.
+   If Home Assistant asks you to confirm the change, confirm it, or it reverts
+   after a few minutes.
+
+   Don't use an `http:` block in `configuration.yaml` for this. Current Home
+   Assistant ignores it once the setting has moved into its own storage, and
+   warns that it stops working altogether in 2027.2.
 6. **Start.** Click **Start**. The add-on creates the tunnel on first start
    and logs its address:
    `Home Assistant is reachable at https://<name>.datumproxy.net`.
@@ -42,8 +47,8 @@ Updates appear as an **Update** button on the add-on, like any other add-on.
 |---|---|
 | `project` | The Datum project the tunnel is created in. Required. |
 | `service_account_key_file` | Path to the Datum service account JSON. Defaults to `/share/datum-service-account.json`. Required. |
-| `target` | What the tunnel points at. Defaults to Home Assistant on this host. |
-| `tunnel_label` | A name for the tunnel, to recognise it in the dashboard. |
+| `target` | What the tunnel points at. Leave empty for this Home Assistant: the add-on asks Home Assistant which port it uses. Must be plain HTTP. |
+| `tunnel_label` | A name for the tunnel, to recognise it in the dashboard. The tunnel is found again by this name on every start, so changing it creates a new tunnel with a new address. |
 | `log_level` | Daemon log verbosity. Leave at `info` unless diagnosing something. |
 
 ### Use a service account, not your own login
@@ -101,12 +106,23 @@ token, whether that token is fresh, and whether the control plane accepts it.
 Those fail for different reasons and need different fixes, and an error from
 the public hostname looks identical for all three.
 
-**Every request fails with "not set-up for reverse proxies".** Home Assistant
+**The public address returns `502` with `upstream error: client error
+(Connect)`.** The tunnel works, but nothing answered at `target`. If you set
+`target` by hand, check the port. The address you use for Home Assistant on
+your network shows it: no port in the address means port 80. To switch to a
+different target, also change `tunnel_label`, because an existing tunnel keeps
+the target it was created with.
+
+**The public address returns `400: Bad Request`.** Home Assistant doesn't
+trust the proxy yet. See step 5 of "Installing".
+
+**Every request fails with "not set-up for reverse proxies", or Home Assistant
+warns "HTTP YAML configuration is ignored after migration".** Home Assistant
 2026.x stops reading the `http:` block in `configuration.yaml` once it has
-migrated that setting into its own storage, which it does on first boot. Then
-editing the YAML changes nothing, even though the config check still passes.
-Set the trusted proxy in the UI instead, or delete `.storage/http` and restart
-Home Assistant so it reads the YAML again.
+moved that setting into its own storage, which it does on first boot. After
+that, editing the YAML changes nothing, even though the config check still
+passes. Remove the `http:` block and set the trusted proxy under **Settings →
+System → Network**.
 
 ## Known limits
 
