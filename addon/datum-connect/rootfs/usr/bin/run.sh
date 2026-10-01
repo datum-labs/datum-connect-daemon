@@ -41,10 +41,24 @@ export DATUM_SESSION="service-account@${PROJECT}"
 export DATUM_CREDENTIALS_HELPER="${CREDENTIALS_HELPER}"
 export RUST_LOG="datum_connect_daemon=${LOG_LEVEL},connect_lib=${LOG_LEVEL}"
 
+# The daemon force-stops any tunnel left on for 24h. That backstop exists for
+# tunnels a person opens and forgets; this add-on's entire job is a tunnel that
+# stays on, and a daily silent outage is the failure it would produce here.
+# Turning the add-on off in the UI is the off switch.
+export DATUM_TUNNEL_MAX_HOURS=87600
+
+if bashio::var.is_empty "${LABEL}" || [ "${LABEL}" = "null" ]; then
+    LABEL="home-assistant"
+fi
+
 bashio::log.info "Starting Datum Connect daemon (project ${PROJECT}, target ${TARGET})"
 
 /usr/bin/datum-connect-daemon --port "${PORT}" &
 DAEMON_PID=$!
+
+# Hand the daemon the terminal signal so the Supervisor can stop it cleanly,
+# including while the tunnel setup below is still running.
+trap 'kill -TERM "${DAEMON_PID}" 2>/dev/null || true' TERM INT
 
 # The daemon answers HTTP slightly before it finishes writing setup.token, so
 # waiting on the port alone races and yields a 401 on the first call. Wait for
@@ -64,7 +78,55 @@ fi
 
 bashio::log.info "Daemon up (pid ${DAEMON_PID})"
 
-# Hand the daemon the terminal signal so the Supervisor can stop it cleanly,
-# and surface its exit status as the container's.
-trap 'kill -TERM "${DAEMON_PID}" 2>/dev/null || true' TERM INT
+API="http://127.0.0.1:${PORT}/v1"
+AUTH="Authorization: Bearer $(cat "${TOKEN_FILE}")"
+
+# Ensure the tunnel exists and is on. Without this the add-on starts a daemon
+# with nothing to serve, and installing it would still need someone with a
+# shell on the box — which HAOS does not offer.
+#
+# Idempotent across restarts: the tunnel is found again by its label, and the
+# daemon persists it, so a restart re-uses the same public hostname rather than
+# minting a new one each boot.
+if ! TUNNELS=$(curl -sf "${API}/tunnels" -H "${AUTH}"); then
+    bashio::exit.nok "Could not list tunnels. The daemon is up but cannot reach Datum Cloud — usually the service account key or project is wrong. Check the log above."
+fi
+TUNNEL_ID=$(jq -r --arg l "${LABEL}" 'map(select(.label == $l)) | first | .id // empty' <<<"${TUNNELS}")
+
+if [ -z "${TUNNEL_ID}" ]; then
+    bashio::log.info "Creating tunnel '${LABEL}' → ${TARGET}"
+    BODY=$(jq -n --arg l "${LABEL}" --arg e "${TARGET}" '{label: $l, endpoint: $e}')
+    if ! CREATED=$(curl -sf -X POST "${API}/tunnels" -H "${AUTH}" -H "Content-Type: application/json" -d "${BODY}"); then
+        bashio::exit.nok "Could not create the tunnel. Check that the service account can create tunnels in project ${PROJECT}."
+    fi
+    TUNNEL_ID=$(jq -r '.id' <<<"${CREATED}")
+else
+    EXISTING_TARGET=$(jq -r --arg id "${TUNNEL_ID}" '.[] | select(.id == $id) | .endpoint' <<<"${TUNNELS}")
+    bashio::log.info "Using existing tunnel '${LABEL}' (${TUNNEL_ID}) → ${EXISTING_TARGET}"
+    if [ "${EXISTING_TARGET%/}" != "${TARGET%/}" ]; then
+        bashio::log.warning "The 'target' option is ${TARGET}, but tunnel '${LABEL}' already points at ${EXISTING_TARGET}. Change 'tunnel_label' to create a new tunnel for the new target."
+    fi
+fi
+
+if ! curl -sf -X POST "${API}/tunnels/${TUNNEL_ID}/start" -H "${AUTH}" >/dev/null; then
+    bashio::exit.nok "Could not start tunnel ${TUNNEL_ID}. Check the log above."
+fi
+
+# Hostname assignment and DNS publication take a little while after start.
+# Report it when it lands; not finding it in time is worth a warning, not a
+# failure, since the tunnel keeps converging on its own.
+HOSTNAME=""
+for _ in $(seq 1 60); do
+    HOSTNAME=$(curl -sf "${API}/tunnels/${TUNNEL_ID}/progress" -H "${AUTH}" | jq -r '.hostnames[0] // empty' || true)
+    [ -n "${HOSTNAME}" ] && break
+    sleep 2
+done
+
+if [ -n "${HOSTNAME}" ]; then
+    bashio::log.info "Home Assistant is reachable at https://${HOSTNAME}"
+else
+    bashio::log.warning "Tunnel started, but no public hostname was reported within 2 minutes. It may still be provisioning; restart the add-on to check again."
+fi
+
+# Surface the daemon's exit status as the container's.
 wait "${DAEMON_PID}"
