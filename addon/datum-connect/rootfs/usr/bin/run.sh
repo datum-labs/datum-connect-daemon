@@ -13,22 +13,49 @@ CONNECT_DIR=/data/connect
 CREDENTIALS_HELPER=/usr/bin/sa-credentials-helper.sh
 
 PROJECT="$(bashio::config 'project')"
+PASTED_KEY="$(bashio::config 'service_account_key')"
 KEY_FILE="$(bashio::config 'service_account_key_file')"
 TARGET="$(bashio::config 'target')"
 LABEL="$(bashio::config 'tunnel_label')"
 LOG_LEVEL="$(bashio::config 'log_level')"
 
-if bashio::var.is_empty "${PROJECT}"; then
-    bashio::exit.nok "No 'project' configured. Set the Datum project this tunnel belongs to in the add-on configuration."
+# A pasted key wins over a file. It is written to the add-on's private /data,
+# readable by this add-on only, because the credentials helper reads a file.
+# The browser strips the line breaks from a pasted multi-line file, which is
+# harmless: whitespace between JSON tokens is insignificant, and the PEM key
+# inside is stored with escaped \n, not real line breaks.
+if ! bashio::var.is_empty "${PASTED_KEY}" && [ "${PASTED_KEY}" != "null" ]; then
+    KEY_FILE=/data/service-account.json
+    (umask 077 && printf '%s' "${PASTED_KEY}" > "${KEY_FILE}")
+    KEY_SOURCE="the pasted service_account_key"
+else
+    if bashio::var.is_empty "${KEY_FILE}" || [ "${KEY_FILE}" = "null" ]; then
+        KEY_FILE=/share/datum-service-account.json
+    fi
+    if [ ! -s "${KEY_FILE}" ]; then
+        bashio::exit.nok "No service account key. Paste the key file's contents into 'service_account_key' on the Configuration tab (or place the file at ${KEY_FILE})."
+    fi
+    KEY_SOURCE="${KEY_FILE}"
 fi
-if [ ! -s "${KEY_FILE}" ]; then
-    bashio::exit.nok "No service account key at ${KEY_FILE}. Download one from Datum and place it there — the Samba or File Editor add-on can put it in /share."
-fi
+unset PASTED_KEY
 
 # Checked here rather than left for the daemon to fail on later: a wrong file
 # in the right place is a confusing failure, and this is cheap.
 if ! jq -e 'select(.type == "datum_service_account") | .client_id, .private_key, .scope' "${KEY_FILE}" >/dev/null 2>&1; then
-    bashio::exit.nok "${KEY_FILE} is not a Datum service account key (expected a JSON file with type, client_id, private_key and scope). A personal login token will not work here."
+    bashio::exit.nok "${KEY_SOURCE} is not a Datum service account key (expected JSON with type, client_id, private_key and scope). Paste the whole file, braces included. A personal login token will not work here."
+fi
+
+# A service account's client_email is <name>@<project>.identity.miloapis.com,
+# so the project it belongs to can be read off the key rather than typed in.
+KEY_PROJECT=$(jq -r '.client_email // empty' "${KEY_FILE}" | sed -n 's/^[^@]*@\([^.]*\)\.identity\..*$/\1/p')
+if bashio::var.is_empty "${PROJECT}" || [ "${PROJECT}" = "null" ]; then
+    if [ -z "${KEY_PROJECT}" ]; then
+        bashio::exit.nok "Could not tell which project the service account key belongs to. Set 'project' on the Configuration tab."
+    fi
+    PROJECT="${KEY_PROJECT}"
+    bashio::log.info "Using project ${PROJECT} from the service account key"
+elif [ -n "${KEY_PROJECT}" ] && [ "${KEY_PROJECT}" != "${PROJECT}" ]; then
+    bashio::log.warning "'project' is ${PROJECT}, but the service account key belongs to ${KEY_PROJECT}. If tunnel calls are refused, clear 'project' to use the key's."
 fi
 
 mkdir -p "${CONNECT_DIR}"
@@ -49,6 +76,26 @@ export DATUM_TUNNEL_MAX_HOURS=87600
 
 if bashio::var.is_empty "${LABEL}" || [ "${LABEL}" = "null" ]; then
     LABEL="home-assistant"
+fi
+
+# No target set means "this Home Assistant". Ask the Supervisor which port it
+# serves on rather than assuming 8123: the first real install was on port 80,
+# and the hard-coded default produced a 502 at the public hostname.
+if bashio::var.is_empty "${TARGET}" || [ "${TARGET}" = "null" ]; then
+    HA_PORT=$(bashio::core.port 2>/dev/null || true)
+    HA_SSL=$(bashio::core.ssl 2>/dev/null || true)
+    if bashio::var.is_empty "${HA_PORT}" || [ "${HA_PORT}" = "null" ]; then
+        HA_PORT=8123
+        bashio::log.warning "Could not ask the Supervisor for Home Assistant's port; assuming ${HA_PORT}. Set 'target' if that is wrong."
+    fi
+    # The daemon forwards plain HTTP only. Home Assistant serving TLS itself
+    # (ssl_certificate set) would fail every request with a 502 that says
+    # nothing about why, so stop here and say it instead.
+    if bashio::var.true "${HA_SSL}"; then
+        bashio::exit.nok "Home Assistant serves HTTPS directly on port ${HA_PORT}, and this add-on can only forward plain HTTP. Set 'target' to a plain-HTTP address for Home Assistant, or remove its own certificate settings. Datum's edge provides HTTPS either way."
+    fi
+    TARGET="http://127.0.0.1:${HA_PORT}"
+    bashio::log.info "Detected Home Assistant on port ${HA_PORT}"
 fi
 
 bashio::log.info "Starting Datum Connect daemon (project ${PROJECT}, target ${TARGET})"
