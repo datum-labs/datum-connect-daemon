@@ -11,7 +11,8 @@ Home Assistant OS does not allow that — and nothing is built on the device.
 [![Add this repository to your Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fdatum-labs%2Fdatum-connect-daemon)
 
 1. **Add the repository.** Click the button above, or go to **Settings →
-   Add-ons → Add-on Store**, open the three-dot menu, choose
+   Apps** (called **Add-ons** before Home Assistant renamed them), open the
+   store, open the three-dot menu, choose
    **Repositories**, and add
    `https://github.com/datum-labs/datum-connect-daemon`.
 2. **Install.** Find **Datum Connect** in the store and click **Install**.
