@@ -42,6 +42,7 @@ func NewCmd() *cobra.Command {
 	cmd.AddCommand(newStartCmd())
 	cmd.AddCommand(newStopCmd())
 	cmd.AddCommand(newDeleteCmd())
+	cmd.AddCommand(newNoteCmd())
 	cmd.AddCommand(newTrafficCmd())
 	cmd.AddCommand(newReplayCmd())
 	cmd.AddCommand(newTokenCmd())
