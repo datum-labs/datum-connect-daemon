@@ -195,5 +195,85 @@ else
     bashio::log.warning "Tunnel started, but no public hostname was reported within 2 minutes. It may still be provisioning; restart the add-on to check again."
 fi
 
+# Put Datum's WAF in front of the tunnel. A public hostname for someone's
+# whole house should not be reachable without it, so there is no option to
+# turn it off here; the portal is where it is tuned or removed.
+#
+# Created only when missing, never overwritten: a policy that already exists
+# may have been tuned in the portal, and a restart must not undo that.
+#
+# Paranoia level 1 with rule 920420 excluded is the setting validated on a
+# real device (remote login, and saving an automation with a template
+# condition, over cellular). 920420 has to go at every level: Home
+# Assistant's login page POSTs JSON as text/plain, which CRS v4 rejects, so
+# login fails. Attacks in text/plain bodies are still caught by the other
+# rules. Level 2 also blocks any {{ }} template in a REST body, which breaks
+# template automations, so it stays off until it has targeted exclusions.
+#
+# A failure here is a warning, not an exit: the tunnel already works, and
+# taking it down because its WAF could not be set up helps no one.
+DATUM_API=${DATUM_API_URL:-https://api.datum.net}
+WAF_NAME="${TUNNEL_ID}-waf"
+WAF_URL="${DATUM_API}/apis/resourcemanager.miloapis.com/v1alpha1/projects/${PROJECT}/control-plane/apis/networking.datumapis.com/v1alpha/namespaces/default/trafficprotectionpolicies"
+PORTAL_LINK="https://cloud.datum.net (project ${PROJECT}, policy ${WAF_NAME})"
+
+ensure_waf() {
+    local token status body policy
+    if ! token=$("${CREDENTIALS_HELPER}" auth get-token --session "${DATUM_SESSION}"); then
+        bashio::log.warning "Edge protection NOT set up: could not get a token from the service account."
+        return
+    fi
+    body=$(mktemp)
+    status=$(curl -s -m 30 -o "${body}" -w '%{http_code}' "${WAF_URL}/${WAF_NAME}" \
+        -H "Authorization: Bearer ${token}" || true)
+    case "${status}" in
+        200)
+            bashio::log.info "Edge protection on (Datum WAF, existing policy kept). Manage it in the Datum portal: ${PORTAL_LINK}"
+            rm -f "${body}"
+            return ;;
+        404) ;;
+        *)
+            bashio::log.warning "Edge protection NOT set up: could not check for policy ${WAF_NAME} (HTTP ${status:-no response}). Response: $(cat "${body}")"
+            rm -f "${body}"
+            return ;;
+    esac
+
+    policy=$(jq -n --arg name "${WAF_NAME}" --arg route "${TUNNEL_ID}" --arg label "${LABEL}" '{
+        apiVersion: "networking.datumapis.com/v1alpha",
+        kind: "TrafficProtectionPolicy",
+        metadata: {
+            name: $name,
+            namespace: "default",
+            annotations: {"networking.datumapis.com/display-name": $label}
+        },
+        spec: {
+            mode: "Enforce",
+            samplingPercentage: 100,
+            ruleSets: [{
+                type: "OWASPCoreRuleSet",
+                owaspCoreRuleSet: {
+                    paranoiaLevels: {blocking: 1, detection: 1},
+                    scoreThresholds: {inbound: 5, outbound: 4},
+                    ruleExclusions: {ids: [920420]}
+                }
+            }],
+            targetRefs: [{group: "gateway.networking.k8s.io", kind: "HTTPRoute", name: $route}]
+        }
+    }')
+    status=$(curl -s -m 30 -o "${body}" -w '%{http_code}' -X POST "${WAF_URL}" \
+        -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+        -d "${policy}" || true)
+    case "${status}" in
+        200|201)
+            bashio::log.info "Edge protection on (Datum WAF). Manage it in the Datum portal: ${PORTAL_LINK}" ;;
+        401|403)
+            bashio::log.warning "Edge protection NOT set up: the service account may not create WAF policies in project ${PROJECT} (HTTP ${status}). Give it that permission, then restart the add-on." ;;
+        *)
+            bashio::log.warning "Edge protection NOT set up: creating policy ${WAF_NAME} failed (HTTP ${status:-no response}). Response: $(cat "${body}")" ;;
+    esac
+    rm -f "${body}"
+}
+ensure_waf
+
 # Surface the daemon's exit status as the container's.
 wait "${DAEMON_PID}"
