@@ -75,6 +75,33 @@ A service account avoids both. The add-on signs a short-lived assertion with
 the key and exchanges it for an access token on every request the daemon makes
 for one, so there is no browser step and no cached token to get stuck on.
 
+The service account also needs permission to create WAF policies (see below).
+
+## Edge protection (WAF)
+
+On every start, the add-on puts Datum's web application firewall in front of
+the tunnel. It creates a policy named `<tunnel id>-waf` in Enforce mode: the
+OWASP Core Rule Set at paranoia level 1, with rule `920420` excluded. There is
+no option to turn it off in the add-on. Tune it or remove it in the
+[Datum portal](https://cloud.datum.net). The log line `Edge protection on`
+names the policy.
+
+The add-on only creates the policy when it is missing. If one already exists,
+it is kept as is, so changes made in the portal survive restarts.
+
+Why these settings:
+
+- **Rule `920420` is excluded** because Home Assistant's login page sends its
+  JSON as `text/plain`, a content type that rule rejects, so login fails at
+  every paranoia level. Attacks in `text/plain` bodies are still caught by the
+  other rules.
+- **Paranoia level 2 is not used yet.** It blocks any `{{ }}` template in a
+  REST request, which breaks saving automations with template conditions.
+
+If the log says `Edge protection NOT set up`, the tunnel still works, but
+without the firewall. The usual cause is a service account that may not
+create WAF policies. Grant that permission and restart the add-on.
+
 ## Why the image is prebuilt
 
 Add-on `Dockerfile`s are normally free to build whatever they like, and the
