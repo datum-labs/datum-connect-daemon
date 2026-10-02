@@ -5,3 +5,13 @@
 *.sh text eol=lf
 *.py text eol=lf
 Dockerfile text eol=lf
+
+# Built dashboard bundle (Vite single-file output, embedded by the daemon via
+# include_str!). Committed so cargo builds never need Bun/Node; collapse it in
+# diffs and keep it out of language stats. Rebuild with `task build:dashboard`.
+connect/connect-lib/daemon/dashboard/dist/** linguist-generated -diff
+
+# The dashboard's sources feed a byte-for-byte committed bundle (CI fails if
+# dist/ is stale), so a Windows autocrlf checkout must not turn index.html's
+# line endings into CRLF and leak them into the build.
+connect/connect-lib/daemon/dashboard/** text=auto eol=lf

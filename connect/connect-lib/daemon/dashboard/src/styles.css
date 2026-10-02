@@ -1,0 +1,19 @@
+@import 'tailwindcss';
+@import '@datum-cloud/datum-ui/styles';
+@import '@datum-cloud/datum-ui/styles/canela';
+
+/* Network map: one-shot glow when a station's state changes between polls
+   (see useChangeFlash in components/NetworkMap.tsx). */
+@keyframes map-flash-line {
+  0%, 100% { filter: drop-shadow(0 0 0 var(--color-sky-400)); }
+  30% { filter: drop-shadow(0 0 8px var(--color-sky-400)); }
+}
+@keyframes map-flash-dot {
+  0%, 100% { stroke-width: 4; filter: drop-shadow(0 0 0 var(--color-sky-400)); }
+  30% { stroke-width: 8; filter: drop-shadow(0 0 8px var(--color-sky-400)); }
+}
+.map-flash-line { animation: map-flash-line 1.8s ease-out; }
+.map-flash-station circle { animation: map-flash-dot 1.8s ease-out; }
+@media (prefers-reduced-motion: reduce) {
+  .map-flash-line, .map-flash-station circle { animation: none; }
+}
