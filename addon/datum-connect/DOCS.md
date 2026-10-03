@@ -79,12 +79,18 @@ The service account also needs permission to create WAF policies (see below).
 
 ## Edge protection (WAF)
 
-On every start, the add-on puts Datum's web application firewall in front of
-the tunnel. It creates a policy named `<tunnel id>-waf` in Enforce mode: the
-OWASP Core Rule Set at paranoia level 1, with rule `920420` excluded. There is
-no option to turn it off in the add-on. Tune it or remove it in the
-[Datum portal](https://cloud.datum.net). The log line `Edge protection on`
-names the policy.
+On every start, the add-on sets up Datum's web application firewall for the
+tunnel: a policy named `<tunnel id>-waf` with the OWASP Core Rule Set at
+paranoia level 1 and rule `920420` excluded.
+
+**For now, the policy is created switched off (`Disabled`).** While a WAF is
+attached, Datum's edge holds back streamed responses, so Home Assistant's live
+views, such as an add-on's log, never load. It can't yet be limited to skip
+just those pages either. Both are platform issues being fixed. Until then you
+can turn the WAF on yourself in the [Datum portal](https://cloud.datum.net), by
+setting the policy's mode to `Enforce`, if you'd rather have the protection
+than remote live views. The `Edge protection policy` log line names the
+policy.
 
 The add-on only creates the policy when it is missing. If one already exists,
 it is kept as is, so changes made in the portal survive restarts.
@@ -171,6 +177,14 @@ passes. Remove the `http:` block and set the trusted proxy under **Settings →
 System → Network**.
 
 ## Known limits
+
+**Streaming is limited to 1 hour.** Datum's edge allows a single response at
+most an hour, even with the request timeout raised (see "Request timeout").
+A live view, such as an add-on's log, left open longer than that is cut, and
+reloading the page starts a new hour. The same applies to downloads.
+
+**Live views don't load with the WAF switched on.** See "Edge protection
+(WAF)".
 
 The watchdog in `config.yaml` restarts the add-on if the daemon's local API
 stops answering. That proves the process is alive; it does **not** prove the

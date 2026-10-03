@@ -195,15 +195,18 @@ else
     bashio::log.warning "Tunnel started, but no public hostname was reported within 2 minutes. It may still be provisioning; restart the add-on to check again."
 fi
 
-# Put Datum's WAF in front of the tunnel. A public hostname for someone's
-# whole house should not be reachable without it, so there is no option to
-# turn it off here; the portal is where it is tuned or removed.
+# Set up Datum's WAF for the tunnel, but leave it switched off for now. With a
+# WAF attached, Datum's edge holds back streamed responses entirely, so Home
+# Assistant's live views (such as an add-on's log) never load (datum-cloud/
+# infra#6677), and it cannot yet be scoped to skip just those paths
+# (datum-cloud/infra#6702). The policy is created in Disabled mode so it is
+# ready in the portal to switch on; once those are fixed, this becomes Enforce.
 #
 # Created only when missing, never overwritten: a policy that already exists
 # may have been tuned in the portal, and a restart must not undo that.
 #
 # Paranoia level 1 with rule 920420 excluded is the setting validated on a
-# real device (remote login, and saving an automation with a template
+# real device when enforced (remote login, and saving an automation with a template
 # condition, over cellular). 920420 has to go at every level: Home
 # Assistant's login page POSTs JSON as text/plain, which CRS v4 rejects, so
 # login fails. Attacks in text/plain bodies are still caught by the other
@@ -236,7 +239,7 @@ ensure_waf() {
         -H "Authorization: Bearer ${token}" || true)
     case "${status}" in
         200)
-            bashio::log.info "Edge protection on (Datum WAF, existing policy kept). Manage it in the Datum portal: ${PORTAL_LINK}"
+            bashio::log.info "Edge protection policy found (Datum WAF, existing policy kept as set). Manage it in the Datum portal: ${PORTAL_LINK}"
             rm -f "${body}"
             return ;;
         404) ;;
@@ -255,7 +258,7 @@ ensure_waf() {
             annotations: {"networking.datumapis.com/display-name": $label}
         },
         spec: {
-            mode: "Enforce",
+            mode: "Disabled",
             samplingPercentage: 100,
             ruleSets: [{
                 type: "OWASPCoreRuleSet",
@@ -273,7 +276,7 @@ ensure_waf() {
         -d "${policy}" || true)
     case "${status}" in
         200|201)
-            bashio::log.info "Edge protection on (Datum WAF). Manage it in the Datum portal: ${PORTAL_LINK}" ;;
+            bashio::log.info "Edge protection policy created, switched OFF for now (Datum WAF blocks live streams until a platform fix). Turn it on in the Datum portal: ${PORTAL_LINK}" ;;
         401|403)
             bashio::log.warning "Edge protection NOT set up: the service account may not create WAF policies in project ${PROJECT} (HTTP ${status}). Give it that permission, then restart the add-on." ;;
         *)
