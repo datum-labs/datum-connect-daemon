@@ -102,6 +102,22 @@ If the log says `Edge protection NOT set up`, the tunnel still works, but
 without the firewall. The usual cause is a service account that may not
 create WAF policies. Grant that permission and restart the add-on.
 
+## Request timeout
+
+Datum's edge ends any response 15 seconds after the request by default. That
+is too short for Home Assistant: live views such as an add-on's log stop
+after 15-20 seconds, and so does any download that takes longer. On every
+start, the add-on therefore raises the limit for its tunnel to 1 hour, the
+most the platform allows, with a policy named `<tunnel id>-timeout`.
+
+As with the WAF, the policy is only created when it is missing. If one
+already exists, it is kept as is, so a value changed since survives restarts.
+
+If the log says `Edge request timeout NOT raised`, the tunnel still works, but
+long streams and downloads are cut at about 15 seconds. The usual cause is a
+service account that may not create traffic policies. Grant that permission
+and restart the add-on.
+
 ## Why the image is prebuilt
 
 Add-on `Dockerfile`s are normally free to build whatever they like, and the
