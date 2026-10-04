@@ -1,6 +1,6 @@
 # Plan: merge Scot's networking core with Brett's feature layer
 
-Drafted 2026-10-02. Status: **proposal, not yet agreed with Scot.** No code has been written.
+Drafted 2026-10-02, updated 2026-10-04. Status: **Scot agreed to the split and to 2 of the 3 open decisions (see "Decisions with Scot").** No code has been written yet.
 
 ## The decision being implemented
 
@@ -12,6 +12,18 @@ Going forward there are two projects:
 | **datum-labs/datum-connect-daemon** | Brett | Features, dashboards, integrations: dashboard and network map, L7 inspector and replay, log tail, tunnel notes, visible-signal and audit presentation, the HA add-on, Android, Daytona and SSH demos, and the user-facing CLI commands for those features |
 
 Brett's project consumes Scot's as a **pinned library dependency**. It no longer contains its own networking code.
+
+## Decisions with Scot (2026-10-04)
+
+| # | Decision | Outcome |
+|---|---|---|
+| 1 | Integration style | **Option C (embedded `connect-runtime`) is agreed, on two conditions:** (1) it results in **one canonical daemon/runtime**, and (2) **policy, identity, state and reconciliation stay enforced inside that runtime**. Our extension hooks can add features but can't bypass or re-implement any of that. **Option B (separate process over his API) is fine as the interim path** until the runtime split lands |
+| 2 | Plugin | **One `datumctl connect`.** Scot prefers folding our dashboard and inspector surfaces into his plugin over shipping two plugins. Our feature commands go there as PRs Scot reviews |
+| 3 | Ticket-style cross-project sharing | **Still open** |
+
+Other updates from Scot:
+- **VPC gateway API.** Scot now has an API endpoint that deploys a gateway inside a VPC, to support VPN (CONNECT-IP) tunnels. That's the platform half of GVPC landing, which we'd been planning separately.
+- **Security.** Scot confirmed the findings we sent him privately and is tracking the fixes in core.
 
 ## What the evaluation found
 
@@ -80,7 +92,7 @@ datum-labs/datum-connect-daemon (Brett)                datum-cloud/connect (Scot
                                                        └──────────────────────────────┘
 ```
 
-**Recommended integration style: embed his runtime as a library (Option C below).**
+**Agreed integration style: embed his runtime as a library (Option C below). Option B is the interim path.**
 - Scot splits his `daemon` crate into a `connect-runtime` library plus a thin binary.
 - Our daemon builds his runtime and mounts his `/v1` router under its own routes.
 - Our feature routes and the dashboard are added on top of that.
@@ -93,7 +105,7 @@ datum-labs/datum-connect-daemon (Brett)                datum-cloud/connect (Scot
 | B. Two processes | His daemon runs unchanged; ours becomes a companion app using his HTTP API | Cleanest ownership, no Rust coupling | Two installs and two services. The inspector can't hook the data path except as a loopback hop. Everything polls. HA/Android packaging gets harder |
 | **C. Embedded runtime** | His runtime as a library with a router and an extension API; ours is the binary users run | One process; clear boundary; features get events and diagnostics in-process | Scot has to carve out a library API (backlog item 10) |
 
-**If Scot doesn't want to maintain a library API, B is the fallback.** It needs only items 3 and 4 from his backlog.
+**Interim: B, until `connect-runtime` exists.** His daemon does MASQUE serve/dial/networks. Ours keeps running the legacy gateway path and the feature layer, and the dashboard reads both APIs. This needs only items 3 and 4 from his backlog, and it lets us start before the runtime split.
 
 ## Feature-by-feature mapping
 
@@ -102,14 +114,14 @@ datum-labs/datum-connect-daemon (Brett)                datum-cloud/connect (Scot
 | Public HTTPS tunnels (HTTPProxy + gateway) | `ListenNode` + `iroh-proxy-utils` | **Kept on the legacy adapter**, isolated in one module, until the platform MASQUE gateway ships. Then it moves to his `serve --public` |
 | Peer tunnels (tickets) | `peer.rs`, n0 relays, no Datum | His `serve` + `dial` with private policy or an explicit `allow` list. **Open question: should we keep "anyone with a ticket, cross-project, no Datum account"?** His model needs an enrolled Connector in the same project. Options: drop it, or add a ticket → allow-key mechanism in core |
 | Dialing Scot's/others' connectors | Not possible | Native, via his `POST /v1/dials`. The earlier Scot-connector dial plan (Phases 1–2) folds into this plan |
-| CONNECT-IP / GVPC landing | Plan only | Native, via his `POST /v1/networks` plus ip-adapter. The GVPC edge landing plan gets rebased on it |
+| CONNECT-IP / GVPC landing | Plan only | Native, via his `POST /v1/networks` plus ip-adapter. **Scot already has an API endpoint that deploys a VPC gateway for VPN tunnels**, so the client side can target it directly. The GVPC edge landing plan gets rebased on it. The network map shows VPC gateways as their own line |
 | Token tiers and audit | Ours: setup / per-tunnel operate / global viewer | **Use his** (`Setup/Operate/Viewer`, scoped `project\|service\|dial`, expiry, revocation). Port our viewer-token UX and `last_actor` visible-signal on top. Our `/v1/tunnels/:id/tokens` becomes a thin alias, then is retired |
 | L7 inspector and replay | HTTPProxy backend → inspector port → target | **Keep, as an opt-in loopback hop.** The serve target points at the inspector, and the inspector forwards to the real target. That makes it protocol-agnostic in core and HTTP-only only when enabled. It needs a core hook to rewrite a service target, or we register the service with the inspector address |
 | Metrics panel | `iroh_proxy_utils::UpstreamMetrics` | His `TransportStats` + `PeerDiagnostics`. **Needs per-service and inbound stats from core** (item 4) |
 | Network map ("subway map") | Derived from `/v1/tunnels` + `/v1/peers` `conn_type` | Derived from his status: services, dials, networks, per-peer `path` and `rtt_ms`. VPC networks finally appear as their own line. Better with an event stream (item 3) |
 | Tunnel notes, log tail, auto-expiry, restart auto-resume | Ours, independent | Kept as is. Notes are keyed by his service/dial ids instead of tunnel ids |
 | Dashboard | Polls our API every 3 s | Same, against the merged API. Switch to SSE when core adds events |
-| datumctl plugin | Ours: `tunnel …` and `tunnel api …` | **Both are named `datumctl connect`, so they collide.** Proposal: Scot's plugin is the base (install, daemon service, up/serve/dial/join). Our feature commands become a subcommand group in it, or a separate plugin such as `datumctl connect-ui`. **Decide with Scot** |
+| datumctl plugin | Ours: `tunnel …` and `tunnel api …` | **Decided: one `datumctl connect`, Scot's.** Our dashboard and inspector surfaces (and the notes, logs and token UX) fold into it as PRs Scot reviews. Our plugin is retired once that's done |
 | HA add-on (aarch64, GHCR) | Builds our daemon | Rebuilt on the merged binary. Our glibc ≤ 2.36 gate and native arm64 build carry over. A CONNECT-IP/TUN add-on would need `NET_ADMIN` |
 | Android POC | Our daemon as `lib*.so` | Rebuild on iroh 1.0. CONNECT-IP would need Android `VpnService`, which is out of scope for now |
 | Daytona and SSH demos | Use peer/gateway tunnels | Re-scripted on serve/dial after Phase 3 |
@@ -120,10 +132,10 @@ datum-labs/datum-connect-daemon (Brett)                datum-cloud/connect (Scot
 
 ### Phase 0: agreement and contract (about 1 week, mostly conversation)
 
-1. Settle the three decisions with Scot:
-   - (a) integration option C vs B;
-   - (b) plugin naming and ownership;
-   - (c) whether ticket-style cross-project sharing lives in core.
+1. Decisions with Scot:
+   - ~~(a) integration option C vs B~~: C agreed, B as the interim path.
+   - ~~(b) plugin naming and ownership~~: one `datumctl connect`, Scot's.
+   - (c) whether ticket-style cross-project sharing lives in core: **still open**.
 2. Agree the core backlog items the feature layer needs first: **10** (runtime as a library), **3** (events and typed status), **4** (inbound and per-service diagnostics).
 3. **Versioning.** He tags releases; we pin a tag via a Cargo git dependency. Breaking API changes come with a note.
 4. Ask the platform/NSO team when the MASQUE gateway is scheduled. This sets when the legacy adapter can be retired.
@@ -138,7 +150,8 @@ datum-labs/datum-connect-daemon (Brett)                datum-cloud/connect (Scot
 
 ### Phase 2: adopt the core (about 1–2 weeks)
 
-1. Our daemon builds his runtime (or library pieces, if Option C isn't ready yet) and mounts his `/v1` API.
+1. **Interim (B):** his daemon runs alongside ours. The dashboard reads his `/v1/status` and `/v1/audit` for MASQUE services, dials and networks, and reads ours for legacy public tunnels and features.
+   **Final (C):** once `connect-runtime` lands, our binary embeds it and mounts his `/v1` router. Then there's one daemon again. Every feature hook goes through his runtime's policy and identity; none of them bypass it.
 2. Remove our `peer.rs`, the per-tunnel `ListenNode` and `HeartbeatAgent` from the MASQUE path. Move the legacy gateway path into `legacy_gateway.rs`, with nothing else touching iroh internals.
 3. Converge local auth and audit on his model. Migrate existing `daemon_auth/` tokens, or force a one-time re-mint (simpler; it's a preview).
 4. **Exit criteria:** serve, dial and network all work from our binary, existing public tunnels still work through the legacy adapter, and his test suite plus ours pass in CI.
@@ -166,6 +179,8 @@ When the platform gateway speaks `datum-connect/masque-v1`:
 
 ## Ongoing rules between the two projects
 
+- **One canonical runtime.** Policy, identity, state and reconciliation are enforced only in Scot's runtime. Feature code may observe and extend it, but never re-implements or bypasses it.
+
 - **Networking changes go upstream.** If a feature needs a change in transport, policy or enrollment, it's a PR or issue on Scot's repo, never a patch in ours. (Exception: the legacy adapter, until Phase 5.)
 - **We never push to datum-cloud/connect directly** without Scot's say-so. Contributions go through PRs he reviews.
 - **Pin tags, not branches.** We upgrade deliberately, and the dashboard's e2e run gates each bump.
@@ -184,10 +199,11 @@ When the platform gateway speaks `datum-connect/masque-v1`:
 
 ## Questions for Scot
 
-1. Will you split `daemon` into `connect-runtime` (library) + binary, with a router we can mount and an extension hook (target rewrite for the inspector, event subscription)? If not, are you OK with Option B (two processes, HTTP only)?
-2. Plugin: one `datumctl connect` with our commands added, or separate plugins?
+1. ~~Runtime split?~~ **Yes (2026-10-04),** as long as there's one canonical runtime that keeps the enforcement. B is fine as the interim path. *Follow-up: what does the extension hook look like? We need inspector target rewrite and event subscription.*
+2. ~~Plugin?~~ **One `datumctl connect`, with our dashboard and inspector folded in** (2026-10-04).
 3. Should ticket-style, cross-project, no-account sharing exist in core?
 4. Priorities: events/typed status, inbound diagnostics, connection reuse, and making `fail_closed` per-service instead of global. Which do you already plan to do?
 5. Release cadence and tag scheme we can pin to.
 6. Do you know the platform MASQUE gateway timeline?
 7. Will you take PRs for Datum prod relays + relay probing, and for Windows fixes from our Windows testing?
+8. *New:* What's the API for the VPC gateway endpoint, and is it on staging? We'd like the network map and the GVPC client path to target it.
