@@ -1,4 +1,7 @@
-# Datum Connect Daemon — local API reference
+# Datum Connect daemon local API reference
+
+> Historical Labs proof of concept. This API describes the separate daemon in
+> this repository, not the current `datum-cloud/connect` daemon API.
 
 This documents the local HTTP API exposed by `datum-connect-daemon` (`connect/connect-lib/daemon`). It's a loopback-only API (`127.0.0.1`, never bound to a public interface) fronting one Datum Cloud project per daemon instance. The `datumctl connect` plugin (`tunnel api ...` / `tunnel daemon ...`) is the reference client; anything else (a browser client, an MCP server) talks to the same endpoints directly over HTTP.
 
@@ -75,7 +78,9 @@ Turns the tunnel on: mints/rewires its listen key if needed, starts the heartbea
 ### `POST /v1/tunnels/:id/stop` — setup or operate (scoped)
 Turns the tunnel off. Returns the current `TunnelSummary`. Idempotent if already stopped. Also invoked internally by the auto-expiry sweep (see below) — that path logs as `auto_expired`, not `stop`, in the audit log.
 
-## Traffic (L7 inspector) — setup or viewer for all of these
+## Traffic inspection
+
+Setup and viewer tokens can read and replay traffic.
 
 Each tunnel has its own reverse-proxy inspector sitting between the tunnel and the real local target, capturing request/response headers and bodies (capped at 64KB each; full traffic still streams through uncapped, only the *recorded copy* is capped, with `body_truncated: true` past the cap). Known-sensitive headers (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, `X-Auth-Token`) are redacted to `[redacted]` **at capture time**, before they ever enter the stored exchange — the real value still reaches the local target unchanged, only the recorded/displayable copy is redacted. Body content is not redacted (not reliably possible — a secret in a JSON field looks like any other string), so treat captured traffic as sensitive to whatever your own tunneled app actually sends.
 
@@ -144,7 +149,10 @@ Returns the last ~500 entries from the append-only audit log (`daemon_auth/audit
 ```
 `event` is one of: `create`, `delete`, `start`, `stop`, `auto_expired`, `token_created`, `token_revoked`, `viewer_token_created`, `viewer_token_revoked`, `log_source_added`, `log_source_removed`. `actor` is `setup`, `operate:<token_id>`, `viewer`, or `system` (the auto-expiry sweep) — log-source events are always `setup`, since registering one is a setup-only action.
 
-## App-to-app (peer) tunnels — setup only, except `GET /v1/peers` (setup or viewer)
+## Peer tunnels
+
+Only setup tokens can advertise or connect to peers. Setup and viewer tokens can
+list peers.
 
 Direct daemon-to-daemon tunnels over iroh, with no Datum Cloud involvement at any layer — no project, no HTTPProxy/Connector, and pinned to iroh's own public relays rather than Datum's. Shown in the dashboard's "Peer tunnels" section.
 

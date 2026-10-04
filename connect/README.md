@@ -1,4 +1,8 @@
-# Datum Connect Plugin
+# Datum Connect plugin
+
+> Historical Labs proof of concept. This vendored plugin documents the older
+> `tunnel` command tree; use the canonical `datum-cloud/connect` repository for
+> current CLI commands and installation instructions.
 
 A `datumctl` plugin (`datumctl connect tunnel listen ...`) that wraps the Rust
 [`datum-connect`](connect-lib/) binary to manage Datum Connect tunnels.

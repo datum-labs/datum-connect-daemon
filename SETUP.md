@@ -1,5 +1,8 @@
 # Setup
 
+> Historical Labs proof of concept. These setup instructions apply only to the
+> daemon in this repository, not the current `datum-cloud/connect` product.
+
 Build-from-source instructions for the daemon and CLI plugin. This is the mechanical "get it building and running" part — see the top-level [README.md](./README.md) for what this project actually is and what's proven to work.
 
 ## What you're building

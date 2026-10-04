@@ -1,8 +1,14 @@
-# Datum Connect Daemon
+# Datum Connect daemon: Labs proof of concept
 
-A headless daemon that puts Datum Cloud tunnels — and direct peer-to-peer tunnels — behind one local HTTP API, so a desktop UI, the `datumctl` CLI, a browser dashboard, and AI agents can all be thin clients of the same running process instead of each reimplementing tunnel logic. Same shape as Tailscale's `tailscaled` + CLI + GUI.
+> Historical Labs proof of concept. This repository is separate from the current
+> `datum-cloud/connect` product and vendors an older snapshot. Its `tunnel api`
+> commands and API reference are not current `datumctl connect` instructions.
 
-> **Labs-tier, not for production.** This is an early, actively-evolving project out of [Datum Labs](https://github.com/datum-labs) — demos and tools for Datum Cloud, not hardened or supported the way the core platform is. Expect rough edges; see [Status](#status) for what's actually proven versus still aspirational.
+This project puts Datum Cloud tunnels and direct peer-to-peer tunnels behind a
+local HTTP API. A CLI, browser dashboard, or script can call the same daemon.
+
+> Labs-tier and not for production. This project is an early Datum Labs demo.
+> See [Status](#status) for its verified behavior and known limitations.
 
 ## What it does
 
