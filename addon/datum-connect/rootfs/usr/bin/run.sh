@@ -232,7 +232,7 @@ fi
 #
 # Created only when missing, never overwritten: a policy that already exists
 # may have been tuned in the portal, and a restart must not undo that. The
-# one exception is the switched-off policy add-on 0.1.5 created, recognised
+# one exception is the switched-off policy add-on 0.1.5 or 0.1.6 created, recognised
 # strictly (see is_addon_015_waf) and moved to this setup once. Every policy
 # the add-on writes carries the managed-by annotation; one without it is
 # never changed.
@@ -257,7 +257,7 @@ MANAGED_BY_KEY="connect.datum.net/managed-by"
 MANAGED_BY_VALUE="datum-connect-addon"
 PROTECTED_RULE="protected"
 
-# The policy's spec, shared by a fresh create and the 0.1.5 upgrade.
+# The policy's spec, shared by a fresh create and the 0.1.5/0.1.6 upgrade.
 WAF_SPEC=$(jq -n --arg route "${TUNNEL_ID}" --arg section "${PROTECTED_RULE}" '{
     mode: "Enforce",
     samplingPercentage: 100,
@@ -300,8 +300,8 @@ check_protected_rule() {
     rm -f "${body}"
 }
 
-# True only for the exact policy add-on 0.1.5 created: switched off, aimed at
-# the whole route, without our annotation, and with the 0.1.5 rule set
+# True only for the exact policy add-on 0.1.5 or 0.1.6 created: switched off, aimed at
+# the whole route, without our annotation, and with that rule set
 # unchanged. Anything else may have been chosen in the portal.
 is_addon_015_waf() {
     jq -e --arg route "${TUNNEL_ID}" --arg key "${MANAGED_BY_KEY}" '
@@ -321,7 +321,7 @@ is_addon_015_waf() {
     ' "$1" >/dev/null
 }
 
-# Moves the 0.1.5 policy to the current spec in place. The PUT carries the
+# Moves that switched-off policy to the current spec in place. The PUT carries the
 # resourceVersion just read, so an edit made in between wins over this (409).
 upgrade_015_waf() {
     local token=$1 current=$2 status body policy
@@ -333,7 +333,7 @@ upgrade_015_waf() {
         -d "${policy}" || true)
     case "${status}" in
         200|201)
-            bashio::log.info "Edge protection policy from add-on 0.1.5 switched ON: Datum WAF now enforces on everything except Home Assistant's streaming endpoints. Manage it in the Datum portal: ${PORTAL_LINK}" ;;
+            bashio::log.info "Edge protection policy from add-on 0.1.5/0.1.6 switched ON: Datum WAF now enforces on everything except Home Assistant's streaming endpoints. Manage it in the Datum portal: ${PORTAL_LINK}" ;;
         409)
             bashio::log.warning "Edge protection still OFF: policy ${WAF_NAME} changed while being upgraded, so it was left as is. Restart the add-on to try again." ;;
         401|403)

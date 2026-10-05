@@ -99,8 +99,8 @@ The add-on only creates the policy when it is missing. If one already exists,
 it is kept as is, so changes made in the portal survive restarts. Policies the
 add-on creates carry the annotation
 `connect.datum.net/managed-by: datum-connect-addon`. A policy without it is
-never changed, with one exception: the switched-off policy add-on 0.1.5
-created is switched on as above, once, and only if it is exactly as 0.1.5
+never changed, with one exception: the switched-off policy add-on 0.1.5 or 0.1.6
+created is switched on as above, once, and only if it is exactly as those versions
 left it.
 
 If the log says `Edge protection is OFF: tunnel ... has no rule named
