@@ -109,6 +109,10 @@ struct AppState {
     /// Operator-configurable hard cap on `/v1/logs/:name/tail` — see
     /// `Args::log_tail_max_lines`.
     log_tail_max_lines: usize,
+    /// Parsed `Args::waf_exempt_matches`, handed to every per-tunnel
+    /// `TunnelService` so its enable path writes the same rules as
+    /// `control` does (otherwise each start would undo the split).
+    waf_exempt_matches: Vec<connect_lib::datum_apis::http_proxy::HTTPRouteMatch>,
     /// When this daemon process started, for the dashboard's uptime.
     started_at_unix_ms: u128,
 }
@@ -194,6 +198,15 @@ struct Args {
     /// dashboard can show it.
     #[clap(long, env = "DATUM_LOG_TAIL_MAX_LINES", default_value_t = 1000)]
     log_tail_max_lines: usize,
+    /// JSON array of HTTPRoute matches that get their own `streams` rule on
+    /// every tunnel's HTTPProxy, ahead of a `protected` rule for the rest,
+    /// so a WAF scoped to `protected` skips them. Set by the Home Assistant
+    /// add-on for HA's streaming endpoints, which Datum's WAF holds back
+    /// (infra#6677). Unset (the default) leaves the rules exactly as before.
+    /// Invalid JSON stops the daemon at startup: silently ignoring it would
+    /// leave a `protected`-scoped WAF matching nothing.
+    #[clap(long, env = "DATUM_TUNNEL_WAF_EXEMPT_MATCHES")]
+    waf_exempt_matches: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -739,7 +752,8 @@ async fn start_tunnel_internal(
             .await
             .map_err(err_response)?;
     }
-    let service = TunnelService::new(state.datum.clone(), node.clone());
+    let service = TunnelService::new(state.datum.clone(), node.clone())
+        .with_waf_exempt_matches(state.waf_exempt_matches.clone());
 
     // Heartbeat first so the relay/connection details are populated before
     // enabling — same ordering as `datum-connect listen` and for the same
@@ -917,7 +931,19 @@ async fn run() -> n0_error::Result<()> {
     let repo = Repo::open_or_create(repo_path.clone()).await?;
 
     let control_node = ListenNode::new(repo.clone()).await?;
-    let control = TunnelService::new(datum.clone(), control_node);
+    let waf_exempt_matches = match args.waf_exempt_matches.as_deref() {
+        Some(raw) if !raw.trim().is_empty() => connect_lib::parse_waf_exempt_matches(raw)
+            .map_err(|e| n0_error::anyerr!("invalid DATUM_TUNNEL_WAF_EXEMPT_MATCHES: {e}"))?,
+        _ => Vec::new(),
+    };
+    if !waf_exempt_matches.is_empty() {
+        tracing::info!(
+            count = waf_exempt_matches.len(),
+            "WAF exemptions configured: tunnels get a `streams` rule ahead of `protected`"
+        );
+    }
+    let control = TunnelService::new(datum.clone(), control_node)
+        .with_waf_exempt_matches(waf_exempt_matches.clone());
 
     let setup_token = auth::load_or_create_setup_token(&repo_path)
         .await
@@ -949,6 +975,7 @@ async fn run() -> n0_error::Result<()> {
         peer: peer_state,
         log_sources,
         log_tail_max_lines: args.log_tail_max_lines,
+        waf_exempt_matches,
         started_at_unix_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
