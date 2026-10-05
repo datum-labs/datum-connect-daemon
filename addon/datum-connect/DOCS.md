@@ -81,19 +81,31 @@ The service account also needs permission to create WAF policies (see below).
 
 On every start, the add-on sets up Datum's web application firewall for the
 tunnel: a policy named `<tunnel id>-waf` with the OWASP Core Rule Set at
-paranoia level 1 and rule `920420` excluded.
+paranoia level 1 and rule `920420` excluded. It is on (`Enforce`) for
+everything except Home Assistant's streaming endpoints:
 
-**For now, the policy is created switched off (`Disabled`).** While a WAF is
-attached, Datum's edge holds back streamed responses, so Home Assistant's live
-views, such as an add-on's log, never load. It can't yet be limited to skip
-just those pages either. Both are platform issues being fixed. Until then you
-can turn the WAF on yourself in the [Datum portal](https://cloud.datum.net), by
-setting the policy's mode to `Enforce`, if you'd rather have the protection
-than remote live views. The `Edge protection policy` log line names the
-policy.
+- live logs (the Supervisor's and each add-on's log, followed live)
+- the event stream that keeps the Home Assistant UI up to date
+- camera streams
+
+Those are left out because, while a WAF covers a response, Datum's edge holds
+back a streamed response until it ends, so live views never load. They still
+need a Home Assistant login like every other page; only the firewall is
+skipped. To do this, the tunnel sends those paths through their own rule,
+and the policy covers only the tunnel's main rule, named `protected`. The
+`Edge protection policy` log line names the policy.
 
 The add-on only creates the policy when it is missing. If one already exists,
-it is kept as is, so changes made in the portal survive restarts.
+it is kept as is, so changes made in the portal survive restarts. Policies the
+add-on creates carry the annotation
+`connect.datum.net/managed-by: datum-connect-addon`. A policy without it is
+never changed, with one exception: the switched-off policy add-on 0.1.5
+created is switched on as above, once, and only if it is exactly as 0.1.5
+left it.
+
+If the log says `Edge protection is OFF: tunnel ... has no rule named
+'protected'`, the policy exists but covers nothing. Restart the add-on, and
+report it if that persists.
 
 Why these settings:
 
@@ -104,9 +116,10 @@ Why these settings:
 - **Paranoia level 2 is not used yet.** It blocks any `{{ }}` template in a
   REST request, which breaks saving automations with template conditions.
 
-If the log says `Edge protection NOT set up`, the tunnel still works, but
-without the firewall. The usual cause is a service account that may not
-create WAF policies. Grant that permission and restart the add-on.
+If the log says `Edge protection NOT set up` or `Edge protection still OFF`,
+the tunnel still works, but without the firewall. The usual cause is a service
+account that may not create or update WAF policies. Grant that permission and
+restart the add-on.
 
 ## Request timeout
 
@@ -182,9 +195,6 @@ System → Network**.
 most an hour, even with the request timeout raised (see "Request timeout").
 A live view, such as an add-on's log, left open longer than that is cut, and
 reloading the page starts a new hour. The same applies to downloads.
-
-**Live views don't load with the WAF switched on.** See "Edge protection
-(WAF)".
 
 The watchdog in `config.yaml` restarts the add-on if the daemon's local API
 stops answering. That proves the process is alive; it does **not** prove the
