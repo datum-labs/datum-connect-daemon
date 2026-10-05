@@ -249,13 +249,13 @@ ensure_waf() {
             return ;;
     esac
 
-    policy=$(jq -n --arg name "${WAF_NAME}" --arg route "${TUNNEL_ID}" --arg label "${LABEL}" '{
+    policy=$(jq -n --arg name "${WAF_NAME}" --arg route "${TUNNEL_ID}" --arg display "${LABEL}" '{
         apiVersion: "networking.datumapis.com/v1alpha",
         kind: "TrafficProtectionPolicy",
         metadata: {
             name: $name,
             namespace: "default",
-            annotations: {"networking.datumapis.com/display-name": $label}
+            annotations: {"networking.datumapis.com/display-name": $display}
         },
         spec: {
             mode: "Disabled",
