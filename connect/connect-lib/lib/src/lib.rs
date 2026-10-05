@@ -25,8 +25,9 @@ pub use state::{
     Advertisment, AdvertismentTicket, ProxyState, SelectedContext, State, StateWrapper, TcpProxyData,
 };
 pub use tunnels::{
-    friendly_device_name, normalize_endpoint, OrphanedConnector, ProgressStep, ProgressStepKind,
-    StepStatus, TunnelDeleteOutcome, TunnelProgress, TunnelService, TunnelSummary,
+    friendly_device_name, normalize_endpoint, parse_waf_exempt_matches, OrphanedConnector,
+    ProgressStep, ProgressStepKind, StepStatus, TunnelDeleteOutcome, TunnelProgress, TunnelService,
+    TunnelSummary,
 };
 
 /// The root domain for datum connect URLs to subdomain from. A proxy URL will

@@ -95,6 +95,10 @@ pub struct TunnelService {
     listen: ListenNode,
     publish_tickets: bool,
     create_traffic_protection_policies: bool,
+    /// Path matches that get their own WAF-free rule — see
+    /// `desired_proxy_rules`. `None` (the default, and what every caller
+    /// except the daemon gets) keeps the proxy's rules exactly as before.
+    waf_exempt_matches: Option<Vec<HTTPRouteMatch>>,
 }
 
 fn proxy_state_from_summary(
@@ -358,7 +362,17 @@ impl TunnelService {
             listen,
             publish_tickets: publish_tickets_enabled(),
             create_traffic_protection_policies: create_traffic_protection_policies_enabled(),
+            waf_exempt_matches: None,
         }
+    }
+
+    /// Splits every proxy this service writes into a `streams` rule (these
+    /// matches) ahead of a `protected` rule (everything else), so a WAF
+    /// scoped by `sectionName: protected` leaves the streams alone. An
+    /// empty list is the same as never calling this.
+    pub fn with_waf_exempt_matches(mut self, matches: Vec<HTTPRouteMatch>) -> Self {
+        self.waf_exempt_matches = (!matches.is_empty()).then_some(matches);
+        self
     }
 
     pub async fn list_active(&self) -> Result<Vec<TunnelSummary>> {
@@ -772,10 +786,11 @@ impl TunnelService {
             },
             spec: HTTPProxySpec {
                 hostnames: None,
-                rules: vec![
-                    https_redirect_rule(),
-                    proxy_rule(&endpoint, &connector_name),
-                ],
+                rules: desired_proxy_rules(
+                    &endpoint,
+                    &connector_name,
+                    self.waf_exempt_matches.as_deref(),
+                ),
             },
             status: None,
         };
@@ -976,7 +991,8 @@ impl TunnelService {
             .await
             .std_context("Failed to fetch HTTPProxy")?;
         let hostnames = existing.spec.hostnames.clone().unwrap_or_default();
-        let desired_rules = vec![https_redirect_rule(), proxy_rule(&endpoint, &connector_name)];
+        let desired_rules =
+            desired_proxy_rules(&endpoint, &connector_name, self.waf_exempt_matches.as_deref());
 
         // Skip the PATCH when the existing spec already matches what we'd
         // write. A no-op patch still bumps metadata.generation on some API
@@ -1117,7 +1133,11 @@ impl TunnelService {
         // never become True.
         {
             let target = parse_target(&endpoint)?;
-            let desired_rules = vec![https_redirect_rule(), proxy_rule(&endpoint, &connector_name)];
+            let desired_rules = desired_proxy_rules(
+                &endpoint,
+                &connector_name,
+                self.waf_exempt_matches.as_deref(),
+            );
             if !http_proxy_spec_matches(&proxy, &label, &desired_rules) {
                 let hostnames = proxy.spec.hostnames.clone().unwrap_or_default();
                 let patch = json!({
@@ -1699,6 +1719,55 @@ fn proxy_rule(endpoint: &str, connector_name: &str) -> HTTPProxyRule {
     }
 }
 
+/// Rule names used only when WAF exemptions are configured. A
+/// TrafficProtectionPolicy targets `protected` by `sectionName`; if that
+/// name ever stops resolving, the policy applies to nothing, so these are
+/// a contract with whoever creates the policy (the Home Assistant add-on).
+pub const WAF_EXEMPT_RULE_NAME: &str = "streams";
+pub const WAF_PROTECTED_RULE_NAME: &str = "protected";
+
+/// The rules every create/update/enable path writes, built in one place so
+/// they can never disagree (a mismatch would mean a PATCH on every enable).
+///
+/// Without exemptions this is exactly the long-standing unnamed
+/// `[redirect, proxy]` pair, so existing proxies compare equal and see no
+/// patch. With exemptions, a `streams` rule carrying those matches sits
+/// between the two: after the redirect, so plain HTTP to a stream path is
+/// still upgraded, and before the catch-all, so it wins for its paths.
+/// Both backend rules point at the same endpoint and connector.
+fn desired_proxy_rules(
+    endpoint: &str,
+    connector_name: &str,
+    waf_exempt_matches: Option<&[HTTPRouteMatch]>,
+) -> Vec<HTTPProxyRule> {
+    match waf_exempt_matches {
+        Some(matches) if !matches.is_empty() => {
+            let mut streams = proxy_rule(endpoint, connector_name);
+            streams.name = Some(WAF_EXEMPT_RULE_NAME.to_string());
+            streams.matches = matches.to_vec();
+            let mut protected = proxy_rule(endpoint, connector_name);
+            protected.name = Some(WAF_PROTECTED_RULE_NAME.to_string());
+            vec![https_redirect_rule(), streams, protected]
+        }
+        _ => vec![https_redirect_rule(), proxy_rule(endpoint, connector_name)],
+    }
+}
+
+/// Parses `DATUM_TUNNEL_WAF_EXEMPT_MATCHES`: a JSON array of HTTPRoute
+/// matches, e.g. `[{"path":{"type":"Exact","value":"/api/stream"}}]`.
+pub fn parse_waf_exempt_matches(raw: &str) -> std::result::Result<Vec<HTTPRouteMatch>, String> {
+    let matches: Vec<HTTPRouteMatch> = serde_json::from_str(raw)
+        .map_err(|e| format!("not a JSON array of HTTPRoute matches: {e}"))?;
+    if let Some(i) = matches.iter().position(|m| m.path.is_none()) {
+        // A match without a path defaults to PathPrefix "/" and would take
+        // the whole site out from behind the WAF — refuse rather than guess.
+        return Err(format!("match #{i} has no \"path\""));
+    }
+    Ok(matches)
+}
+
+/// The endpoint from the first rule with a backend. With WAF exemptions
+/// that's the `streams` rule, which shares its backend with `protected`.
 fn proxy_backend_endpoint(proxy: &HTTPProxy) -> Option<String> {
     proxy
         .spec
@@ -2219,6 +2288,140 @@ mod tests {
         let mut bare = existing.clone();
         bare.metadata.annotations = None;
         assert!(!http_proxy_spec_matches(&bare, "my-label", &rules_same));
+    }
+
+    /// The Home Assistant add-on's `DATUM_TUNNEL_WAF_EXEMPT_MATCHES`, as
+    /// verified on staging.
+    const HA_EXEMPT_MATCHES: &str = r#"[
+        {"path":{"type":"RegularExpression","value":"^/api/hassio/(?:(?:audio|cli|core|dns|host|multicast|observer|supervisor)|addons/[^/]+)/logs/(?:boots/-?[0-9]+/)?follow$"}},
+        {"path":{"type":"Exact","value":"/api/stream"}},
+        {"path":{"type":"PathPrefix","value":"/api/camera_proxy_stream/"}}
+    ]"#;
+
+    const EP: &str = "http://127.0.0.1:8123";
+    const CONN: &str = "datum-connect-mhxj5";
+
+    fn ha_matches() -> Vec<HTTPRouteMatch> {
+        parse_waf_exempt_matches(HA_EXEMPT_MATCHES).expect("HA matches parse")
+    }
+
+    #[test]
+    fn parse_waf_exempt_matches_reads_ha_matches() {
+        let m = ha_matches();
+        assert_eq!(m.len(), 3);
+        let path = |i: usize| m[i].path.as_ref().unwrap();
+        assert_eq!(
+            path(0).r#type,
+            Some(HTTPRouteRulesMatchesPathType::RegularExpression)
+        );
+        assert_eq!(
+            path(0).value.as_deref(),
+            Some(
+                r"^/api/hassio/(?:(?:audio|cli|core|dns|host|multicast|observer|supervisor)|addons/[^/]+)/logs/(?:boots/-?[0-9]+/)?follow$"
+            )
+        );
+        assert_eq!(path(1).r#type, Some(HTTPRouteRulesMatchesPathType::Exact));
+        assert_eq!(path(1).value.as_deref(), Some("/api/stream"));
+        assert_eq!(
+            path(2).r#type,
+            Some(HTTPRouteRulesMatchesPathType::PathPrefix)
+        );
+        assert_eq!(path(2).value.as_deref(), Some("/api/camera_proxy_stream/"));
+        assert!(m.iter().all(|m| m.headers.is_none()));
+    }
+
+    #[test]
+    fn parse_waf_exempt_matches_rejects_bad_input() {
+        assert!(parse_waf_exempt_matches("not json").is_err());
+        assert!(parse_waf_exempt_matches(r#"{"path":{"value":"/x"}}"#).is_err());
+        assert!(parse_waf_exempt_matches(r#"[{"path":{"type":"Nope","value":"/x"}}]"#).is_err());
+        // A path-less match would exempt the whole site.
+        assert!(parse_waf_exempt_matches(r#"[{}]"#).is_err());
+        assert_eq!(parse_waf_exempt_matches("[]").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn desired_proxy_rules_unchanged_without_exemptions() {
+        let old = serde_json::to_value(vec![https_redirect_rule(), proxy_rule(EP, CONN)]).unwrap();
+        for exempt in [None, Some(&[][..])] {
+            let rules = desired_proxy_rules(EP, CONN, exempt);
+            assert_eq!(serde_json::to_value(&rules).unwrap(), old);
+            assert!(rules.iter().all(|r| r.name.is_none()));
+        }
+    }
+
+    #[test]
+    fn desired_proxy_rules_splits_streams_from_protected() {
+        let matches = ha_matches();
+        let rules = desired_proxy_rules(EP, CONN, Some(&matches));
+        assert_eq!(rules.len(), 3);
+
+        // Redirect stays first so plain HTTP to a stream path is upgraded.
+        assert_eq!(
+            serde_json::to_value(&rules[0]).unwrap(),
+            serde_json::to_value(https_redirect_rule()).unwrap()
+        );
+
+        assert_eq!(rules[1].name.as_deref(), Some(WAF_EXEMPT_RULE_NAME));
+        assert_eq!(rules[1].name.as_deref(), Some("streams"));
+        assert_eq!(
+            serde_json::to_value(&rules[1].matches).unwrap(),
+            serde_json::to_value(&matches).unwrap()
+        );
+
+        assert_eq!(rules[2].name.as_deref(), Some(WAF_PROTECTED_RULE_NAME));
+        assert_eq!(rules[2].name.as_deref(), Some("protected"));
+        assert_eq!(
+            serde_json::to_value(&rules[2].matches).unwrap(),
+            serde_json::to_value(vec![default_match()]).unwrap()
+        );
+
+        // Both backend rules reach the same endpoint through the same connector.
+        let expected_backends = serde_json::to_value(proxy_rule(EP, CONN).backends).unwrap();
+        for rule in &rules[1..] {
+            assert!(rule.filters.is_none());
+            assert_eq!(serde_json::to_value(&rule.backends).unwrap(), expected_backends);
+        }
+    }
+
+    fn proxy_with_rules(label: &str, rules: Vec<HTTPProxyRule>) -> HTTPProxy {
+        let mut p = proxy_with_backend(label, EP, CONN);
+        p.spec.rules = rules;
+        // Round-trip through JSON the way a GET from the API server would,
+        // so the comparison isn't just comparing a value with itself.
+        serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn http_proxy_spec_matches_with_exempt_rules_no_churn() {
+        let matches = ha_matches();
+        let existing = proxy_with_rules("ha", desired_proxy_rules(EP, CONN, Some(&matches)));
+        assert!(http_proxy_spec_matches(
+            &existing,
+            "ha",
+            &desired_proxy_rules(EP, CONN, Some(&matches))
+        ));
+        // Turning exemptions on for an existing proxy patches it once...
+        let plain = proxy_with_rules("ha", desired_proxy_rules(EP, CONN, None));
+        assert!(!http_proxy_spec_matches(
+            &plain,
+            "ha",
+            &desired_proxy_rules(EP, CONN, Some(&matches))
+        ));
+        // ...and a daemon without them would put the old rules back.
+        assert!(!http_proxy_spec_matches(
+            &existing,
+            "ha",
+            &desired_proxy_rules(EP, CONN, None)
+        ));
+    }
+
+    #[test]
+    fn proxy_backend_endpoint_with_streams_rule() {
+        let matches = ha_matches();
+        let proxy = proxy_with_rules("ha", desired_proxy_rules(EP, CONN, Some(&matches)));
+        assert_eq!(proxy_backend_endpoint(&proxy).as_deref(), Some(EP));
+        assert_eq!(proxy_connector_name(&proxy).as_deref(), Some(CONN));
     }
 
     fn target(host: &str, port: u16) -> ParsedTarget {
