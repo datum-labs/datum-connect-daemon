@@ -368,14 +368,14 @@ ensure_waf() {
             return ;;
     esac
 
-    policy=$(jq -n --arg name "${WAF_NAME}" --arg label "${LABEL}" \
+    policy=$(jq -n --arg name "${WAF_NAME}" --arg display "${LABEL}" \
         --arg key "${MANAGED_BY_KEY}" --arg value "${MANAGED_BY_VALUE}" --argjson spec "${WAF_SPEC}" '{
         apiVersion: "networking.datumapis.com/v1alpha",
         kind: "TrafficProtectionPolicy",
         metadata: {
             name: $name,
             namespace: "default",
-            annotations: {"networking.datumapis.com/display-name": $label, ($key): $value}
+            annotations: {"networking.datumapis.com/display-name": $display, ($key): $value}
         },
         spec: $spec
     }')
