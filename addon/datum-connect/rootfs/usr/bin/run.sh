@@ -74,17 +74,26 @@ else
         KEY_SOURCE="${KEY_FILE}"
     else
         if [ ! -s "${PAIRED_KEY_FILE}" ]; then
-            bashio::log.info "No service account key yet, so pairing this add-on with Datum. A link and a code follow."
+            bashio::log.info "No service account key yet, so pairing this add-on with Datum. A link and a code follow, here and as a notification."
             # --hold-port: while pairing waits for approval the daemon is not
             # listening yet, and the Supervisor's watchdog (config.yaml)
             # would restart the add-on mid-approval, replacing the code.
-            PAIR_ARGS=(pair --key-out "${PAIRED_KEY_FILE}" --hold-port "${PORT}")
+            # --options-source supervisor: with several projects and none set,
+            # pairing waits for 'project' to be saved on the Configuration
+            # tab, reading it from the Supervisor, since /data/options.json
+            # only changes on a restart, and a restart would mean a second
+            # approval.
+            PAIR_ARGS=(pair --key-out "${PAIRED_KEY_FILE}" --hold-port "${PORT}" --options-source supervisor)
             if [ -n "${PROJECT}" ]; then
                 PAIR_ARGS+=(--project "${PROJECT}")
             fi
             if ! /usr/bin/datum-connect-daemon "${PAIR_ARGS[@]}"; then
                 bashio::exit.nok "Pairing with Datum did not finish; the reason is above. Restart the add-on to try again, or use your own service account key (see the Documentation tab)."
             fi
+            # The project may have been chosen while pairing waited, after
+            # PROJECT was read from the stale options file. The key belongs
+            # to whichever project was used, so take it from the key below.
+            PROJECT=""
         fi
         KEY_FILE="${PAIRED_KEY_FILE}"
         KEY_SOURCE="the key saved by pairing"
