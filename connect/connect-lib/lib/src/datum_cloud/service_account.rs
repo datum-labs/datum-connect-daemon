@@ -23,7 +23,6 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use ring::rand::SystemRandom;
 use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
 use serde::Deserialize;
-use serde_json::json;
 
 use super::external_token_source::ExternalTokenError;
 
@@ -108,7 +107,7 @@ impl ServiceAccount {
             kid: key.private_key_id,
             scope: key.scope,
             signer,
-            issuer: issuer.trim_end_matches('/').to_string(),
+            issuer: issuer.to_string(),
             http,
         })
     }
@@ -121,20 +120,36 @@ impl ServiceAccount {
         format!("{}/oauth/v2/token", self.issuer)
     }
 
+    /// The form the helper sent with `curl --data-urlencode`, encoded the
+    /// way curl encodes it, fields in the same order.
+    fn token_request_body(&self, assertion: &str) -> String {
+        format!(
+            "grant_type={}&assertion={}&scope={}",
+            form_encode(JWT_BEARER_GRANT),
+            form_encode(assertion),
+            form_encode(&self.scope)
+        )
+    }
+
     /// The signed JWT-bearer assertion, issued at `now` (Unix seconds).
+    ///
+    /// Byte for byte what the add-on's old `sa-credentials-helper.sh`
+    /// produced, which is known to work against Datum's IdP: compact JSON
+    /// with the keys in the helper's order. RS256 is deterministic, so the
+    /// whole assertion matches too (`matches_the_old_helper_byte_for_byte`).
+    /// The order is written out by hand because `json!` sorts keys.
     pub fn assertion(&self, now: u64) -> Result<String, ExternalTokenError> {
-        let header = json!({"alg": "RS256", "kid": self.kid, "typ": "JWT"});
-        let claims = json!({
-            "iss": self.client_id,
-            "sub": self.client_id,
-            "aud": self.issuer,
-            "iat": now,
-            "exp": now + ASSERTION_LIFETIME_SECS,
-        });
+        let header = format!(r#"{{"alg":"RS256","kid":{},"typ":"JWT"}}"#, json_str(&self.kid));
+        let claims = format!(
+            r#"{{"iss":{id},"sub":{id},"aud":{aud},"iat":{now},"exp":{exp}}}"#,
+            id = json_str(&self.client_id),
+            aud = json_str(&self.issuer),
+            exp = now + ASSERTION_LIFETIME_SECS,
+        );
         let signing_input = format!(
             "{}.{}",
-            URL_SAFE_NO_PAD.encode(header.to_string()),
-            URL_SAFE_NO_PAD.encode(claims.to_string())
+            URL_SAFE_NO_PAD.encode(header),
+            URL_SAFE_NO_PAD.encode(claims)
         );
         let mut signature = vec![0u8; self.signer.public().modulus_len()];
         self.signer
@@ -158,11 +173,8 @@ impl ServiceAccount {
         let response = self
             .http
             .post(self.token_endpoint())
-            .form(&[
-                ("grant_type", JWT_BEARER_GRANT),
-                ("assertion", assertion.as_str()),
-                ("scope", self.scope.as_str()),
-            ])
+            .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(self.token_request_body(&assertion))
             .send()
             .await
             .map_err(|e| sa_err(format!("token exchange failed: {e}")))?;
@@ -184,8 +196,29 @@ impl ServiceAccount {
     }
 }
 
-/// Accepts PKCS#1 (`RSA PRIVATE KEY`, what Datum issues) and PKCS#8
-/// (`PRIVATE KEY`) PEM.
+/// A JSON string literal. For the plain ids and URLs in a key this is the
+/// helper's unescaped `printf '"%s"'`; anything odd is escaped rather than
+/// producing invalid JSON.
+fn json_str(s: &str) -> String {
+    serde_json::Value::from(s).to_string()
+}
+
+/// `curl --data-urlencode`'s encoding: RFC 3986 unreserved characters as is,
+/// space as `+`, every other byte as `%XX`.
+fn form_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Accepts PKCS#1 (`RSA PRIVATE KEY`, which Zitadel generates and Datum's
+/// key JSON passes through) and PKCS#8 (`PRIVATE KEY`) PEM.
 fn rsa_key_from_pem(pem: &str) -> Result<RsaKeyPair, String> {
     let (label, der) = decode_pem(pem)?;
     match label.as_str() {
@@ -218,6 +251,7 @@ pub(crate) mod tests {
     use ring::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
 
     use super::*;
+    use serde_json::json;
 
     /// A throwaway key, generated per test run. Never a real one.
     pub(crate) struct TestKey {
@@ -323,13 +357,51 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pkcs8_keys_work_too_and_trailing_slash_on_issuer_is_dropped() {
+    fn pkcs8_keys_work_too() {
         let key = test_key();
-        let sa = ServiceAccount::from_json(&key_json(&pem("PRIVATE KEY", &key.pkcs8_der)), "https://auth.example.test/")
+        let sa = ServiceAccount::from_json(&key_json(&pem("PRIVATE KEY", &key.pkcs8_der)), "https://auth.example.test")
             .unwrap();
         let (_, claims) = verify_assertion(&sa.assertion(42).unwrap(), &key.public_der);
         assert_eq!(claims["aud"], "https://auth.example.test");
+        assert_eq!(claims["exp"], 342);
         assert_eq!(sa.token_endpoint(), "https://auth.example.test/oauth/v2/token");
+    }
+
+    /// The deleted `sa-credentials-helper.sh` is known to work against
+    /// Datum's IdP, and RS256 is deterministic, so with the same key and iat
+    /// the native assertion must be identical to the helper's, byte for byte.
+    ///
+    /// Fixtures in `testdata/`, all THROWAWAY test material, never a real
+    /// credential:
+    /// - `throwaway-sa-key-pkcs{1,8}.json`: one RSA-2048 key, made with
+    ///   `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048`, and
+    ///   `openssl rsa -traditional` for the PKCS#1 copy, wrapped in a key
+    ///   JSON with made-up client_id, private_key_id and scope.
+    /// - `helper-*-iat-1700000000.txt`: what the helper from e82b49a
+    ///   produced for that key with `now` patched to 1700000000 and its
+    ///   `curl --data-urlencode` POST sent to a local recorder instead of the
+    ///   IdP (curl 8.17.0, OpenSSL 3.5.4): the assertion and the request body.
+    #[test]
+    fn matches_the_old_helper_byte_for_byte() {
+        let assertion = include_str!("testdata/helper-assertion-iat-1700000000.txt").trim();
+        let body = include_str!("testdata/helper-form-body-iat-1700000000.txt").trim();
+        for (format, key) in [
+            ("PKCS#1", include_str!("testdata/throwaway-sa-key-pkcs1.json")),
+            ("PKCS#8", include_str!("testdata/throwaway-sa-key-pkcs8.json")),
+        ] {
+            let sa = ServiceAccount::from_json(key, DEFAULT_ISSUER).unwrap();
+            assert_eq!(sa.assertion(1_700_000_000).unwrap(), assertion, "{format} assertion");
+            assert_eq!(sa.token_request_body(assertion), body, "{format} form body");
+            assert_eq!(sa.token_endpoint(), "https://auth.datum.net/oauth/v2/token");
+        }
+    }
+
+    #[test]
+    fn form_encoding_matches_curl() {
+        assert_eq!(form_encode("openid profile urn:a:b"), "openid+profile+urn%3Aa%3Ab");
+        assert_eq!(form_encode("aZ09-._~"), "aZ09-._~");
+        assert_eq!(form_encode("a+b/c=d&e*"), "a%2Bb%2Fc%3Dd%26e%2A");
+        assert_eq!(form_encode("\u{e9}"), "%C3%A9");
     }
 
     #[test]
