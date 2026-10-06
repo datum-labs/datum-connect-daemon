@@ -10,7 +10,10 @@
 //!    code, poll until the person approves. A code that expires unapproved
 //!    is replaced by a new one, up to [`PairingConfig::max_wait`].
 //! 2. Find the project, and the organization it belongs to, through the
-//!    person's organization memberships.
+//!    person's organization memberships. With several and none chosen, or
+//!    not the one configured, and a [`ProjectWait`] set, list them and wait
+//!    for one to be chosen, holding the token in memory meanwhile, so that
+//!    choosing does not cost a second approval.
 //! 3. Create a ServiceAccount in the project and wait for its email.
 //! 4. Grant it `editor` on the project with one PolicyBinding. The binding
 //!    lives in the organization's control plane: a person cannot create
@@ -26,7 +29,10 @@
 //! refresh token, if the IdP sends one, is never even deserialized.
 
 use std::io::Write;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -78,10 +84,54 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// binding Ready). Both were near-immediate in production.
 const SETTLE_TICKS: u32 = 60;
 const SA_NAME_PREFIX: &str = "home-assistant-";
+/// How long before the person's token expires to stop waiting for a
+/// project, in ticks: enough to create the service account, binding and
+/// key with the token still valid.
+const TOKEN_MARGIN_TICKS: u64 = 120;
 
 const RM: &str = "resourcemanager.miloapis.com/v1alpha1";
 const IAM: &str = "iam.miloapis.com/v1alpha1";
 const IDENTITY: &str = "identity.miloapis.com/v1alpha1";
+
+/// Where pairing reads the project a person chooses while it waits.
+pub trait ProjectSource: Send + Sync {
+    /// The project set now, if any. An error is logged and asked again.
+    fn project(&self) -> Pin<Box<dyn Future<Output = Result<Option<String>, String>> + Send + '_>>;
+}
+
+/// Between polls of the [`ProjectSource`].
+pub const DEFAULT_PROJECT_POLL: Duration = Duration::from_secs(5);
+/// The longest pairing waits for a project, even with the token still valid.
+pub const DEFAULT_PROJECT_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// Wait for a project to be chosen instead of stopping. See [`pair`].
+#[derive(Clone)]
+pub struct ProjectWait {
+    pub source: Arc<dyn ProjectSource>,
+    pub poll: Duration,
+    /// Also bounded by the person's token: waiting stops two minutes (120
+    /// ticks) before it expires, if that is sooner.
+    pub max: Duration,
+}
+
+impl ProjectWait {
+    pub fn new(source: Arc<dyn ProjectSource>) -> Self {
+        Self {
+            source,
+            poll: DEFAULT_PROJECT_POLL,
+            max: DEFAULT_PROJECT_WAIT,
+        }
+    }
+}
+
+impl std::fmt::Debug for ProjectWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProjectWait")
+            .field("poll", &self.poll)
+            .field("max", &self.max)
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PairingConfig {
@@ -92,8 +142,12 @@ pub struct PairingConfig {
     pub client_id: String,
     pub scope: String,
     /// The project to pair with. `None` means "the only one the person can
-    /// see"; with several, pairing stops and lists them.
+    /// see"; with several, pairing lists them and stops, or waits with
+    /// [`PairingConfig::project_wait`].
     pub project: Option<String>,
+    /// When set, a missing or unknown project is waited for instead of
+    /// ending pairing.
+    pub project_wait: Option<ProjectWait>,
     /// Where the key file goes.
     pub key_out: PathBuf,
     /// Recorded on the service account, to tell which device it is for.
@@ -121,6 +175,7 @@ impl PairingConfig {
             scope: var(SCOPE_ENV).unwrap_or_else(|| DEFAULT_SCOPE.to_string()),
             issuer,
             project: project.filter(|p| !p.trim().is_empty()),
+            project_wait: None,
             key_out,
             device_name: Some(crate::friendly_device_name()).filter(|n| !n.is_empty()),
             max_wait: DEFAULT_MAX_WAIT,
@@ -154,6 +209,14 @@ pub enum PairingEvent {
     /// The last code expired unapproved; a [`PairingEvent::Code`] follows.
     CodeExpired,
     Approved { email: String },
+    /// Several projects and none chosen, or not the one configured: pairing
+    /// waits up to `wait` for one of `projects` to be set. Comes again, with
+    /// `rejected`, each time one is set that is not listed.
+    ChooseProject {
+        projects: Vec<ProjectChoice>,
+        rejected: Option<String>,
+        wait: Duration,
+    },
     ProjectSelected { project: String, organization: String },
     ServiceAccountCreated { email: String, project: String },
     /// A previous attempt created this one and was stopped at the grant.
@@ -165,12 +228,25 @@ pub enum PairingEvent {
     KeySaved { path: PathBuf },
 }
 
+/// A project the approving login can see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectChoice {
+    pub id: String,
+    pub display_name: String,
+    pub organization: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PairingError {
     #[error("The request was declined on the approval screen. Restart to get a new code.")]
     Denied,
     #[error("Nobody approved a code within {minutes} minutes. Restart to get a new code.")]
     TimedOut { minutes: u64 },
+    #[error(
+        "Choosing a project took too long: none of yours was set within {}, and the approval is no longer good. Restart to try again.",
+        duration_words(*.waited)
+    )]
+    ProjectNotChosen { waited: Duration },
     #[error(
         "Your Datum login can create the service account but can't grant it access. Ask an organization owner or editor to grant role 'editor' to service account {email} on project {project}, then restart"
     )]
@@ -202,7 +278,11 @@ pub async fn pair(
     if cfg.key_out.exists() {
         return Err(PairingError::KeyExists(cfg.key_out.clone()));
     }
-    if let Some(p) = &cfg.project {
+    // With a wait, a malformed project is waited past like any other
+    // project that is not there. It is only ever compared, never sent.
+    if let Some(p) = &cfg.project
+        && cfg.project_wait.is_none()
+    {
         check_name("project", p)?;
     }
     let http = reqwest::Client::builder()
@@ -222,7 +302,7 @@ pub async fn pair(
             base: cfg.api_url.trim_end_matches('/').to_string(),
             token: &login.token,
         };
-        provision(cfg, &api, &login.sub, on_event).await
+        provision(cfg, &api, &login.sub, login.expires_at, on_event).await
     };
     // The person's token goes here, on every path.
     drop(login);
@@ -233,9 +313,19 @@ async fn provision(
     cfg: &PairingConfig,
     api: &Api<'_>,
     sub: &str,
+    token_expires_at: Option<Instant>,
     on_event: &mut (dyn FnMut(PairingEvent) + Send),
 ) -> Result<PairedKey, PairingError> {
-    let project = find_project(api, sub, cfg.project.as_deref()).await?;
+    let projects = list_projects(api, sub).await?;
+    let project = match choose_project(&projects, cfg.project.as_deref()) {
+        Ok(p) => p,
+        Err(e) => match &cfg.project_wait {
+            Some(wait) if !projects.is_empty() => {
+                wait_for_project(cfg, wait, &projects, token_expires_at, on_event).await?
+            }
+            _ => return Err(e),
+        },
+    };
     on_event(PairingEvent::ProjectSelected {
         project: project.name.clone(),
         organization: project.org.clone(),
@@ -317,6 +407,8 @@ async fn provision(
 /// The person's login. Lives only until provisioning ends.
 struct Login {
     token: SecretString,
+    /// When the token stops working, if the IdP said.
+    expires_at: Option<Instant>,
     sub: String,
     email: Option<String>,
 }
@@ -335,6 +427,8 @@ struct DeviceAuthorization {
 #[derive(Deserialize)]
 struct TokenSuccess {
     access_token: String,
+    #[serde(default)]
+    expires_in: Option<u64>,
     #[serde(default)]
     id_token: Option<String>,
 }
@@ -462,11 +556,14 @@ async fn poll_for_approval(
             let token: TokenSuccess = serde_json::from_str(&body).map_err(|_| {
                 PairingError::Failed("Datum's login service sent an unexpected reply after approval".into())
             })?;
+            let received = Instant::now();
+            let lifetime = token.expires_in.or_else(|| jwt_lifetime_secs(&token.access_token));
             let token_secret = SecretString::from(token.access_token);
             let claims = identity(cfg, http, &token_secret, token.id_token.as_deref()).await?;
             check_name("user id", &claims.sub)?;
             return Ok(CodeOutcome::Approved(Login {
                 token: token_secret,
+                expires_at: lifetime.map(|secs| received + ticks(cfg, secs)),
                 sub: claims.sub,
                 email: claims.email.filter(|e| !e.is_empty()),
             }));
@@ -526,6 +623,19 @@ async fn identity(
     }
     serde_json::from_str(&body)
         .map_err(|_| PairingError::Failed("the login service did not say who approved".into()))
+}
+
+/// Seconds left on a JWT access token, from its `exp`, for an IdP that
+/// leaves out `expires_in`. `None` for an opaque token.
+fn jwt_lifetime_secs(jwt: &str) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Exp {
+        exp: i64,
+    }
+    let payload = jwt.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+    let exp: Exp = serde_json::from_slice(&bytes).ok()?;
+    u64::try_from(exp.exp - chrono::Utc::now().timestamp()).ok()
 }
 
 fn decode_jwt_claims(jwt: &str) -> Option<IdClaims> {
@@ -605,7 +715,7 @@ struct ProjectRef {
 
 /// Mirrors datumctl's `internal/discovery`: organization memberships from
 /// the person's own control plane, then each organization's projects.
-async fn find_project(api: &Api<'_>, sub: &str, wanted: Option<&str>) -> Result<ProjectRef, PairingError> {
+async fn list_projects(api: &Api<'_>, sub: &str) -> Result<Vec<ProjectRef>, PairingError> {
     let what = "listing your Datum organizations";
     let reply = api
         .call(Method::GET, &format!("{}/apis/{RM}/organizationmemberships", user_cp(sub)), None, what)
@@ -660,6 +770,12 @@ async fn find_project(api: &Api<'_>, sub: &str, wanted: Option<&str>) -> Result<
         }
     }
 
+    Ok(projects)
+}
+
+/// The project to use, or why there is none: none, several, or not the one
+/// configured. The error lists what the person can see.
+fn choose_project(projects: &[ProjectRef], wanted: Option<&str>) -> Result<ProjectRef, PairingError> {
     let listing = || {
         projects
             .iter()
@@ -679,7 +795,7 @@ async fn find_project(api: &Api<'_>, sub: &str, wanted: Option<&str>) -> Result<
             ))),
         },
         None => match projects.len() {
-            1 => Ok(projects.remove(0)),
+            1 => Ok(projects[0].clone()),
             0 => Err(PairingError::Project(
                 "Your Datum login can't see any projects. Create one in the Datum portal, or approve with an account that has one, then restart.".into(),
             )),
@@ -688,6 +804,74 @@ async fn find_project(api: &Api<'_>, sub: &str, wanted: Option<&str>) -> Result<
                 listing()
             ))),
         },
+    }
+}
+
+/// Lists `projects` and waits for one of them to be set in `wait.source`.
+/// The person's token stays in memory meanwhile, so that once one is set,
+/// pairing carries on with no second approval.
+async fn wait_for_project(
+    cfg: &PairingConfig,
+    wait: &ProjectWait,
+    projects: &[ProjectRef],
+    token_expires_at: Option<Instant>,
+    on_event: &mut (dyn FnMut(PairingEvent) + Send),
+) -> Result<ProjectRef, PairingError> {
+    let started = Instant::now();
+    let mut deadline = started + wait.max;
+    if let Some(expires) = token_expires_at {
+        let usable_until = expires.checked_sub(ticks(cfg, TOKEN_MARGIN_TICKS)).unwrap_or(started);
+        deadline = deadline.min(usable_until.max(started));
+    }
+    let total = deadline.saturating_duration_since(started);
+    let choices: Vec<ProjectChoice> = projects
+        .iter()
+        .map(|p| ProjectChoice {
+            id: p.name.clone(),
+            display_name: p.display_name.clone(),
+            organization: p.org.clone(),
+        })
+        .collect();
+    let normalize = |v: Option<&str>| v.map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
+    // The value already judged: polls only act on a change from it.
+    let mut seen = normalize(cfg.project.as_deref());
+    on_event(PairingEvent::ChooseProject {
+        projects: choices.clone(),
+        rejected: seen.clone(),
+        wait: total,
+    });
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(PairingError::ProjectNotChosen { waited: total });
+        }
+        tokio::time::sleep(wait.poll.min(deadline - now)).await;
+        if Instant::now() >= deadline {
+            continue;
+        }
+        let current = match wait.source.project().await {
+            Ok(v) => normalize(v.as_deref()),
+            Err(e) => {
+                tracing::warn!("pairing: cannot read the add-on's saved options, trying again: {e}");
+                continue;
+            }
+        };
+        if current == seen {
+            continue;
+        }
+        seen = current.clone();
+        if let Some(id) = &current
+            && let Some(p) = projects.iter().find(|p| &p.name == id)
+        {
+            return Ok(p.clone());
+        }
+        // Cleared, or set to one that is not listed: show the list again,
+        // saying which, and keep waiting.
+        on_event(PairingEvent::ChooseProject {
+            projects: choices.clone(),
+            rejected: current,
+            wait: deadline.saturating_duration_since(Instant::now()),
+        });
     }
 }
 
@@ -1012,6 +1196,16 @@ impl Pending {
 
 // ---- Helpers ----
 
+/// "5 minutes", "1 minute", "45 seconds".
+pub fn duration_words(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        return format!("{secs} seconds");
+    }
+    let m = secs.div_ceil(60);
+    if m == 1 { "1 minute".into() } else { format!("{m} minutes") }
+}
+
 fn ticks(cfg: &PairingConfig, n: u64) -> Duration {
     cfg.tick.saturating_mul(u32::try_from(n).unwrap_or(u32::MAX))
 }
@@ -1068,9 +1262,13 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+    use crate::datum_cloud::ha_supervisor::{self, PairingNotifier, Supervisor};
     use crate::datum_cloud::service_account::tests::{pkcs1_key_json, test_key};
 
     const TOKEN: &str = "user-access-token-SECRET-1234567890";
+    const SUP_TOKEN: &str = "supervisor-token-SECRET-0987654321";
+    const NOTIFY_PREFIX: &str = "/core/api/services/persistent_notification/";
+    const OPTIONS_PATH: &str = "/addons/self/options/config";
     const SUB: &str = "300000000000000001";
     const ORG: &str = "datum-demos-iy50km";
     const PROJECT: &str = "project-7r4rl";
@@ -1113,6 +1311,13 @@ mod tests {
         key_json: String,
         /// Make this path fail with a body that echoes the Authorization header.
         echo_auth_on: Option<String>,
+        /// The token response's `expires_in`.
+        token_expires_in: u64,
+        /// The Supervisor's answer to a notification call.
+        notify_status: u16,
+        /// The saved `project`, one per read of the add-on's options; the
+        /// last one repeats. `!500` answers HTTP 500 instead.
+        options: VecDeque<String>,
         requests: Vec<Request>,
     }
 
@@ -1135,6 +1340,9 @@ mod tests {
                 binding_gets: 0,
                 key_json: String::new(),
                 echo_auth_on: None,
+                token_expires_in: 43199,
+                notify_status: 200,
+                options: VecDeque::from([String::new()]),
                 requests: Vec::new(),
             }
         }
@@ -1147,6 +1355,26 @@ mod tests {
             }
             let path = req.path.as_str();
             let authed = req.authorization.as_deref() == Some(&format!("Bearer {TOKEN}"));
+            let supervisor = req.authorization.as_deref() == Some(&format!("Bearer {SUP_TOKEN}"));
+            if path.starts_with(NOTIFY_PREFIX) || path == OPTIONS_PATH {
+                if !supervisor {
+                    return (401, json!({"message": "401: Unauthorized"}));
+                }
+                if path == OPTIONS_PATH {
+                    let project = if self.options.len() > 1 {
+                        self.options.pop_front().unwrap()
+                    } else {
+                        self.options.front().cloned().unwrap_or_default()
+                    };
+                    if project == "!500" {
+                        return (500, json!({"result": "error", "message": "busy"}));
+                    }
+                    return (200, json!({"result": "ok", "data": {
+                        "project": project, "tunnel_label": "home-assistant", "repair": false,
+                    }}));
+                }
+                return (self.notify_status, json!([]));
+            }
             match (req.method.as_str(), path) {
                 ("POST", "/oauth/v2/device_authorization") => {
                     self.codes_issued += 1;
@@ -1175,7 +1403,7 @@ mod tests {
                             "refresh_token": "refresh-SECRET",
                             "id_token": id_token,
                             "token_type": "Bearer",
-                            "expires_in": 43199,
+                            "expires_in": self.token_expires_in,
                         }))
                     }
                 },
@@ -1328,6 +1556,7 @@ mod tests {
             client_id: PROD_CLIENT_ID.into(),
             scope: DEFAULT_SCOPE.into(),
             project: project.map(str::to_string),
+            project_wait: None,
             key_out: dir.join("service-account.json"),
             device_name: Some("homeassistant".into()),
             max_wait: Duration::from_secs(10),
@@ -1682,6 +1911,331 @@ mod tests {
             assert!(!shown.contains(TOKEN), "{step}: token leaked: {shown}");
             assert!(!shown.contains("refresh-SECRET"), "{step}: refresh token leaked: {shown}");
         }
+    }
+
+    // ---- Waiting for a project, and the Home Assistant notification ----
+
+    fn two_projects() -> Fake {
+        let mut fake = Fake::new();
+        fake.projects.push((
+            "other-org".into(),
+            vec![("project-abc".into(), "uid-abc".into(), "Garage".into())],
+        ));
+        fake
+    }
+
+    fn supervisor(base: &str) -> Supervisor {
+        Supervisor::new(base, SecretString::from(SUP_TOKEN)).unwrap()
+    }
+
+    fn wait_on(sup: &Supervisor) -> ProjectWait {
+        ProjectWait {
+            source: Arc::new(sup.clone()),
+            poll: Duration::from_millis(2),
+            max: Duration::from_secs(10),
+        }
+    }
+
+    /// As the add-on runs it: a wait on the Supervisor's saved options, and
+    /// every event and the outcome shown as a notification.
+    async fn run_notified(mut fake: Fake, project: Option<&str>, tweak: impl FnOnce(&mut PairingConfig)) -> Run {
+        if fake.key_json.is_empty() {
+            fake.key_json = good_key();
+        }
+        let (base, fake) = serve(fake).await;
+        let dir = temp_dir();
+        let mut cfg = config(&base, &dir.0, project);
+        let sup = supervisor(&base);
+        cfg.project_wait = Some(wait_on(&sup));
+        tweak(&mut cfg);
+        let notifier = PairingNotifier::spawn(sup);
+        let mut events = Vec::new();
+        let result = pair(&cfg, &mut |e| {
+            notifier.event(&e);
+            events.push(e);
+        })
+        .await;
+        notifier.outcome(&result);
+        notifier.finish().await;
+        Run { result, events, fake, cfg, _dir: dir }
+    }
+
+    /// (service, body) of each notification call, in order, after checking
+    /// each one carried the Supervisor token and nothing of the person's.
+    fn notifications(fake: &Fake) -> Vec<(String, Value)> {
+        fake.requests
+            .iter()
+            .filter_map(|r| {
+                let service = r.path.strip_prefix(NOTIFY_PREFIX)?;
+                assert_eq!(r.method, "POST");
+                assert_eq!(r.authorization.as_deref(), Some(format!("Bearer {SUP_TOKEN}").as_str()));
+                Some((service.to_string(), serde_json::from_str(&r.body).unwrap()))
+            })
+            .collect()
+    }
+
+    fn chooses(events: &[PairingEvent]) -> Vec<Option<String>> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                PairingEvent::ChooseProject { rejected, .. } => Some(rejected.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Nothing the person's login or the Supervisor's token could leak
+    /// through: events (what the log prints), notification bodies, errors.
+    fn assert_no_secrets(run: &Run) {
+        let fake = run.fake.lock().unwrap();
+        for r in fake.requests.iter().filter(|r| r.path.starts_with(NOTIFY_PREFIX) || r.path == OPTIONS_PATH) {
+            assert_ne!(r.authorization.as_deref(), Some(format!("Bearer {TOKEN}").as_str()), "user token sent to the Supervisor");
+            for secret in [TOKEN, SUP_TOKEN, "refresh-SECRET"] {
+                assert!(!r.body.contains(secret), "{secret} in {} body: {}", r.path, r.body);
+            }
+        }
+        let shown = format!("{:?} {:?}", run.events, run.result.as_ref().err().map(|e| e.to_string()));
+        for secret in [TOKEN, SUP_TOKEN, "refresh-SECRET"] {
+            assert!(!shown.contains(secret), "{secret} in events or error: {shown}");
+        }
+    }
+
+    #[tokio::test]
+    async fn several_projects_wait_for_a_choice_and_pair_with_one_approval() {
+        let mut fake = two_projects();
+        fake.options = VecDeque::from(["".into(), "".into(), "project-nope".into(), "project-nope".into(), PROJECT.into()]);
+        let run = run_notified(fake, None, |_| {}).await;
+        let paired = run.result.as_ref().expect("pairs once the project is set");
+        assert_eq!(paired.project, PROJECT);
+        assert_eq!(paired.organization, ORG);
+        assert!(run.cfg.key_out.exists());
+
+        {
+            let fake = run.fake.lock().unwrap();
+            assert_eq!(fake.codes_issued, 1, "no second approval");
+            assert_eq!(token_requests(&fake), 1);
+            assert!(fake.requests.iter().filter(|r| r.path == OPTIONS_PATH).count() >= 5);
+            // Nothing was created while waiting, and only in the chosen project.
+            assert_eq!(fake.sas.len(), 1);
+        }
+        assert_eq!(chooses(&run.events), [None, Some("project-nope".to_string())]);
+        let choose_at = run.events.iter().position(|e| matches!(e, PairingEvent::ChooseProject { .. })).unwrap();
+        let selected_at = run
+            .events
+            .iter()
+            .position(|e| matches!(e, PairingEvent::ProjectSelected { .. }))
+            .unwrap();
+        assert!(choose_at < selected_at);
+        let PairingEvent::ChooseProject { projects, wait, .. } = &run.events[choose_at] else { unreachable!() };
+        assert_eq!(
+            projects,
+            &[
+                ProjectChoice { id: PROJECT.into(), display_name: "Demo".into(), organization: ORG.into() },
+                ProjectChoice { id: "project-abc".into(), display_name: "Garage".into(), organization: "other-org".into() },
+            ]
+        );
+        assert!(*wait <= Duration::from_secs(10));
+
+        // The notification: the code, the list, the list again naming the
+        // wrong id, then gone. Always the same id, so each replaces the last.
+        let notes = notifications(&run.fake.lock().unwrap());
+        let services: Vec<&str> = notes.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(services, ["create", "create", "create", "dismiss"]);
+        for (service, body) in &notes {
+            assert_eq!(body["notification_id"], ha_supervisor::NOTIFICATION_ID);
+            if service == "create" {
+                assert_eq!(body["title"], "Datum Connect: connect to Datum");
+            } else {
+                assert_eq!(body, &json!({"notification_id": "datum_connect_pairing"}));
+            }
+        }
+        let code = notes[0].1["message"].as_str().unwrap();
+        assert_eq!(
+            code,
+            format!(
+                "[Open the Datum approval page]({}/ui/v2/login/device?user_code=ABCD-EFG1) and confirm code **ABCD-EFG1**. The code expires in 5 minutes; a new one appears here if it does.",
+                run.cfg.issuer
+            )
+        );
+        let list = notes[1].1["message"].as_str().unwrap();
+        assert!(list.contains("Set **project** on the add-on's Configuration tab to one of these ids and click Save. No restart needed; pairing continues automatically."), "{list}");
+        assert!(list.contains("- `project-7r4rl`: Demo (organization datum-demos-iy50km)"), "{list}");
+        assert!(list.contains("- `project-abc`: Garage (organization other-org)"), "{list}");
+        assert!(!list.contains("isn't one of your projects"), "{list}");
+        let again = notes[2].1["message"].as_str().unwrap();
+        assert!(again.starts_with("'project-nope' isn't one of your projects."), "{again}");
+        assert!(again.contains("`project-abc`"), "{again}");
+        assert_no_secrets(&run);
+    }
+
+    #[tokio::test]
+    async fn every_new_code_updates_the_notification() {
+        let mut fake = Fake::new();
+        fake.polls = VecDeque::from([Poll::Expired, Poll::Approve]);
+        let run = run_notified(fake, Some(PROJECT), |_| {}).await;
+        run.result.as_ref().expect("pairs");
+        let notes = notifications(&run.fake.lock().unwrap());
+        let messages: Vec<String> = notes.iter().map(|(s, b)| format!("{s} {}", b["message"].as_str().unwrap_or(""))).collect();
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert!(messages[0].starts_with("create ") && messages[0].contains("**ABCD-EFG1**"), "{messages:?}");
+        assert!(messages[1].starts_with("create ") && messages[1].contains("**ABCD-EFG2**"), "{messages:?}");
+        assert_eq!(messages[2], "dismiss ");
+        assert!(chooses(&run.events).is_empty(), "project was set and valid");
+        assert!(!run.fake.lock().unwrap().requests.iter().any(|r| r.path == OPTIONS_PATH), "no options read");
+    }
+
+    #[tokio::test]
+    async fn the_only_project_is_used_without_waiting() {
+        let run = run_notified(Fake::new(), None, |_| {}).await;
+        assert_eq!(run.result.as_ref().expect("pairs").project, PROJECT);
+        assert!(chooses(&run.events).is_empty());
+        assert!(!run.fake.lock().unwrap().requests.iter().any(|r| r.path == OPTIONS_PATH));
+    }
+
+    #[tokio::test]
+    async fn a_configured_project_that_is_not_there_is_waited_past() {
+        // One project visible, but another configured: wait, don't guess.
+        let mut fake = Fake::new();
+        fake.options = VecDeque::from(["project-nope".into(), "project-nope".into(), PROJECT.into()]);
+        let run = run_notified(fake, Some("project-nope"), |_| {}).await;
+        assert_eq!(run.result.as_ref().expect("pairs").project, PROJECT);
+        assert_eq!(chooses(&run.events), [Some("project-nope".to_string())], "the stale value is not re-reported");
+        let notes = notifications(&run.fake.lock().unwrap());
+        assert!(notes[1].1["message"].as_str().unwrap().starts_with("'project-nope' isn't one of your projects."));
+    }
+
+    #[tokio::test]
+    async fn a_failed_options_read_is_retried() {
+        let mut fake = two_projects();
+        fake.options = VecDeque::from(["!500".into(), "!500".into(), PROJECT.into()]);
+        let run = run_notified(fake, None, |_| {}).await;
+        assert_eq!(run.result.as_ref().expect("pairs").project, PROJECT);
+        assert_eq!(chooses(&run.events), [None]);
+    }
+
+    #[tokio::test]
+    async fn the_wait_stops_before_the_token_runs_out() {
+        let mut fake = two_projects();
+        // 125 ticks of 10ms: the token is good for 1.25s, and waiting stops
+        // 120 ticks (1.2s) before that.
+        fake.token_expires_in = 125;
+        let started = Instant::now();
+        let run = run_notified(fake, None, |c| c.tick = Duration::from_millis(10)).await;
+        let err = run.result.as_ref().unwrap_err();
+        assert!(matches!(err, PairingError::ProjectNotChosen { .. }), "{err}");
+        assert!(err.to_string().starts_with("Choosing a project took too long: none of yours was set within "), "{err}");
+        assert!(err.to_string().ends_with(" seconds, and the approval is no longer good. Restart to try again."), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(run.fake.lock().unwrap().sas.is_empty(), "nothing created");
+        assert!(!run.cfg.key_out.exists());
+
+        let notes = notifications(&run.fake.lock().unwrap());
+        let (service, last) = notes.last().unwrap();
+        assert_eq!(service, "create", "a failure stays up, with the reason");
+        let message = last["message"].as_str().unwrap();
+        assert!(message.starts_with("Pairing with Datum failed: Choosing a project took too long"), "{message}");
+        assert!(message.ends_with("Restart to try again."), "{message}");
+        assert_eq!(message.matches("estart").count(), 1, "restart advice once: {message}");
+        assert_no_secrets(&run);
+    }
+
+    #[tokio::test]
+    async fn the_wait_stops_at_its_maximum() {
+        let run = run_notified(two_projects(), None, |c| {
+            c.project_wait.as_mut().unwrap().max = Duration::from_millis(100);
+        })
+        .await;
+        assert!(matches!(run.result, Err(PairingError::ProjectNotChosen { .. })));
+        let reads = run.fake.lock().unwrap().requests.iter().filter(|r| r.path == OPTIONS_PATH).count();
+        assert!(reads >= 2, "polled while waiting: {reads}");
+    }
+
+    #[test]
+    fn the_wait_bound_falls_back_to_a_jwt_exp() {
+        let exp = chrono::Utc::now().timestamp() + 600;
+        let jwt = format!("e30.{}.sig", URL_SAFE_NO_PAD.encode(json!({"exp": exp}).to_string()));
+        let left = jwt_lifetime_secs(&jwt).unwrap();
+        assert!((598..=600).contains(&left), "{left}");
+        assert_eq!(jwt_lifetime_secs("opaque-token"), None);
+        let past = format!("e30.{}.sig", URL_SAFE_NO_PAD.encode(json!({"exp": 1}).to_string()));
+        assert_eq!(jwt_lifetime_secs(&past), None);
+    }
+
+    #[tokio::test]
+    async fn failing_notifications_never_fail_pairing() {
+        for status in [401, 500] {
+            let mut fake = two_projects();
+            fake.notify_status = status;
+            fake.options = VecDeque::from(["".into(), PROJECT.into()]);
+            let run = run_notified(fake, None, |_| {}).await;
+            assert_eq!(run.result.as_ref().expect("pairs regardless").project, PROJECT, "HTTP {status}");
+            assert_eq!(notifications(&run.fake.lock().unwrap()).len(), 3, "each still tried once");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_supervisor_that_is_not_there_never_fails_pairing() {
+        let (base, fake) = serve({
+            let mut f = Fake::new();
+            f.key_json = good_key();
+            f
+        })
+        .await;
+        let dir = temp_dir();
+        let cfg = config(&base, &dir.0, None);
+        // Nothing listens on a port just freed.
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let notifier = PairingNotifier::spawn(supervisor(&closed));
+        let mut events = Vec::new();
+        let result = pair(&cfg, &mut |e| {
+            notifier.event(&e);
+            events.push(e);
+        })
+        .await;
+        notifier.outcome(&result);
+        notifier.finish().await;
+        result.expect("pairs");
+        drop((fake, dir));
+    }
+
+    #[tokio::test]
+    async fn without_a_wait_several_projects_still_stop_and_nothing_is_asked_of_the_supervisor() {
+        let run = run_with(two_projects(), None, |_| {}).await;
+        assert!(matches!(run.result, Err(PairingError::Project(_))));
+        let fake = run.fake.lock().unwrap();
+        assert!(
+            !fake.requests.iter().any(|r| r.path.starts_with(NOTIFY_PREFIX) || r.path == OPTIONS_PATH),
+            "log-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_errors_never_quote_its_token() {
+        let mut fake = Fake::new();
+        fake.echo_auth_on = Some("/persistent_notification/create".into());
+        let (base, _fake) = serve(fake).await;
+        let err = supervisor(&base).notify("hi").await.unwrap_err();
+        assert!(err.contains("[redacted]") && !err.contains(SUP_TOKEN), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_saved_project_is_read_from_the_supervisor() {
+        let mut fake = Fake::new();
+        fake.options = VecDeque::from(["".into(), "  p-1 ".into()]);
+        let (base, fake) = serve(fake).await;
+        let sup = supervisor(&base);
+        assert_eq!(sup.saved_project().await.unwrap(), None, "empty is unset");
+        assert_eq!(sup.saved_project().await.unwrap().as_deref(), Some("p-1"));
+        let fake = fake.lock().unwrap();
+        let read = fake.requests.iter().find(|r| r.path == OPTIONS_PATH).unwrap();
+        assert_eq!(read.method, "GET");
+        assert_eq!(read.authorization.as_deref(), Some(format!("Bearer {SUP_TOKEN}").as_str()));
+        drop(fake);
+        let wrong = Supervisor::new(base, SecretString::from("wrong")).unwrap();
+        assert!(wrong.saved_project().await.unwrap_err().contains("HTTP 401"));
     }
 
     #[test]
