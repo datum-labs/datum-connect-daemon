@@ -531,6 +531,17 @@ impl TunnelService {
             .await
     }
 
+    /// Repoint a tunnel's backend at `endpoint`, keeping the connector its
+    /// HTTPProxy and ConnectorAdvertisement already reference. See
+    /// [`retarget_project`](Self::retarget_project).
+    pub async fn retarget_active(&self, tunnel_id: &str, endpoint: &str) -> Result<TunnelSummary> {
+        let Some(selected) = self.datum.selected_context() else {
+            n0_error::bail_any!("No project selected");
+        };
+        self.retarget_project(&selected.project_id, tunnel_id, endpoint)
+            .await
+    }
+
     /// Delete connectors in the active project that are not referenced by any
     /// HTTPProxy. Returns the names of deleted connectors.
     pub async fn cleanup_orphaned_connectors(&self) -> Result<Vec<String>> {
@@ -1143,15 +1154,114 @@ impl TunnelService {
         Ok(summary)
     }
 
+    /// Like [`update_project`](Self::update_project), but only the backend
+    /// endpoint changes: the proxy keeps the connector it references and the
+    /// advertisement keeps its `connectorRef`, so this never finds or creates
+    /// a Connector for this service's own identity.
+    ///
+    /// That matters for a service whose identity isn't the tunnel's. The
+    /// daemon's control node gets a fresh key on every start, so going
+    /// through `update_project` there made a new Connector each restart and
+    /// briefly pointed the tunnel at it, until the tunnel's own start pointed
+    /// it back and left the new one unreferenced and never Ready.
+    ///
+    /// A proxy that references no connector at all falls back to
+    /// `update_project`, since there is nothing to keep.
+    pub async fn retarget_project(
+        &self,
+        project_id: &str,
+        tunnel_id: &str,
+        endpoint: &str,
+    ) -> Result<TunnelSummary> {
+        let endpoint = normalize_endpoint(endpoint);
+        let target = parse_target(&endpoint)?;
+
+        let pcp = self.datum.project_control_plane_client(project_id).await?;
+        let client = pcp.client();
+        let proxies: Api<HTTPProxy> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
+        let ads: Api<ConnectorAdvertisement> = Api::namespaced(client, DEFAULT_PCP_NAMESPACE);
+
+        let existing = proxies
+            .get(tunnel_id)
+            .await
+            .std_context("Failed to fetch HTTPProxy")?;
+        let label = proxy_label(&existing, tunnel_id);
+        let Some(desired_rules) =
+            retarget_proxy_rules(&existing, &endpoint, self.waf_exempt_matches.as_deref())
+        else {
+            warn!(%project_id, proxy = %tunnel_id, "HTTPProxy references no connector; falling back to a full update");
+            return self.update_project(project_id, tunnel_id, &label, &endpoint).await;
+        };
+
+        if http_proxy_spec_matches(&existing, &label, &desired_rules) {
+            debug!(%project_id, proxy = %tunnel_id, "HTTPProxy already points at this endpoint; skipping patch");
+        } else {
+            let hostnames = existing.spec.hostnames.clone().unwrap_or_default();
+            let patch = json!({
+                "metadata": { "annotations": { DISPLAY_NAME_ANNOTATION: &label } },
+                "spec": { "hostnames": hostnames, "rules": desired_rules },
+            });
+            proxies
+                .patch(tunnel_id, &PatchParams::default(), &Patch::Merge(&patch))
+                .await
+                .std_context("Failed to update HTTPProxy endpoint")?;
+        }
+
+        let existing_ad = ads
+            .get_opt(tunnel_id)
+            .await
+            .std_context("Failed to fetch ConnectorAdvertisement")?;
+        if let Some(existing_ad) = existing_ad.as_ref() {
+            let desired_ad_spec = retarget_advertisement_spec(&existing_ad.spec, target);
+            if !advertisement_spec_matches(existing_ad, &desired_ad_spec) {
+                let ad_patch = json!({ "spec": desired_ad_spec });
+                ads.patch(tunnel_id, &PatchParams::default(), &Patch::Merge(&ad_patch))
+                    .await
+                    .std_context("Failed to update ConnectorAdvertisement endpoint")?;
+            }
+        }
+
+        let conditions = existing.status.as_ref().and_then(|s| s.conditions.as_deref());
+        let summary = TunnelSummary {
+            id: tunnel_id.to_string(),
+            label,
+            endpoint,
+            hostnames: proxy_hostnames(&existing),
+            enabled: existing_ad.is_some(),
+            accepted: condition_status(conditions, HTTP_PROXY_CONDITION_ACCEPTED, true),
+            programmed: condition_status(conditions, HTTP_PROXY_CONDITION_PROGRAMMED, true),
+            connector_metadata_programmed: condition_status(
+                conditions,
+                HTTP_PROXY_CONDITION_CONNECTOR_METADATA_PROGRAMMED,
+                false,
+            ),
+            connector_ready: false,
+            connector_name: proxy_connector_name(&existing),
+            connector_device: None,
+        };
+
+        // Same local bookkeeping as `update_project`.
+        if !self.publish_tickets
+            && let Ok(proxy_state) = proxy_state_from_summary(
+                &summary.id,
+                &summary.endpoint,
+                &summary.label,
+                summary.enabled,
+            )
+            && let Err(err) = self.listen.set_proxy_state(proxy_state).await
+        {
+            warn!(tunnel_id = %summary.id, "Failed to store proxy state: {err:#}");
+        }
+
+        Ok(summary)
+    }
+
     pub async fn set_enabled_project(
         &self,
         project_id: &str,
         tunnel_id: &str,
         enabled: bool,
     ) -> Result<TunnelSummary> {
-        let connector = self.ensure_connector(project_id).await?;
-        let connector_name = connector.name_any();
-
         let pcp = self.datum.project_control_plane_client(project_id).await?;
         let client = pcp.client();
         let proxies: Api<HTTPProxy> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
@@ -1163,50 +1273,45 @@ impl TunnelService {
             .await
             .std_context("Failed to fetch HTTPProxy")?;
         let endpoint = normalize_endpoint(&proxy_backend_endpoint(&proxy).unwrap_or_default());
-        let label = proxy
-            .metadata
-            .annotations
-            .as_ref()
-            .and_then(|labels| labels.get(DISPLAY_NAME_ANNOTATION))
-            .cloned()
-            .unwrap_or_else(|| tunnel_id.to_string());
+        let label = proxy_label(&proxy, tunnel_id);
 
-        // Always patch the proxy's connector backend to reference the fresh
-        // connector. The previous connector was deleted by ensure_connector;
-        // if we don't update the proxy here the operator watches a connector
-        // that no longer exists and the Ready/IrohDNSPublished conditions
-        // never become True.
-        //
-        // `proxy_rules` is what the proxy carries afterwards, for the edge
-        // policy pass below.
-        let proxy_rules: Vec<HTTPProxyRule>;
-        {
+        if enabled {
+            // Always patch the proxy's connector backend to reference this
+            // service's connector. The previous connector was deleted by
+            // ensure_connector; if we don't update the proxy here the
+            // operator watches a connector that no longer exists and the
+            // Ready/IrohDNSPublished conditions never become True.
+            //
+            // Only when enabling: turning a tunnel off needs no connector,
+            // and the daemon disables a stopped tunnel through its control
+            // service, whose fresh identity would otherwise get a Connector
+            // of its own (never Ready) and the proxy repointed at it.
+            let connector = self.ensure_connector(project_id).await?;
+            let connector_name = connector.name_any();
             let target = parse_target(&endpoint)?;
             let desired_rules = desired_proxy_rules(
                 &endpoint,
                 &connector_name,
                 self.waf_exempt_matches.as_deref(),
             );
-            if http_proxy_spec_matches(&proxy, &label, &desired_rules) {
-                proxy_rules = proxy.spec.rules.clone();
-            } else {
-                let hostnames = proxy.spec.hostnames.clone().unwrap_or_default();
-                let patch = json!({
-                    "metadata": { "annotations": { DISPLAY_NAME_ANNOTATION: &label } },
-                    "spec": { "hostnames": hostnames, "rules": desired_rules },
-                });
-                proxy_rules = proxies
-                    .patch(tunnel_id, &PatchParams::default(), &Patch::Merge(&patch))
-                    .await
-                    .std_context("Failed to patch HTTPProxy connector reference")?
-                    .spec
-                    .rules;
-            }
-            let _ = target; // used above
-        }
+            // What the proxy carries afterwards, for the edge policy pass.
+            let proxy_rules: Vec<HTTPProxyRule> =
+                if http_proxy_spec_matches(&proxy, &label, &desired_rules) {
+                    proxy.spec.rules.clone()
+                } else {
+                    let hostnames = proxy.spec.hostnames.clone().unwrap_or_default();
+                    let patch = json!({
+                        "metadata": { "annotations": { DISPLAY_NAME_ANNOTATION: &label } },
+                        "spec": { "hostnames": hostnames, "rules": desired_rules },
+                    });
+                    proxies
+                        .patch(tunnel_id, &PatchParams::default(), &Patch::Merge(&patch))
+                        .await
+                        .std_context("Failed to patch HTTPProxy connector reference")?
+                        .spec
+                        .rules
+                };
 
-        if enabled {
-            let target = parse_target(&endpoint)?;
             let ad_spec = advertisement_spec(&connector_name, target);
             match ads
                 .get_opt(tunnel_id)
@@ -1236,6 +1341,8 @@ impl TunnelService {
                     .std_context("Failed to create ConnectorAdvertisement")?;
                 }
             }
+
+            self.spawn_edge_policies(&client, project_id, tunnel_id, &label, true, &proxy_rules);
         } else if ads
             .get_opt(tunnel_id)
             .await
@@ -1246,8 +1353,6 @@ impl TunnelService {
                 .await
                 .std_context("Failed to delete ConnectorAdvertisement")?;
         }
-
-        self.spawn_edge_policies(&client, project_id, tunnel_id, &label, enabled, &proxy_rules);
 
         let connector_name = proxy_connector_name(&proxy);
 
@@ -1306,9 +1411,6 @@ impl TunnelService {
         project_id: &str,
         tunnel_id: &str,
     ) -> Result<TunnelDeleteOutcome> {
-        let connector = self.find_connector(project_id).await?;
-        let connector_name = connector.as_ref().map(|c| c.name_any());
-
         let pcp = self.datum.project_control_plane_client(project_id).await?;
         let client = pcp.client();
         let proxies: Api<HTTPProxy> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
@@ -1316,13 +1418,22 @@ impl TunnelService {
             Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
         let connectors: Api<Connector> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
 
-        let mut http_proxy_name: Option<String> = None;
-        if proxies
+        let existing_proxy = proxies
             .get_opt(tunnel_id)
             .await
-            .std_context("Failed to load HTTPProxy")?
-            .is_some()
-        {
+            .std_context("Failed to load HTTPProxy")?;
+        // The connector the tunnel actually uses, not this service's: the
+        // daemon deletes through its control service, whose identity never
+        // owns the tunnel's connector, so looking it up by identity left the
+        // real one behind on every delete. The "no other proxy uses it"
+        // check below still guards a shared connector.
+        let connector_name = match existing_proxy.as_ref().and_then(proxy_connector_name) {
+            Some(name) => Some(name),
+            None => self.find_connector(project_id).await?.map(|c| c.name_any()),
+        };
+
+        let mut http_proxy_name: Option<String> = None;
+        if existing_proxy.is_some() {
             proxies
                 .delete(tunnel_id, &DeleteParams::default())
                 .await
@@ -1711,6 +1822,39 @@ fn advertisement_spec_matches(
         return false;
     };
     existing_value == desired_value
+}
+
+/// The proxy's display label, or its name when it has none.
+fn proxy_label(proxy: &HTTPProxy, tunnel_id: &str) -> String {
+    proxy
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|labels| labels.get(DISPLAY_NAME_ANNOTATION))
+        .cloned()
+        .unwrap_or_else(|| tunnel_id.to_string())
+}
+
+/// The rules `retarget_project` writes: `desired_proxy_rules` for the new
+/// endpoint, aimed at the connector the proxy already references, so the
+/// `streams`/`protected` split and the no-churn comparison behave exactly as
+/// on every other path. `None` when the proxy references no connector.
+fn retarget_proxy_rules(
+    existing: &HTTPProxy,
+    endpoint: &str,
+    waf_exempt_matches: Option<&[HTTPRouteMatch]>,
+) -> Option<Vec<HTTPProxyRule>> {
+    let connector_name = proxy_connector_name(existing)?;
+    Some(desired_proxy_rules(endpoint, &connector_name, waf_exempt_matches))
+}
+
+/// The advertisement `retarget_project` writes: the new address and port
+/// under the `connectorRef` the advertisement already has.
+fn retarget_advertisement_spec(
+    existing: &ConnectorAdvertisementSpec,
+    target: ParsedTarget,
+) -> ConnectorAdvertisementSpec {
+    advertisement_spec(&existing.connector_ref.name, target)
 }
 
 /// Extract the connector name from the first backend that references one.
@@ -2560,5 +2704,79 @@ mod tests {
         let desired_new_conn =
             advertisement_spec("datum-connect-NEW", target("127.0.0.1", 11434));
         assert!(!advertisement_spec_matches(&existing, &desired_new_conn));
+    }
+
+    fn json(rules: &[HTTPProxyRule]) -> serde_json::Value {
+        serde_json::to_value(rules).unwrap()
+    }
+
+    /// The restart leak: the daemon's control node has a fresh identity on
+    /// every start, so repointing through it must keep the tunnel's own
+    /// connector rather than name one of its own.
+    #[test]
+    fn retarget_proxy_rules_keep_the_existing_connector() {
+        let existing = proxy_with_rules("ha", desired_proxy_rules(EP, CONN, None));
+        let rules = retarget_proxy_rules(&existing, "http://127.0.0.1:41795", None).unwrap();
+        assert_eq!(json(&rules), json(&desired_proxy_rules("http://127.0.0.1:41795", CONN, None)));
+        let patched = proxy_with_rules("ha", rules);
+        assert_eq!(proxy_connector_name(&patched).as_deref(), Some(CONN));
+        assert_eq!(proxy_backend_endpoint(&patched).as_deref(), Some("http://127.0.0.1:41795"));
+    }
+
+    #[test]
+    fn retarget_proxy_rules_keep_the_streams_split() {
+        let matches = ha_matches();
+        let existing = proxy_with_rules("ha", desired_proxy_rules(EP, CONN, Some(&matches)));
+        let rules = retarget_proxy_rules(&existing, "http://127.0.0.1:41795", Some(&matches)).unwrap();
+        assert_eq!(json(&rules), json(&desired_proxy_rules("http://127.0.0.1:41795", CONN, Some(&matches))));
+        assert!(edge_policies::has_protected_rule(&rules));
+        // Both backend rules move to the new endpoint, on the same connector.
+        for rule in rules.iter().filter(|r| r.backends.is_some()) {
+            let backend = &rule.backends.as_ref().unwrap()[0];
+            assert_eq!(backend.endpoint, "http://127.0.0.1:41795");
+            assert_eq!(backend.connector.as_ref().unwrap().name, CONN);
+        }
+    }
+
+    /// Repointing at the endpoint the proxy already has must compare equal,
+    /// so `retarget_project` sends no PATCH.
+    #[test]
+    fn retarget_to_same_endpoint_is_no_churn() {
+        for matches in [None, Some(ha_matches())] {
+            let existing = proxy_with_rules("ha", desired_proxy_rules(EP, CONN, matches.as_deref()));
+            let rules = retarget_proxy_rules(&existing, EP, matches.as_deref()).unwrap();
+            assert!(http_proxy_spec_matches(&existing, "ha", &rules));
+            let moved = retarget_proxy_rules(&existing, "http://127.0.0.1:1", matches.as_deref()).unwrap();
+            assert!(!http_proxy_spec_matches(&existing, "ha", &moved));
+        }
+    }
+
+    #[test]
+    fn retarget_proxy_rules_none_without_a_connector() {
+        let mut existing = proxy_with_backend("ha", EP, CONN);
+        existing.spec.rules = vec![https_redirect_rule()];
+        assert!(retarget_proxy_rules(&existing, EP, None).is_none());
+    }
+
+    #[test]
+    fn retarget_advertisement_spec_keeps_connector_ref() {
+        let existing = advertisement_with_target(CONN, "127.0.0.1", 8123);
+        let desired = retarget_advertisement_spec(&existing.spec, target("127.0.0.1", 41795));
+        assert_eq!(desired.connector_ref.name, CONN);
+        assert_eq!(
+            serde_json::to_value(&desired).unwrap(),
+            serde_json::to_value(advertisement_spec(CONN, target("127.0.0.1", 41795))).unwrap()
+        );
+        assert!(!advertisement_spec_matches(&existing, &desired));
+        let same = retarget_advertisement_spec(&existing.spec, target("127.0.0.1", 8123));
+        assert!(advertisement_spec_matches(&existing, &same));
+    }
+
+    #[test]
+    fn proxy_label_falls_back_to_name() {
+        assert_eq!(proxy_label(&proxy_with_backend("ha", EP, CONN), "tunnel-test"), "ha");
+        let mut unlabelled = proxy_with_backend("ha", EP, CONN);
+        unlabelled.metadata.annotations = None;
+        assert_eq!(proxy_label(&unlabelled, "tunnel-test"), "tunnel-test");
     }
 }
