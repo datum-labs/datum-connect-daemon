@@ -113,6 +113,10 @@ struct AppState {
     /// `TunnelService` so its enable path writes the same rules as
     /// `control` does (otherwise each start would undo the split).
     waf_exempt_matches: Vec<connect_lib::datum_apis::http_proxy::HTTPRouteMatch>,
+    /// `Args::edge_policies`, handed to every per-tunnel `TunnelService`
+    /// for the same reason: the enable path is where the policies are
+    /// (re)ensured.
+    edge_policies: bool,
     /// When this daemon process started, for the dashboard's uptime.
     started_at_unix_ms: u128,
 }
@@ -207,6 +211,19 @@ struct Args {
     /// leave a `protected`-scoped WAF matching nothing.
     #[clap(long, env = "DATUM_TUNNEL_WAF_EXEMPT_MATCHES")]
     waf_exempt_matches: Option<String>,
+    /// On create and on every enable, also ensure the tunnel's edge
+    /// policies: a WAF scoped to the `protected` rule and a 1h request
+    /// timeout (see `connect_lib::edge_policies`). Set by the Home Assistant
+    /// add-on, alongside `DATUM_TUNNEL_WAF_EXEMPT_MATCHES`. Off (the
+    /// default) touches no policy. Failures are logged, never fatal.
+    #[clap(
+        long,
+        env = "DATUM_TUNNEL_EDGE_POLICIES",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    edge_policies: bool,
 }
 
 #[derive(Deserialize)]
@@ -377,6 +394,27 @@ async fn get_progress(
         }
         Ok(None) => Err(not_found(&id)),
         Err(e) => Err(err_response(e)),
+    }
+}
+
+#[cfg(test)]
+mod args_tests {
+    use super::*;
+
+    /// Unset means off, so the desktop app and datumctl, which never set
+    /// it, keep their behaviour. The add-on's `1` and the usual spellings
+    /// turn it on.
+    #[test]
+    fn edge_policies_default_off_and_accept_boolish_values() {
+        if std::env::var_os("DATUM_TUNNEL_EDGE_POLICIES").is_none() {
+            let args = Args::try_parse_from(["datum-connect-daemon"]).unwrap();
+            assert!(!args.edge_policies);
+        }
+        for (raw, want) in [("1", true), ("true", true), ("yes", true), ("0", false), ("false", false)] {
+            let args =
+                Args::try_parse_from(["datum-connect-daemon", "--edge-policies", raw]).unwrap();
+            assert_eq!(args.edge_policies, want, "{raw}");
+        }
     }
 }
 
@@ -753,7 +791,8 @@ async fn start_tunnel_internal(
             .map_err(err_response)?;
     }
     let service = TunnelService::new(state.datum.clone(), node.clone())
-        .with_waf_exempt_matches(state.waf_exempt_matches.clone());
+        .with_waf_exempt_matches(state.waf_exempt_matches.clone())
+        .with_edge_policies(state.edge_policies);
 
     // Heartbeat first so the relay/connection details are populated before
     // enabling — same ordering as `datum-connect listen` and for the same
@@ -875,13 +914,11 @@ async fn run() -> n0_error::Result<()> {
         ));
     }
 
-    let token_source = ExternalTokenSource::from_env(session.clone())
+    // A service account key (DATUM_SA_KEY_FILE, the Home Assistant add-on)
+    // mints tokens in-process; otherwise the credentials helper, as before.
+    let token_source = ExternalTokenSource::from_env_with_refresh(session.clone())
+        .await
         .map_err(|e| n0_error::anyerr!("failed to create token source: {e}"))?;
-    if let Some(ref s) = session {
-        if let Ok(helper) = std::env::var("DATUM_CREDENTIALS_HELPER") {
-            token_source.start_refresh(helper, s.clone());
-        }
-    }
     let datum = DatumCloudClient::with_external_token_source(ApiEnv::default(), token_source);
 
     let project_id = args
@@ -942,8 +979,14 @@ async fn run() -> n0_error::Result<()> {
             "WAF exemptions configured: tunnels get a `streams` rule ahead of `protected`"
         );
     }
+    if args.edge_policies {
+        tracing::info!(
+            "Edge policies on: each tunnel's WAF and 1h request timeout are ensured on create and on every start"
+        );
+    }
     let control = TunnelService::new(datum.clone(), control_node)
-        .with_waf_exempt_matches(waf_exempt_matches.clone());
+        .with_waf_exempt_matches(waf_exempt_matches.clone())
+        .with_edge_policies(args.edge_policies);
 
     let setup_token = auth::load_or_create_setup_token(&repo_path)
         .await
@@ -976,6 +1019,7 @@ async fn run() -> n0_error::Result<()> {
         log_sources,
         log_tail_max_lines: args.log_tail_max_lines,
         waf_exempt_matches,
+        edge_policies: args.edge_policies,
         started_at_unix_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())

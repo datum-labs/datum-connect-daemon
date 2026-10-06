@@ -10,7 +10,6 @@ set -euo pipefail
 
 PORT=47780
 CONNECT_DIR=/data/connect
-CREDENTIALS_HELPER=/usr/bin/sa-credentials-helper.sh
 
 PROJECT="$(bashio::config 'project')"
 PASTED_KEY="$(bashio::config 'service_account_key')"
@@ -20,7 +19,7 @@ LABEL="$(bashio::config 'tunnel_label')"
 LOG_LEVEL="$(bashio::config 'log_level')"
 
 # A pasted key wins over a file. It is written to the add-on's private /data,
-# readable by this add-on only, because the credentials helper reads a file.
+# readable by this add-on only, because the daemon reads the key from a file.
 # The browser strips the line breaks from a pasted multi-line file, which is
 # harmless: whitespace between JSON tokens is insignificant, and the PEM key
 # inside is stored with escaped \n, not real line breaks.
@@ -41,8 +40,8 @@ unset PASTED_KEY
 
 # Checked here rather than left for the daemon to fail on later: a wrong file
 # in the right place is a confusing failure, and this is cheap.
-if ! jq -e 'select(.type == "datum_service_account") | .client_id, .private_key, .scope' "${KEY_FILE}" >/dev/null 2>&1; then
-    bashio::exit.nok "${KEY_SOURCE} is not a Datum service account key (expected JSON with type, client_id, private_key and scope). Paste the whole file, braces included. A personal login token will not work here."
+if ! jq -e '.type == "datum_service_account" and (.client_id and .private_key_id and .private_key and .scope)' "${KEY_FILE}" >/dev/null 2>&1; then
+    bashio::exit.nok "${KEY_SOURCE} is not a Datum service account key (expected JSON with type, client_id, private_key_id, private_key and scope). Paste the whole file, braces included. A personal login token will not work here."
 fi
 
 # A service account's client_email is <name>@<project>.identity.miloapis.com,
@@ -59,13 +58,14 @@ elif [ -n "${KEY_PROJECT}" ] && [ "${KEY_PROJECT}" != "${PROJECT}" ]; then
 fi
 
 mkdir -p "${CONNECT_DIR}"
+# The daemon signs a short-lived assertion with this key and exchanges it for
+# an access token, a fresh one on every refresh, with no helper process.
 export DATUM_SA_KEY_FILE="${KEY_FILE}"
 
 export DATUM_PLUGIN_MODE=1
 export DATUM_PROJECT="${PROJECT}"
 export DATUM_CONNECT_DIR="${CONNECT_DIR}"
 export DATUM_SESSION="service-account@${PROJECT}"
-export DATUM_CREDENTIALS_HELPER="${CREDENTIALS_HELPER}"
 export RUST_LOG="datum_connect_daemon=${LOG_LEVEL},connect_lib=${LOG_LEVEL}"
 
 # The daemon force-stops any tunnel left on for 24h. That backstop exists for
@@ -96,6 +96,14 @@ DATUM_TUNNEL_WAF_EXEMPT_MATCHES=$(jq -c . <<'EOF'
 EOF
 )
 export DATUM_TUNNEL_WAF_EXEMPT_MATCHES
+
+# Have the daemon put Datum's WAF in front of the tunnel, on (Enforce) for
+# everything but the streams above, by scoping it to the "protected" rule,
+# and raise the edge's request timeout to 1h, since Envoy's 15s default cuts
+# HA's live views. Both policies are created only when missing, so changes
+# made in the portal survive. The daemon checks them every time it starts
+# the tunnel, so a failure is retried on the next add-on start. See DOCS.md.
+export DATUM_TUNNEL_EDGE_POLICIES=1
 
 if bashio::var.is_empty "${LABEL}" || [ "${LABEL}" = "null" ]; then
     LABEL="home-assistant"
@@ -217,244 +225,6 @@ if [ -n "${HOSTNAME}" ]; then
 else
     bashio::log.warning "Tunnel started, but no public hostname was reported within 2 minutes. It may still be provisioning; restart the add-on to check again."
 fi
-
-# Put Datum's WAF in front of the tunnel, on (Enforce) for everything except
-# Home Assistant's streaming endpoints. The policy targets the HTTPProxy's
-# "protected" rule by sectionName, and the streams have their own rule (see
-# DATUM_TUNNEL_WAF_EXEMPT_MATCHES above), because a WAF on a stream makes
-# Datum's edge hold the response back (datum-cloud/infra#6677).
-#
-# This must run after the daemon has applied those rules, which it does
-# during the tunnel start above. Before that, sectionName "protected" would
-# resolve to nothing, which is harmless (the policy applies to nothing) but
-# means no WAF. The same goes for good if the daemon ever lacks the rule:
-# the WAF is silently off, not on everything. check_protected_rule warns.
-#
-# Created only when missing, never overwritten: a policy that already exists
-# may have been tuned in the portal, and a restart must not undo that. The
-# one exception is the switched-off policy add-on 0.1.5 or 0.1.6 created, recognised
-# strictly (see is_addon_015_waf) and moved to this setup once. Every policy
-# the add-on writes carries the managed-by annotation; one without it is
-# never changed.
-#
-# Paranoia level 1 with rule 920420 excluded is the setting validated on a
-# real device when enforced (remote login, and saving an automation with a template
-# condition, over cellular). 920420 has to go at every level: Home
-# Assistant's login page POSTs JSON as text/plain, which CRS v4 rejects, so
-# login fails. Attacks in text/plain bodies are still caught by the other
-# rules. Level 2 also blocks any {{ }} template in a REST body, which breaks
-# template automations, so it stays off until it has targeted exclusions.
-#
-# A failure here is a warning, not an exit: the tunnel already works, and
-# taking it down because its WAF could not be set up helps no one.
-DATUM_API=${DATUM_API_URL:-https://api.datum.net}
-CONTROL_PLANE="${DATUM_API}/apis/resourcemanager.miloapis.com/v1alpha1/projects/${PROJECT}/control-plane"
-WAF_NAME="${TUNNEL_ID}-waf"
-WAF_URL="${CONTROL_PLANE}/apis/networking.datumapis.com/v1alpha/namespaces/default/trafficprotectionpolicies"
-PROXY_URL="${CONTROL_PLANE}/apis/networking.datumapis.com/v1alpha/namespaces/default/httpproxies/${TUNNEL_ID}"
-PORTAL_LINK="https://cloud.datum.net (project ${PROJECT}, policy ${WAF_NAME})"
-MANAGED_BY_KEY="connect.datum.net/managed-by"
-MANAGED_BY_VALUE="datum-connect-addon"
-PROTECTED_RULE="protected"
-
-# The policy's spec, shared by a fresh create and the 0.1.5/0.1.6 upgrade.
-WAF_SPEC=$(jq -n --arg route "${TUNNEL_ID}" --arg section "${PROTECTED_RULE}" '{
-    mode: "Enforce",
-    samplingPercentage: 100,
-    ruleSets: [{
-        type: "OWASPCoreRuleSet",
-        owaspCoreRuleSet: {
-            paranoiaLevels: {blocking: 1, detection: 1},
-            scoreThresholds: {inbound: 5, outbound: 4},
-            ruleExclusions: {ids: [920420]}
-        }
-    }],
-    targetRefs: [{group: "gateway.networking.k8s.io", kind: "HTTPRoute", name: $route, sectionName: $section}]
-}')
-
-# The start of a failed response, on one line. Error bodies can be whole HTML
-# pages, and one dumped in full once buried the rest of the log.
-excerpt() {
-    local text
-    text=$(tr -s '\r\n\t' '   ' < "$1")
-    text="${text% }"
-    if [ "${#text}" -gt 200 ]; then
-        text="${text:0:200}..."
-    fi
-    printf '%s' "${text}"
-}
-
-# The WAF follows the "protected" rule by name, so a proxy without one has
-# no WAF at all: if the daemon ran without DATUM_TUNNEL_WAF_EXEMPT_MATCHES,
-# or the rules were edited by hand. Nothing else would show it.
-check_protected_rule() {
-    local token=$1 status body
-    body=$(mktemp)
-    status=$(curl -s -m 30 -o "${body}" -w '%{http_code}' "${PROXY_URL}" \
-        -H "Authorization: Bearer ${token}" || true)
-    if [ "${status}" != 200 ]; then
-        bashio::log.warning "Could not check tunnel ${TUNNEL_ID}'s rules for the WAF (HTTP ${status:-no response}). Response: $(excerpt "${body}")"
-    elif ! jq -e --arg rule "${PROTECTED_RULE}" 'any(.spec.rules[]?; .name == $rule)' "${body}" >/dev/null; then
-        bashio::log.warning "!!! Edge protection is OFF: tunnel ${TUNNEL_ID} has no rule named '${PROTECTED_RULE}', so its WAF matches nothing. Restart the add-on; if this persists, report it."
-    fi
-    rm -f "${body}"
-}
-
-# True only for the exact policy add-on 0.1.5 or 0.1.6 created: switched off, aimed at
-# the whole route, without our annotation, and with that rule set
-# unchanged. Anything else may have been chosen in the portal.
-is_addon_015_waf() {
-    jq -e --arg route "${TUNNEL_ID}" --arg key "${MANAGED_BY_KEY}" '
-        .spec.mode == "Disabled"
-        and ((.metadata.annotations // {}) | has($key) | not)
-        and (.spec.samplingPercentage // 100) == 100
-        and (.spec.targetRefs | length) == 1
-        and .spec.targetRefs[0].kind == "HTTPRoute"
-        and .spec.targetRefs[0].name == $route
-        and (.spec.targetRefs[0].sectionName // "") == ""
-        and (.spec.ruleSets | length) == 1
-        and .spec.ruleSets[0].type == "OWASPCoreRuleSet"
-        and (.spec.ruleSets[0].owaspCoreRuleSet
-            | .paranoiaLevels == {blocking: 1, detection: 1}
-              and .scoreThresholds == {inbound: 5, outbound: 4}
-              and .ruleExclusions == {ids: [920420]})
-    ' "$1" >/dev/null
-}
-
-# Moves that switched-off policy to the current spec in place. The PUT carries the
-# resourceVersion just read, so an edit made in between wins over this (409).
-upgrade_015_waf() {
-    local token=$1 current=$2 status body policy
-    policy=$(jq --arg key "${MANAGED_BY_KEY}" --arg value "${MANAGED_BY_VALUE}" --argjson spec "${WAF_SPEC}" \
-        'del(.status) | .spec = $spec | .metadata.annotations[$key] = $value' "${current}")
-    body=$(mktemp)
-    status=$(curl -s -m 30 -o "${body}" -w '%{http_code}' -X PUT "${WAF_URL}/${WAF_NAME}" \
-        -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
-        -d "${policy}" || true)
-    case "${status}" in
-        200|201)
-            bashio::log.info "Edge protection policy from add-on 0.1.5/0.1.6 switched ON: Datum WAF now enforces on everything except Home Assistant's streaming endpoints. Manage it in the Datum portal: ${PORTAL_LINK}" ;;
-        409)
-            bashio::log.warning "Edge protection still OFF: policy ${WAF_NAME} changed while being upgraded, so it was left as is. Restart the add-on to try again." ;;
-        401|403)
-            bashio::log.warning "Edge protection still OFF: the service account may not update WAF policies in project ${PROJECT} (HTTP ${status}). Give it that permission, then restart the add-on." ;;
-        *)
-            bashio::log.warning "Edge protection still OFF: upgrading policy ${WAF_NAME} failed (HTTP ${status:-no response}). Response: $(excerpt "${body}")" ;;
-    esac
-    rm -f "${body}"
-}
-
-ensure_waf() {
-    local token=$1 status body policy
-    check_protected_rule "${token}"
-    body=$(mktemp)
-    status=$(curl -s -m 30 -o "${body}" -w '%{http_code}' "${WAF_URL}/${WAF_NAME}" \
-        -H "Authorization: Bearer ${token}" || true)
-    case "${status}" in
-        200)
-            if jq -e --arg key "${MANAGED_BY_KEY}" '(.metadata.annotations // {}) | has($key)' "${body}" >/dev/null; then
-                bashio::log.info "Edge protection policy found (Datum WAF, set up by this add-on, kept as set). Manage it in the Datum portal: ${PORTAL_LINK}"
-            elif is_addon_015_waf "${body}"; then
-                upgrade_015_waf "${token}" "${body}"
-            else
-                bashio::log.info "Edge protection policy found, not set up by this add-on, so kept as set. Unless it targets rule '${PROTECTED_RULE}', an enforcing WAF there also holds back live views. Manage it in the Datum portal: ${PORTAL_LINK}"
-            fi
-            rm -f "${body}"
-            return ;;
-        404) ;;
-        *)
-            bashio::log.warning "Edge protection NOT set up: could not check for policy ${WAF_NAME} (HTTP ${status:-no response}). Response: $(excerpt "${body}")"
-            rm -f "${body}"
-            return ;;
-    esac
-
-    policy=$(jq -n --arg name "${WAF_NAME}" --arg display "${LABEL}" \
-        --arg key "${MANAGED_BY_KEY}" --arg value "${MANAGED_BY_VALUE}" --argjson spec "${WAF_SPEC}" '{
-        apiVersion: "networking.datumapis.com/v1alpha",
-        kind: "TrafficProtectionPolicy",
-        metadata: {
-            name: $name,
-            namespace: "default",
-            annotations: {"networking.datumapis.com/display-name": $display, ($key): $value}
-        },
-        spec: $spec
-    }')
-    status=$(curl -s -m 30 -o "${body}" -w '%{http_code}' -X POST "${WAF_URL}" \
-        -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
-        -d "${policy}" || true)
-    case "${status}" in
-        200|201)
-            bashio::log.info "Edge protection policy created: Datum WAF on (Enforce) for everything except Home Assistant's streaming endpoints. Manage it in the Datum portal: ${PORTAL_LINK}" ;;
-        401|403)
-            bashio::log.warning "Edge protection NOT set up: the service account may not create WAF policies in project ${PROJECT} (HTTP ${status}). Give it that permission, then restart the add-on." ;;
-        *)
-            bashio::log.warning "Edge protection NOT set up: creating policy ${WAF_NAME} failed (HTTP ${status:-no response}). Response: $(excerpt "${body}")" ;;
-    esac
-    rm -f "${body}"
-}
-
-# Let a request through the edge run for up to an hour. Datum's edge (Envoy)
-# otherwise ends every response 15s after the request, its default route
-# timeout. In Home Assistant that cuts streams, such as the add-on log view
-# (/api/hassio/addons/<slug>/logs/follow), after ~15-20s, and any download
-# that takes longer. An hour is the most the platform allows.
-#
-# Same rule as the WAF: created only when missing, never overwritten, so a
-# value tuned since is kept across restarts.
-#
-# A failure is a warning, not an exit: the tunnel works without it, only
-# long requests are cut short.
-TIMEOUT_NAME="${TUNNEL_ID}-timeout"
-TIMEOUT_URL="${CONTROL_PLANE}/apis/gateway.envoyproxy.io/v1alpha1/namespaces/default/backendtrafficpolicies"
-
-ensure_request_timeout() {
-    local token=$1 status body policy
-    body=$(mktemp)
-    status=$(curl -s -m 30 -o "${body}" -w '%{http_code}' "${TIMEOUT_URL}/${TIMEOUT_NAME}" \
-        -H "Authorization: Bearer ${token}" || true)
-    case "${status}" in
-        200)
-            bashio::log.info "Edge request timeout set (existing policy ${TIMEOUT_NAME} kept)"
-            rm -f "${body}"
-            return ;;
-        404) ;;
-        *)
-            bashio::log.warning "Edge request timeout NOT raised: could not check for policy ${TIMEOUT_NAME} (HTTP ${status:-no response}). Response: $(excerpt "${body}")"
-            rm -f "${body}"
-            return ;;
-    esac
-
-    policy=$(jq -n --arg name "${TIMEOUT_NAME}" --arg route "${TUNNEL_ID}" '{
-        apiVersion: "gateway.envoyproxy.io/v1alpha1",
-        kind: "BackendTrafficPolicy",
-        metadata: {name: $name, namespace: "default"},
-        spec: {
-            targetRefs: [{group: "gateway.networking.k8s.io", kind: "HTTPRoute", name: $route}],
-            timeout: {http: {requestTimeout: "1h"}}
-        }
-    }')
-    status=$(curl -s -m 30 -o "${body}" -w '%{http_code}' -X POST "${TIMEOUT_URL}" \
-        -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
-        -d "${policy}" || true)
-    case "${status}" in
-        200|201)
-            bashio::log.info "Edge request timeout raised to 1h (policy ${TIMEOUT_NAME})" ;;
-        401|403)
-            bashio::log.warning "Edge request timeout NOT raised: the service account may not create traffic policies in project ${PROJECT} (HTTP ${status}). Give it that permission, then restart the add-on." ;;
-        *)
-            bashio::log.warning "Edge request timeout NOT raised: creating policy ${TIMEOUT_NAME} failed (HTTP ${status:-no response}). Response: $(excerpt "${body}")" ;;
-    esac
-    rm -f "${body}"
-}
-
-# One token covers every call below; it outlives them by a wide margin.
-if DATUM_TOKEN=$("${CREDENTIALS_HELPER}" auth get-token --session "${DATUM_SESSION}"); then
-    ensure_waf "${DATUM_TOKEN}"
-    ensure_request_timeout "${DATUM_TOKEN}"
-else
-    bashio::log.warning "Edge protection and request timeout NOT set up: could not get a token from the service account."
-fi
-unset DATUM_TOKEN
 
 # Surface the daemon's exit status as the container's.
 wait "${DAEMON_PID}"
