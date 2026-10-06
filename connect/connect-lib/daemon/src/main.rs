@@ -310,7 +310,64 @@ enum Command {
         /// before `pair` exits, so the daemon can bind it straight after.
         #[clap(long)]
         hold_port: Option<u16>,
+        /// Where to read a project chosen while pairing waits, when the
+        /// approving login can see several and none is set (or not the one
+        /// set): `supervisor` (the add-on's saved options, read from the
+        /// Home Assistant Supervisor), `file:<path>` (a JSON file with a
+        /// `project` field, re-read every poll), or `none` (stop and list
+        /// them, as before). `auto` is `supervisor` inside an add-on, where
+        /// SUPERVISOR_TOKEN is set, and `none` elsewhere.
+        #[clap(long, env = "DATUM_PAIRING_OPTIONS_SOURCE", default_value = "auto")]
+        options_source: OptionsSource,
     },
+}
+
+/// `pair --options-source`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OptionsSource {
+    Auto,
+    Supervisor,
+    File(std::path::PathBuf),
+    None,
+}
+
+impl std::str::FromStr for OptionsSource {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "supervisor" => Ok(Self::Supervisor),
+            "none" => Ok(Self::None),
+            _ => match s.strip_prefix("file:") {
+                Some(path) if !path.is_empty() => Ok(Self::File(path.into())),
+                _ => Err(format!("expected auto, supervisor, none or file:<path>, not {s:?}")),
+            },
+        }
+    }
+}
+
+impl OptionsSource {
+    /// What pairing waits on, if anything. Asking for the Supervisor
+    /// without one only costs the wait, so it is a warning, not an error.
+    fn resolve(
+        &self,
+        supervisor: Option<&connect_lib::datum_cloud::ha_supervisor::Supervisor>,
+    ) -> Option<Arc<dyn connect_lib::datum_cloud::pairing::ProjectSource>> {
+        use connect_lib::datum_cloud::ha_supervisor::OptionsFile;
+        match self {
+            Self::Auto => supervisor.map(|s| Arc::new(s.clone()) as _),
+            Self::Supervisor => {
+                if supervisor.is_none() {
+                    tracing::warn!(
+                        "pair: --options-source supervisor, but SUPERVISOR_TOKEN is not set; with several projects, pairing stops instead of waiting"
+                    );
+                }
+                supervisor.map(|s| Arc::new(s.clone()) as _)
+            }
+            Self::File(path) => Some(Arc::new(OptionsFile(path.clone()))),
+            Self::None => None,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -513,7 +570,7 @@ mod args_tests {
         ])
         .unwrap();
         match args.command {
-            Some(Command::Pair { project, key_out, hold_port: None }) => {
+            Some(Command::Pair { project, key_out, hold_port: None, options_source: OptionsSource::Auto }) => {
                 assert_eq!(project.as_deref(), Some("p-1"));
                 assert_eq!(key_out, std::path::PathBuf::from("/data/k.json"));
             }
@@ -547,6 +604,58 @@ mod args_tests {
         let busy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = busy.local_addr().unwrap().port();
         assert!(PortHolder::bind(port).await.is_err());
+    }
+
+    #[test]
+    fn options_source_parses() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["datum-connect-daemon", "pair", "--key-out", "k.json"];
+            argv.extend_from_slice(extra);
+            match Args::try_parse_from(argv).map(|a| a.command) {
+                Ok(Some(Command::Pair { options_source, .. })) => Ok(options_source),
+                Ok(other) => panic!("{other:?}"),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+        assert_eq!(parse(&["--options-source", "supervisor"]).unwrap(), OptionsSource::Supervisor);
+        assert_eq!(parse(&["--options-source", "none"]).unwrap(), OptionsSource::None);
+        assert_eq!(
+            parse(&["--options-source", "file:/tmp/o.json"]).unwrap(),
+            OptionsSource::File("/tmp/o.json".into())
+        );
+        assert!(parse(&["--options-source", "file:"]).is_err());
+        assert!(parse(&["--options-source", "bogus"]).is_err());
+    }
+
+    /// Outside an add-on there is no SUPERVISOR_TOKEN, so `auto` neither
+    /// waits nor notifies: the log is all there is, as before.
+    #[test]
+    fn options_source_without_a_supervisor() {
+        use connect_lib::datum_cloud::ha_supervisor::Supervisor;
+        assert!(OptionsSource::Auto.resolve(None).is_none());
+        assert!(OptionsSource::Supervisor.resolve(None).is_none());
+        assert!(OptionsSource::None.resolve(None).is_none());
+        assert!(OptionsSource::File("o.json".into()).resolve(None).is_some());
+        let sup = Supervisor::new("http://127.0.0.1:9", "t".to_string().into()).unwrap();
+        assert!(OptionsSource::Auto.resolve(Some(&sup)).is_some());
+        assert!(OptionsSource::None.resolve(Some(&sup)).is_none());
+    }
+
+    #[test]
+    fn choose_project_log_lists_every_project() {
+        use connect_lib::datum_cloud::pairing::ProjectChoice;
+        let projects = vec![
+            ProjectChoice { id: "p-1".into(), display_name: "Home".into(), organization: "o-1".into() },
+            ProjectChoice { id: "p-2".into(), display_name: "Garage".into(), organization: "o-2".into() },
+        ];
+        let first = choose_project_line(&projects, None, std::time::Duration::from_secs(1800));
+        assert_eq!(
+            first,
+            "Your Datum login can see 2 projects. Set 'project' on the add-on's Configuration tab to one of these ids and click Save. No restart needed; pairing continues automatically (waiting up to 30 minutes):\n  p-1 (Home, organization o-1)\n  p-2 (Garage, organization o-2)"
+        );
+        let again = choose_project_line(&projects, Some("nope"), std::time::Duration::from_secs(600));
+        assert!(again.starts_with("'nope' isn't one of your projects. Your Datum login can see 2 projects."), "{again}");
+        assert!(again.contains("(waiting up to 10 minutes)"), "{again}");
     }
 
     #[test]
@@ -1230,8 +1339,10 @@ async fn pair(
     project: Option<String>,
     key_out: std::path::PathBuf,
     hold_port: Option<u16>,
+    options_source: OptionsSource,
 ) -> n0_error::Result<()> {
-    use connect_lib::datum_cloud::pairing::{self, PairingConfig, PairingEvent};
+    use connect_lib::datum_cloud::ha_supervisor::{PairingNotifier, Supervisor};
+    use connect_lib::datum_cloud::pairing::{self, PairingConfig, PairingEvent, ProjectWait};
     use std::io::Write;
 
     tracing_subscriber::fmt()
@@ -1242,8 +1353,17 @@ async fn pair(
         )
         .init();
 
-    let cfg = PairingConfig::from_env(project, key_out);
+    let mut cfg = PairingConfig::from_env(project, key_out);
+    // Inside a Home Assistant add-on: the link as a clickable notification,
+    // and a project chosen on the Configuration tab without a restart. The
+    // log lines below are printed either way, as the fallback.
+    let supervisor = Supervisor::from_env();
+    cfg.project_wait = options_source.resolve(supervisor.as_ref()).map(ProjectWait::new);
+    let notifier = supervisor.map(PairingNotifier::spawn);
     let mut say = |event: PairingEvent| {
+        if let Some(n) = &notifier {
+            n.event(&event);
+        }
         let line = match event {
             PairingEvent::Code { url, user_code, expires_in } => format!(
                 "To connect this Home Assistant to Datum, open {url} and enter code {user_code} (expires in {})",
@@ -1251,6 +1371,9 @@ async fn pair(
             ),
             PairingEvent::CodeExpired => "That code expired before it was approved. Here is a new one.".into(),
             PairingEvent::Approved { email } => format!("Approved as {email}"),
+            PairingEvent::ChooseProject { projects, rejected, wait } => {
+                choose_project_line(&projects, rejected.as_deref(), wait)
+            }
             PairingEvent::ProjectSelected { project, organization } => {
                 format!("Using project {project} (organization {organization})")
             }
@@ -1290,6 +1413,14 @@ async fn pair(
         r = pairing::pair(&cfg, &mut say) => Some(r),
         _ = shutdown_signal() => None,
     };
+    if let Some(n) = notifier {
+        match &outcome {
+            Some(r) => n.outcome(r),
+            // Stopped with the add-on: its code is no use any more.
+            None => n.dismiss(),
+        }
+        n.finish().await;
+    }
     if let Some(holder) = holder {
         holder.release().await;
     }
@@ -1360,12 +1491,28 @@ async fn shutdown_signal() {
 
 /// "5 minutes", "1 minute", "45 seconds".
 fn minutes(d: std::time::Duration) -> String {
-    let secs = d.as_secs();
-    if secs < 60 {
-        return format!("{secs} seconds");
+    connect_lib::datum_cloud::ha_supervisor::duration_words(d)
+}
+
+/// The log's version of the "choose a project" notification.
+fn choose_project_line(
+    projects: &[connect_lib::datum_cloud::pairing::ProjectChoice],
+    rejected: Option<&str>,
+    wait: std::time::Duration,
+) -> String {
+    let mut line = String::new();
+    if let Some(r) = rejected {
+        line.push_str(&format!("'{r}' isn't one of your projects. "));
     }
-    let m = secs.div_ceil(60);
-    if m == 1 { "1 minute".into() } else { format!("{m} minutes") }
+    line.push_str(&format!(
+        "Your Datum login can see {} projects. Set 'project' on the add-on's Configuration tab to one of these ids and click Save. No restart needed; pairing continues automatically (waiting up to {}):",
+        projects.len(),
+        minutes(wait)
+    ));
+    for p in projects {
+        line.push_str(&format!("\n  {} ({}, organization {})", p.id, p.display_name, p.organization));
+    }
+    line
 }
 
 #[tokio::main]
@@ -1383,8 +1530,8 @@ async fn run() -> n0_error::Result<()> {
 
     let args = Args::parse();
 
-    if let Some(Command::Pair { project, key_out, hold_port }) = args.command {
-        return pair(project, key_out, hold_port).await;
+    if let Some(Command::Pair { project, key_out, hold_port, options_source }) = args.command {
+        return pair(project, key_out, hold_port, options_source).await;
     }
 
     let session = std::env::var("DATUM_SESSION").ok();

@@ -28,19 +28,26 @@ Home Assistant OS does not allow that — and nothing is built on the device.
    Don't use an `http:` block in `configuration.yaml` for this. Current Home
    Assistant ignores it once the setting has moved into its own storage, and
    warns that it stops working altogether in 2027.2.
-4. **Optionally, choose the project.** If your Datum login can see more than
-   one project, set `project` on the add-on's **Configuration** tab to the
-   project's id (not its display name) and click **Save**. With only one
-   project, leave it empty.
-5. **Start, and approve.** Click **Start**, then open the **Log** tab. It
-   says:
+4. **Start, and approve.** Start the add-on. A notification (bell icon)
+   appears with a link: click it, approve, and confirm the code. Sign in to
+   Datum as usual on the page it opens, check that the code there matches
+   the one in the notification, and approve. If the code expires first, the
+   notification shows a new one; the add-on keeps offering new codes for an
+   hour. Once pairing has worked, the notification goes away by itself.
+
+   The same link and code are in the add-on's **Log** tab, in case the
+   notification doesn't appear:
 
    `To connect this Home Assistant to Datum, open https://auth.datum.net/ui/v2/login/device?user_code=ABCD-EFGH and enter code ABCD-EFGH (expires in 5 minutes)`
 
-   Open the link on any device, sign in to Datum as usual, check that the
-   code matches, and approve. If the code expires first, the log shows a new
-   one; the add-on keeps offering new codes for an hour. Within a few
-   seconds of approving, the log says `Approved as <you>`,
+5. **Choose the project, if asked.** If you have several projects, the
+   notification lists them: set `project` on the Configuration tab and click
+   Save; pairing continues by itself. Use the project's id, as listed, not
+   its display name. There is no need to restart or approve again. Pairing
+   waits up to 30 minutes for this. With only one project, it is used
+   without asking. You can also set `project` before starting.
+
+   Within a few seconds, the log says `Approved as <you>`,
    `Created service account ...`, `Granted access` and `Saved key`, then
    creates the tunnel and logs its address:
    `Home Assistant is reachable at https://<name>.datumproxy.net`.
@@ -48,8 +55,10 @@ Home Assistant OS does not allow that — and nothing is built on the device.
 
 The approval screen says **datumctl**. That is expected: until the add-on has
 its own Datum login app, it borrows the public one that the `datumctl`
-command line tool uses. Approving lets the add-on act as you for under a
-minute, to make what is listed below; it never stores your login.
+command line tool uses. Approving lets the add-on act as you only while it
+pairs, usually under a minute, or until you choose a project if it asks you
+to (30 minutes at most), to make what is listed below. It keeps your login in
+memory only, and never stores it.
 
 Updates appear as an **Update** button on the add-on, like any other add-on.
 
@@ -91,7 +100,7 @@ Delete the old one in the portal.
 
 | Option | What it is |
 |---|---|
-| `project` | The Datum project the tunnel is created in, by id. When pairing, leave it empty to use the only project your login can see. With your own key, leave it empty to use the project the key belongs to. |
+| `project` | The Datum project the tunnel is created in, by id. When pairing, leave it empty to use the only project your login can see; with several, pairing lists them and waits for you to set one and click Save. With your own key, leave it empty to use the project the key belongs to. |
 | `target` | What the tunnel points at. Leave empty for this Home Assistant: the add-on asks Home Assistant which port it uses. Must be plain HTTP. Changing it repoints the existing tunnel on the next start; its address stays the same. |
 | `tunnel_label` | A name for the tunnel, to recognise it in the dashboard. The tunnel is found again by this name on every start, including after the add-on is reinstalled, so changing it creates a new tunnel with a new address. |
 | `repair` | Forget the paired key and pair again on the next start. See "What pairing creates". Leave off. |
@@ -249,8 +258,18 @@ everything — in particular, a healthy-looking daemon can still have a tunnel
 that serves nothing, because the local side and the cloud side fail
 independently.
 
-**Pairing stops with "can see N projects".** Your login can see several
-projects. Set `project` to the id of one of those the log lists, then restart.
+**No notification appears.** The link and code are in the add-on's log as
+well; use those. A log line starting `Could not show the pairing link as a
+Home Assistant notification` says why the notification failed. Pairing
+works the same either way.
+
+**Pairing says "isn't one of your projects".** The `project` you saved is not
+an id your login can see. Set it to one of the ids listed, and click Save.
+Pairing is still waiting, so there is no need to restart.
+
+**Pairing says "Choosing a project took too long".** Nobody set `project` in
+time. Set it on the Configuration tab, click Save, and restart the add-on.
+You approve again, and it pairs straight away with that project.
 
 **Pairing stops with "can create the service account but can't grant it
 access".** See "What pairing creates".
