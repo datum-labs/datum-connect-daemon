@@ -64,6 +64,9 @@ struct AppState {
     project_id: String,
     /// Shared throwaway identity for operations that don't need a live
     /// connection: list, get, progress, create (profile only), delete.
+    /// Its key is new on every start, so anything that finds or creates a
+    /// Connector for it (`update_active`, enabling) would make a new one
+    /// per restart. Repoint an endpoint through `retarget_active` instead.
     control: TunnelService,
     running: Mutex<HashMap<String, RunningTunnel>>,
     /// Tunnel ids currently mid-start or mid-stop, reserved atomically
@@ -767,6 +770,14 @@ async fn create_tunnel(
 
     let (handle, inspector_endpoint) = spawn_inspector(&target).await.map_err(err_response)?;
 
+    // This makes a Connector for `control`'s throwaway key, which never goes
+    // Ready. The tunnel's first start replaces it with one for the tunnel's
+    // own key (see `resolve_listen_key`) and cleans it up. Creating under
+    // the tunnel's key instead isn't cheap: the key is stored by tunnel id,
+    // which the API server only assigns on create, and a connector is found
+    // again by the key in its connectionDetails, which only a node that has
+    // reached its relay fills in. Get either wrong and the first start
+    // makes a second connector with nothing to clean it up.
     match state.control.create_active(&req.label, &inspector_endpoint).await {
         Ok(tunnel) => {
             install_inspector(&state.connect_dir, &state.inspectors, &tunnel.id, &target.normalized, handle).await;
@@ -971,9 +982,8 @@ async fn start_tunnel_internal(
 
     // Already on, but its target is changing: on the add-on, the startup
     // reconciliation pass resumes the tunnel at its old target before the
-    // add-on gets to ask for the new one. Repoint through the running
-    // service, so the HTTPProxy keeps this tunnel's own connector rather
-    // than `control`'s.
+    // add-on gets to ask for the new one. Only the endpoint changes, so
+    // the HTTPProxy keeps the connector it already references.
     let running_service = state.running.lock().await.get(id).map(|r| r.service.clone());
     if let Some(service) = running_service {
         // A concurrent start may have finished between the check above and
@@ -982,10 +992,7 @@ async fn start_tunnel_internal(
             return Ok(tunnel);
         };
         let (handle, endpoint) = spawn_inspector(t).await.map_err(err_response)?;
-        let updated = service
-            .update_active(id, &tunnel.label, &endpoint)
-            .await
-            .map_err(err_response)?;
+        let updated = service.retarget_active(id, &endpoint).await.map_err(err_response)?;
         install_inspector(&state.connect_dir, &state.inspectors, id, &t.normalized, handle).await;
         tracing::info!(tunnel = %id, target = %t.normalized, "repointed running tunnel at a new inspector");
         auth::append_audit(&state.connect_dir, &state.audit_lock, "retarget", id, actor_label).await;
@@ -1031,18 +1038,19 @@ async fn start_tunnel_internal(
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 
-    // A new inspector means a new endpoint, so the HTTPProxy is rewritten
-    // before enabling even when the connector itself doesn't change.
-    if should_rewire || inspector.is_some() {
+    // A new key means a new connector, which the HTTPProxy must move to.
+    // A new inspector alone means only a new endpoint, so the connector
+    // stays as it is; enabling below confirms it.
+    if should_rewire {
         service
             .update_active(id, &tunnel.label, &endpoint)
             .await
             .map_err(err_response)?;
-        if should_rewire {
-            if let Err(e) = service.cleanup_orphaned_connectors().await {
-                tracing::warn!("cleanup_orphaned_connectors after rewire failed: {e:#}");
-            }
+        if let Err(e) = service.cleanup_orphaned_connectors().await {
+            tracing::warn!("cleanup_orphaned_connectors after rewire failed: {e:#}");
         }
+    } else if inspector.is_some() {
+        service.retarget_active(id, &endpoint).await.map_err(err_response)?;
     }
     if let Some((t, (handle, _))) = inspector {
         install_inspector(&state.connect_dir, &state.inspectors, id, &t.normalized, handle).await;
@@ -1325,9 +1333,12 @@ async fn run() -> n0_error::Result<()> {
                 let tunnel_id = t.id.clone();
                 match spawn_inspector(&real_target).await {
                     Ok((handle, inspector_endpoint)) => {
-                        if let Err(e) =
-                            state.control.update_active(&t.id, &t.label, &inspector_endpoint).await
-                        {
+                        // Endpoint only: `update_active` here made a new
+                        // Connector for `control`'s fresh key on every
+                        // restart, pointed the tunnel at it until the
+                        // auto-resume below pointed it back, and left it
+                        // behind, never Ready.
+                        if let Err(e) = state.control.retarget_active(&t.id, &inspector_endpoint).await {
                             tracing::warn!(tunnel = %t.id, "failed to repoint tunnel at reconciled inspector: {e:#}");
                             continue;
                         }
