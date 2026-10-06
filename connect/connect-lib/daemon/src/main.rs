@@ -76,7 +76,8 @@ struct AppState {
     /// cleanup.
     busy: StdMutex<HashSet<String>>,
     /// One traffic inspector per tunnel — see `inspector.rs`. Keyed by
-    /// tunnel id, started at profile-create time (not tied to start/stop).
+    /// tunnel id, started at profile-create time (not tied to start/stop),
+    /// or by a start that names a target the tunnel has no inspector for.
     inspectors: Mutex<HashMap<String, InspectorHandle>>,
     /// Base directory for persisting each tunnel's real (non-inspector)
     /// target across restarts — see `save_inspector_target` and the
@@ -141,6 +142,61 @@ async fn load_inspector_target(base: &std::path::Path, id: &str) -> Option<Strin
 
 async fn remove_inspector_target(base: &std::path::Path, id: &str) {
     let _ = tokio::fs::remove_file(inspector_target_path(base, id)).await;
+}
+
+/// A tunnel's real local target, as a caller gave it, after the one
+/// normalisation `create_tunnel` has always applied: a bare `host:port`
+/// means plain HTTP. `normalized` is what gets persisted, `uri` is what the
+/// inspector forwards to.
+struct RealTarget {
+    normalized: String,
+    uri: axum::http::Uri,
+}
+
+fn parse_real_target(raw: &str) -> Result<RealTarget, axum::http::uri::InvalidUri> {
+    let normalized = if raw.starts_with("http://") || raw.starts_with("https://") {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
+    };
+    let uri = normalized.parse()?;
+    Ok(RealTarget { normalized, uri })
+}
+
+/// Whether a tunnel must get a fresh inspector before it can serve `wanted`:
+/// it has none in this process (its local state was lost, e.g. the Home
+/// Assistant add-on reinstalled and adopted a tunnel a previous install
+/// created), or the one it has forwards somewhere else. A trailing slash is
+/// not a different target.
+fn needs_repoint(has_inspector: bool, persisted: Option<&str>, wanted: &str) -> bool {
+    !has_inspector || persisted.map(|p| p.trim_end_matches('/')) != Some(wanted.trim_end_matches('/'))
+}
+
+/// Starts an inspector forwarding to `target`, returning it with the
+/// endpoint the tunnel's HTTPProxy should point at instead of the target.
+async fn spawn_inspector(target: &RealTarget) -> n0_error::Result<(InspectorHandle, String)> {
+    let handle = inspector::start(target.uri.clone()).await?;
+    let endpoint = format!("http://{}", handle.local_addr);
+    Ok((handle, endpoint))
+}
+
+/// Makes `handle` the tunnel's inspector: persists the REAL target (not the
+/// inspector's ephemeral local address) so a daemon restart can find it
+/// again — see `connect_dir` and the reconciliation pass in `run()` — and
+/// replaces any previous inspector, whose task aborts as it drops. Only
+/// call this once the HTTPProxy points at `handle`, or a failed repoint
+/// leaves the persisted target describing an inspector nothing uses.
+async fn install_inspector(
+    connect_dir: &std::path::Path,
+    inspectors: &Mutex<HashMap<String, InspectorHandle>>,
+    id: &str,
+    target: &str,
+    handle: InspectorHandle,
+) {
+    if let Err(e) = save_inspector_target(connect_dir, id, target).await {
+        tracing::warn!(tunnel = %id, "failed to persist real target, won't survive a daemon restart: {e:#}");
+    }
+    inspectors.lock().await.insert(id.to_string(), handle);
 }
 
 /// Free-text note a human attaches to a tunnel via the CLI (`tunnel api note
@@ -476,6 +532,84 @@ mod progress_status_tests {
     }
 }
 
+#[cfg(test)]
+mod start_request_tests {
+    use super::*;
+
+    /// Every body an existing client might send must still mean a plain
+    /// start: none at all, whitespace, JSON null, and an empty object.
+    #[test]
+    fn absent_or_empty_body_is_a_plain_start() {
+        for body in ["", "  \n", "null", "{}"] {
+            assert_eq!(parse_start_request(body.as_bytes()).unwrap(), StartTunnelRequest::default(), "{body:?}");
+        }
+    }
+
+    #[test]
+    fn target_is_read_from_body() {
+        let req = parse_start_request(br#"{"target": "http://127.0.0.1:80"}"#).unwrap();
+        assert_eq!(req.target.as_deref(), Some("http://127.0.0.1:80"));
+    }
+
+    /// Ignoring a broken body would start the tunnel at its old target,
+    /// the exact failure the field exists to prevent.
+    #[test]
+    fn malformed_body_is_an_error() {
+        assert!(parse_start_request(b"{\"target\":").is_err());
+        assert!(parse_start_request(br#"{"target": 80}"#).is_err());
+    }
+
+    #[test]
+    fn real_target_defaults_to_http_like_create() {
+        let t = parse_real_target("127.0.0.1:8123").unwrap();
+        assert_eq!(t.normalized, "http://127.0.0.1:8123");
+        assert_eq!(t.uri.authority().map(|a| a.as_str()), Some("127.0.0.1:8123"));
+        assert_eq!(parse_real_target("https://example.test").unwrap().normalized, "https://example.test");
+        assert!(parse_real_target("http://bad host").is_err());
+    }
+
+    #[test]
+    fn repoint_only_when_inspector_missing_or_target_differs() {
+        let want = "http://127.0.0.1:80";
+        // Adopted after a reinstall: no inspector, nothing persisted.
+        assert!(needs_repoint(false, None, want));
+        // Persisted target survived but its inspector did not start.
+        assert!(needs_repoint(false, Some(want), want));
+        // Target changed in the add-on's configuration.
+        assert!(needs_repoint(true, Some("http://127.0.0.1:8123"), want));
+        assert!(needs_repoint(true, None, want));
+        // Unchanged, so a running tunnel keeps today's early return.
+        assert!(!needs_repoint(true, Some(want), want));
+        assert!(!needs_repoint(true, Some("http://127.0.0.1:80/"), want));
+    }
+
+    /// The installed inspector must be the one handed in, and its target
+    /// must be on disk where the restart reconciliation looks for it.
+    #[tokio::test]
+    async fn install_inspector_persists_target_and_replaces_previous() {
+        let dir = std::env::temp_dir().join(format!("dcd-install-inspector-{}", std::process::id()));
+        let inspectors = Mutex::new(HashMap::new());
+
+        let first = parse_real_target("http://127.0.0.1:8123").unwrap();
+        let (handle, _) = spawn_inspector(&first).await.unwrap();
+        install_inspector(&dir, &inspectors, "tunnel-a", &first.normalized, handle).await;
+
+        let second = parse_real_target("127.0.0.1:80").unwrap();
+        let (handle, endpoint) = spawn_inspector(&second).await.unwrap();
+        let addr = handle.local_addr;
+        install_inspector(&dir, &inspectors, "tunnel-a", &second.normalized, handle).await;
+
+        assert_eq!(endpoint, format!("http://{addr}"));
+        let map = inspectors.lock().await;
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["tunnel-a"].local_addr, addr);
+        assert_eq!(map["tunnel-a"].real_target().to_string(), "http://127.0.0.1:80/");
+        assert_eq!(load_inspector_target(&dir, "tunnel-a").await.as_deref(), Some("http://127.0.0.1:80"));
+        drop(map);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+}
+
 /// Real network-level stats for a running tunnel, straight from iroh's own
 /// per-target proxy metrics (`iroh_proxy_utils::upstream::UpstreamMetrics`,
 /// the same source the desktop app's bandwidth view already reads via
@@ -628,27 +762,14 @@ async fn create_tunnel(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateTunnelRequest>,
 ) -> ApiResult<connect_lib::TunnelSummary> {
-    let normalized = if req.endpoint.starts_with("http://") || req.endpoint.starts_with("https://") {
-        req.endpoint.clone()
-    } else {
-        format!("http://{}", req.endpoint)
-    };
-    let target_uri: axum::http::Uri = normalized
-        .parse()
+    let target = parse_real_target(&req.endpoint)
         .map_err(|e| err_response(format!("invalid endpoint '{}': {e}", req.endpoint)))?;
 
-    let handle = inspector::start(target_uri).await.map_err(err_response)?;
-    let inspector_endpoint = format!("http://{}", handle.local_addr);
+    let (handle, inspector_endpoint) = spawn_inspector(&target).await.map_err(err_response)?;
 
     match state.control.create_active(&req.label, &inspector_endpoint).await {
         Ok(tunnel) => {
-            // Persist the REAL target (not the inspector's ephemeral local
-            // address) so a daemon restart can find it again — see
-            // `connect_dir` and the reconciliation pass in `run()`.
-            if let Err(e) = save_inspector_target(&state.connect_dir, &tunnel.id, &normalized).await {
-                tracing::warn!(tunnel = %tunnel.id, "failed to persist real target, won't survive a daemon restart: {e:#}");
-            }
-            state.inspectors.lock().await.insert(tunnel.id.clone(), handle);
+            install_inspector(&state.connect_dir, &state.inspectors, &tunnel.id, &target.normalized, handle).await;
             auth::append_audit(&state.connect_dir, &state.audit_lock, "create", &tunnel.id, "setup").await;
             Ok(Json(tunnel))
         }
@@ -737,12 +858,72 @@ fn claim_busy(state: &Arc<AppState>, id: &str) -> Result<BusyGuard, (StatusCode,
     Ok(BusyGuard { state: state.clone(), id: id.to_string() })
 }
 
+/// Optional body of `POST /v1/tunnels/:id/start`. No body, an empty one,
+/// `null` and `{}` all mean a plain start, exactly as before the body
+/// existed, so existing clients (datumctl, the dashboard) are unaffected.
+#[derive(Deserialize, Default, Debug, PartialEq)]
+struct StartTunnelRequest {
+    /// The real local target this tunnel should forward to. Lets a client
+    /// adopt a tunnel whose local state is gone — the Home Assistant add-on
+    /// finds its tunnel again by label after a reinstall wiped `/data`, and
+    /// with it the persisted target, so nothing would otherwise create the
+    /// inspector the tunnel's HTTPProxy needs. Also how such a client
+    /// changes an existing tunnel's target.
+    #[serde(default)]
+    target: Option<String>,
+}
+
+/// Parsed by hand rather than with axum's `Option<Json<_>>`, which turns a
+/// malformed body into `None` and would silently start the tunnel at its
+/// old target.
+fn parse_start_request(body: &[u8]) -> Result<StartTunnelRequest, String> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(StartTunnelRequest::default());
+    }
+    serde_json::from_slice::<Option<StartTunnelRequest>>(body)
+        .map(Option::unwrap_or_default)
+        .map_err(|e| format!("invalid request body: {e}"))
+}
+
 async fn start_tunnel(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Extension(actor): Extension<Actor>,
+    body: axum::body::Bytes,
 ) -> ApiResult<connect_lib::TunnelSummary> {
-    start_tunnel_internal(&state, &id, &actor.audit_label()).await.map(Json)
+    let result = start_tunnel_with_body(&state, &id, &actor, &body).await;
+    // Logged here as well as returned: a client that drops the response
+    // body (the add-on's `curl -f` did) otherwise leaves no trace of why.
+    if let Err((status, body)) = &result {
+        tracing::warn!(tunnel = %id, %status, error = %body.0, "start failed");
+    }
+    result.map(Json)
+}
+
+async fn start_tunnel_with_body(
+    state: &Arc<AppState>,
+    id: &str,
+    actor: &Actor,
+    body: &[u8],
+) -> Result<connect_lib::TunnelSummary, (StatusCode, Json<serde_json::Value>)> {
+    let bad_request = |msg: String| (StatusCode::BAD_REQUEST, Json(json!({ "error": msg })));
+    let req = parse_start_request(body).map_err(bad_request)?;
+    let target = match req.target.as_deref() {
+        None => None,
+        // Choosing what a tunnel exposes is a create-level decision, which
+        // is setup-only: an operate token may turn its one tunnel on and
+        // off, not aim it at another local port.
+        Some(_) if !matches!(actor, Actor::Setup) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "setting a tunnel's target needs the setup token" })),
+            ));
+        }
+        Some(raw) => Some(
+            parse_real_target(raw).map_err(|e| bad_request(format!("invalid target '{raw}': {e}")))?,
+        ),
+    };
+    start_tunnel_internal(state, id, &actor.audit_label(), target.as_ref()).await
 }
 
 /// Shared by the `/start` handler and the startup reconciliation pass
@@ -751,22 +932,33 @@ async fn start_tunnel(
 /// restart/reboot" note in `run()`), so both go through the identical
 /// mint-key/heartbeat/enable sequence rather than two implementations
 /// drifting apart.
+///
+/// With a `target`, the tunnel is first given an inspector for it, unless
+/// it already has one forwarding there — see `needs_repoint`. That works
+/// whether or not the tunnel is running; the reconciliation pass passes
+/// `None`, since the inspector it has just started is already right.
 async fn start_tunnel_internal(
     state: &Arc<AppState>,
     id: &str,
     actor_label: &str,
+    target: Option<&RealTarget>,
 ) -> Result<connect_lib::TunnelSummary, (StatusCode, Json<serde_json::Value>)> {
-    {
-        let running = state.running.lock().await;
-        if running.contains_key(id) {
-            drop(running);
-            return state
-                .control
-                .get_active(id)
-                .await
-                .map_err(err_response)?
-                .ok_or_else(|| not_found(id));
+    let repoint = match target {
+        Some(t) => {
+            let has_inspector = state.inspectors.lock().await.contains_key(id);
+            let persisted = load_inspector_target(&state.connect_dir, id).await;
+            needs_repoint(has_inspector, persisted.as_deref(), &t.normalized).then_some(t)
         }
+        None => None,
+    };
+
+    if repoint.is_none() && state.running.lock().await.contains_key(id) {
+        return state
+            .control
+            .get_active(id)
+            .await
+            .map_err(err_response)?
+            .ok_or_else(|| not_found(id));
     }
 
     let _busy_guard = claim_busy(state, id)?;
@@ -775,6 +967,38 @@ async fn start_tunnel_internal(
         Ok(Some(t)) => t,
         Ok(None) => return Err(not_found(id)),
         Err(e) => return Err(err_response(e)),
+    };
+
+    // Already on, but its target is changing: on the add-on, the startup
+    // reconciliation pass resumes the tunnel at its old target before the
+    // add-on gets to ask for the new one. Repoint through the running
+    // service, so the HTTPProxy keeps this tunnel's own connector rather
+    // than `control`'s.
+    let running_service = state.running.lock().await.get(id).map(|r| r.service.clone());
+    if let Some(service) = running_service {
+        // A concurrent start may have finished between the check above and
+        // the claim; with nothing to repoint, that's the early return.
+        let Some(t) = repoint else {
+            return Ok(tunnel);
+        };
+        let (handle, endpoint) = spawn_inspector(t).await.map_err(err_response)?;
+        let updated = service
+            .update_active(id, &tunnel.label, &endpoint)
+            .await
+            .map_err(err_response)?;
+        install_inspector(&state.connect_dir, &state.inspectors, id, &t.normalized, handle).await;
+        tracing::info!(tunnel = %id, target = %t.normalized, "repointed running tunnel at a new inspector");
+        auth::append_audit(&state.connect_dir, &state.audit_lock, "retarget", id, actor_label).await;
+        return Ok(updated);
+    }
+
+    let inspector = match repoint {
+        Some(t) => Some((t, spawn_inspector(t).await.map_err(err_response)?)),
+        None => None,
+    };
+    let endpoint = match &inspector {
+        Some((_, (_, inspector_endpoint))) => inspector_endpoint.clone(),
+        None => tunnel.endpoint.clone(),
     };
 
     let (key, should_rewire) = resolve_listen_key(&state.repo, &state.project_id, id)
@@ -807,14 +1031,23 @@ async fn start_tunnel_internal(
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 
-    if should_rewire {
+    // A new inspector means a new endpoint, so the HTTPProxy is rewritten
+    // before enabling even when the connector itself doesn't change.
+    if should_rewire || inspector.is_some() {
         service
-            .update_active(id, &tunnel.label, &tunnel.endpoint)
+            .update_active(id, &tunnel.label, &endpoint)
             .await
             .map_err(err_response)?;
-        if let Err(e) = service.cleanup_orphaned_connectors().await {
-            tracing::warn!("cleanup_orphaned_connectors after rewire failed: {e:#}");
+        if should_rewire {
+            if let Err(e) = service.cleanup_orphaned_connectors().await {
+                tracing::warn!("cleanup_orphaned_connectors after rewire failed: {e:#}");
+            }
         }
+    }
+    if let Some((t, (handle, _))) = inspector {
+        install_inspector(&state.connect_dir, &state.inspectors, id, &t.normalized, handle).await;
+        tracing::info!(tunnel = %id, target = %t.normalized, "pointed tunnel at a new inspector");
+        auth::append_audit(&state.connect_dir, &state.audit_lock, "retarget", id, actor_label).await;
     }
 
     service.set_enabled_active(id, true).await.map_err(err_response)?;
@@ -1073,16 +1306,16 @@ async fn run() -> n0_error::Result<()> {
             // to whether it's currently turned on (mirrors create_tunnel,
             // which starts one unconditionally). A disabled tunnel skipped
             // here would keep a persisted endpoint pointing at a dead
-            // inspector forever, since start_tunnel doesn't create or
-            // repoint one itself — it relies entirely on one already
-            // existing in state.inspectors by the time it runs.
+            // inspector forever, since a plain start (no `target` in its
+            // body) doesn't create or repoint one itself — it relies on
+            // one already existing in state.inspectors by the time it runs.
             for t in tunnels {
                 let Some(target) = load_inspector_target(&state.connect_dir, &t.id).await else {
-                    tracing::warn!(tunnel = %t.id, "no persisted real target found, cannot reconcile inspector");
+                    tracing::warn!(tunnel = %t.id, "no persisted real target found, cannot reconcile inspector (a start that gives a target will create one)");
                     continue;
                 };
-                let target_uri: axum::http::Uri = match target.parse() {
-                    Ok(u) => u,
+                let real_target = match parse_real_target(&target) {
+                    Ok(r) => r,
                     Err(e) => {
                         tracing::warn!(tunnel = %t.id, %target, "persisted target is not a valid URI, skipping: {e}");
                         continue;
@@ -1090,9 +1323,8 @@ async fn run() -> n0_error::Result<()> {
                 };
                 let was_enabled = t.enabled;
                 let tunnel_id = t.id.clone();
-                match inspector::start(target_uri).await {
-                    Ok(handle) => {
-                        let inspector_endpoint = format!("http://{}", handle.local_addr);
+                match spawn_inspector(&real_target).await {
+                    Ok((handle, inspector_endpoint)) => {
                         if let Err(e) =
                             state.control.update_active(&t.id, &t.label, &inspector_endpoint).await
                         {
@@ -1100,7 +1332,8 @@ async fn run() -> n0_error::Result<()> {
                             continue;
                         }
                         tracing::info!(tunnel = %t.id, %target, "reconciled inspector after restart");
-                        state.inspectors.lock().await.insert(t.id, handle);
+                        install_inspector(&state.connect_dir, &state.inspectors, &t.id, &real_target.normalized, handle)
+                            .await;
 
                         // Recover a tunnel that was live (enabled) before
                         // the daemon last stopped — whether from a crash,
@@ -1111,7 +1344,7 @@ async fn run() -> n0_error::Result<()> {
                         // traffic until someone noticed and called
                         // /start by hand.
                         if was_enabled {
-                            match start_tunnel_internal(&state, &tunnel_id, "system").await {
+                            match start_tunnel_internal(&state, &tunnel_id, "system", None).await {
                                 Ok(_) => tracing::info!(tunnel = %tunnel_id, "auto-resumed previously-enabled tunnel after restart"),
                                 Err((status, body)) => tracing::warn!(
                                     tunnel = %tunnel_id,

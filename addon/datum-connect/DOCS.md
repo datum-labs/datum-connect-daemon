@@ -47,8 +47,8 @@ Updates appear as an **Update** button on the add-on, like any other add-on.
 | `service_account_key` | The service account key JSON, pasted whole. Hidden in the UI and stored only in the add-on's private storage. |
 | `project` | The Datum project the tunnel is created in. Leave empty to use the project the key belongs to. |
 | `service_account_key_file` | Where to read the key from if `service_account_key` is empty. Defaults to `/share/datum-service-account.json`, for installs that already placed a file there. |
-| `target` | What the tunnel points at. Leave empty for this Home Assistant: the add-on asks Home Assistant which port it uses. Must be plain HTTP. |
-| `tunnel_label` | A name for the tunnel, to recognise it in the dashboard. The tunnel is found again by this name on every start, so changing it creates a new tunnel with a new address. |
+| `target` | What the tunnel points at. Leave empty for this Home Assistant: the add-on asks Home Assistant which port it uses. Must be plain HTTP. Changing it repoints the existing tunnel on the next start; its address stays the same. |
+| `tunnel_label` | A name for the tunnel, to recognise it in the dashboard. The tunnel is found again by this name on every start, including after the add-on is reinstalled, so changing it creates a new tunnel with a new address. |
 | `log_level` | Daemon log verbosity. Leave at `info` unless diagnosing something. |
 
 ### Use a service account, not your own login
@@ -189,9 +189,9 @@ deleted or disabled in Datum is refused at the exchange, not silently kept.
 **The public address returns `502` with `upstream error: client error
 (Connect)`.** The tunnel works, but nothing answered at `target`. If you set
 `target` by hand, check the port. The address you use for Home Assistant on
-your network shows it: no port in the address means port 80. To switch to a
-different target, also change `tunnel_label`, because an existing tunnel keeps
-the target it was created with.
+your network shows it: no port in the address means port 80. After changing
+`target`, restart the add-on; the log then says which target the tunnel was
+pointed at.
 
 **The public address returns `400: Bad Request`.** Home Assistant doesn't
 trust the proxy yet. See step 4 of "Installing".

@@ -70,7 +70,13 @@ Real network-level stats for a *running* tunnel, straight from iroh's own per-ta
 ```
 
 ### `POST /v1/tunnels/:id/start` — setup or operate (scoped)
-Turns the tunnel on: mints/rewires its listen key if needed, starts the heartbeat, enables it server-side. Returns the current `TunnelSummary`. Idempotent if already running. `409` if another start/stop for this id is already in flight.
+Turns the tunnel on: mints/rewires its listen key if needed, starts the heartbeat, enables it server-side. Returns the current `TunnelSummary`. Idempotent if already running. `409` if another start/stop for this id is already in flight. Failures are also logged at warn with the tunnel id.
+
+Optional body (no body, `null` or `{}` is a plain start):
+```json
+{ "target": "http://127.0.0.1:8123" }
+```
+`target` is the tunnel's real local target, validated like `endpoint` on create. If the tunnel has no inspector in this daemon (its local state is gone, e.g. it was created by an earlier install) or its inspector forwards elsewhere, the daemon starts one for `target`, persists it and repoints the tunnel at it, before enabling or, if it is already running, in place. The same target as now is a no-op. Setup token only (`403` for an operate token); `400` for a malformed body or target. Logged as `retarget` in the audit log.
 
 ### `POST /v1/tunnels/:id/stop` — setup or operate (scoped)
 Turns the tunnel off. Returns the current `TunnelSummary`. Idempotent if already stopped. Also invoked internally by the auto-expiry sweep (see below) — that path logs as `auto_expired`, not `stop`, in the audit log.
