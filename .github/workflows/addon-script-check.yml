@@ -1,0 +1,76 @@
+# Checks the Home Assistant add-on's shell scripts against the tools that ship
+# in the add-on's base image, not the tools on a developer's laptop.
+#
+# Why: add-on 0.1.5 crashed on a fresh install because run.sh used `$label` as
+# a jq variable. `label` is a reserved word in jq 1.6, which is what Debian
+# bookworm (the add-on's base image) ships. Development used jq 1.8, where it
+# is legal, so bash -n, shellcheck and review all passed.
+name: Check add-on script
+
+on:
+  pull_request:
+    paths:
+      - 'addon/**'
+      - '.github/workflows/addon-script-check.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'addon/**'
+      - '.github/workflows/addon-script-check.yml'
+
+permissions:
+  contents: read
+
+env:
+  SHELLCHECK_VERSION: 'v0.11.0'
+  # The jq the add-on actually runs. Bookworm ships 1.6; if the base image in
+  # addon/datum-connect/build.yaml moves to a newer Debian, this fails loudly
+  # and must be bumped on purpose.
+  EXPECTED_JQ: 'jq-1.6'
+
+jobs:
+  script-check:
+    name: shellcheck + jq compat
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: bash -n
+        run: |
+          for f in addon/datum-connect/rootfs/usr/bin/*.sh addon/datum-connect/tests/*.sh; do
+            echo "bash -n $f"
+            bash -n "$f"
+          done
+
+      - name: shellcheck
+        # Pinned image. -s bash because run.sh's shebang is
+        # `with-contenv bashio`, which shellcheck cannot interpret.
+        run: |
+          docker run --rm -v "$PWD:/mnt" -w /mnt "koalaman/shellcheck:${SHELLCHECK_VERSION}" \
+            -s bash addon/datum-connect/rootfs/usr/bin/*.sh addon/datum-connect/tests/*.sh
+
+      - name: Base image is still Debian bookworm
+        # The jq pin below is only meaningful while this holds.
+        run: grep -E 'aarch64-base-debian:bookworm' addon/datum-connect/build.yaml
+
+      - name: jq programs compile with the device's jq
+        # Fidelity choice: the device image is aarch64 (ghcr.io/home-assistant/
+        # aarch64-base-debian:bookworm), but jq is the same Debian bookworm
+        # package on every architecture (1.6-2.1+deb12u*). Running debian:
+        # bookworm natively on amd64 gives the identical jq without QEMU
+        # emulation, and the version assertion below catches drift. The check
+        # script needs only bash, awk and jq, all present in this image.
+        run: |
+          docker run --rm -e EXPECTED_JQ -v "$PWD:/src:ro" -w /src debian:bookworm bash -c '
+            set -euo pipefail
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends jq >/dev/null
+            . /etc/os-release && echo "base: $PRETTY_NAME"
+            echo "jq: $(jq --version)"
+            [ "$(jq --version)" = "${EXPECTED_JQ}" ] || {
+              echo "expected ${EXPECTED_JQ}, got $(jq --version)" >&2
+              exit 1
+            }
+            addon/datum-connect/tests/check-jq.sh
+          '

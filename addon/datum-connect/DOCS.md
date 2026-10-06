@@ -158,6 +158,14 @@ delete the `image:` line from `config.yaml`, put the
 store. It appears under **Local add-ons** and the Supervisor builds it from the
 `Dockerfile`, which only copies files in.
 
+### Script check
+
+CI (`.github/workflows/addon-script-check.yml`) runs shellcheck on the scripts
+and compiles every jq program in them with the jq that ships in the base image
+(1.6 on bookworm), because newer jq accepts things 1.6 rejects. To run the jq
+part locally, use a 1.6 binary:
+`JQ=/path/to/jq-1.6 addon/datum-connect/tests/check-jq.sh`.
+
 ## Diagnosing
 
 The add-on's own log is the first place to look, but it cannot tell you
