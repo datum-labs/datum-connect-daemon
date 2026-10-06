@@ -75,7 +75,10 @@ else
     else
         if [ ! -s "${PAIRED_KEY_FILE}" ]; then
             bashio::log.info "No service account key yet, so pairing this add-on with Datum. A link and a code follow."
-            PAIR_ARGS=(pair --key-out "${PAIRED_KEY_FILE}")
+            # --hold-port: while pairing waits for approval the daemon is not
+            # listening yet, and the Supervisor's watchdog (config.yaml)
+            # would restart the add-on mid-approval, replacing the code.
+            PAIR_ARGS=(pair --key-out "${PAIRED_KEY_FILE}" --hold-port "${PORT}")
             if [ -n "${PROJECT}" ]; then
                 PAIR_ARGS+=(--project "${PROJECT}")
             fi

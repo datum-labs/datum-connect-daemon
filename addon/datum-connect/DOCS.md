@@ -51,10 +51,6 @@ its own Datum login app, it borrows the public one that the `datumctl`
 command line tool uses. Approving lets the add-on act as you for under a
 minute, to make what is listed below; it never stores your login.
 
-If the add-on's **Watchdog** switch is on, turn it off until pairing is done.
-While the add-on waits for approval its daemon is not running yet, so the
-watchdog can restart the add-on part way through, which replaces the code.
-
 Updates appear as an **Update** button on the add-on, like any other add-on.
 
 ### What pairing creates
