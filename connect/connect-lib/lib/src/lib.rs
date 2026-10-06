@@ -1,6 +1,7 @@
 pub mod config;
 pub mod datum_apis;
 pub mod datum_cloud;
+pub mod edge_policies;
 pub mod heartbeat;
 pub mod http_user_agent;
 pub mod kube_error;

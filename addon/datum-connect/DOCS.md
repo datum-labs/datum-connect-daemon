@@ -79,8 +79,8 @@ The service account also needs permission to create WAF policies (see below).
 
 ## Edge protection (WAF)
 
-On every start, the add-on sets up Datum's web application firewall for the
-tunnel: a policy named `<tunnel id>-waf` with the OWASP Core Rule Set at
+Every time it starts the tunnel, the add-on's daemon sets up Datum's web
+application firewall for it: a policy named `<tunnel id>-waf` with the OWASP Core Rule Set at
 paranoia level 1 and rule `920420` excluded. It is on (`Enforce`) for
 everything except Home Assistant's streaming endpoints:
 
@@ -95,7 +95,7 @@ skipped. To do this, the tunnel sends those paths through their own rule,
 and the policy covers only the tunnel's main rule, named `protected`. The
 `Edge protection policy` log line names the policy.
 
-The add-on only creates the policy when it is missing. If one already exists,
+The daemon only creates the policy when it is missing. If one already exists,
 it is kept as is, so changes made in the portal survive restarts. Policies the
 add-on creates carry the annotation
 `connect.datum.net/managed-by: datum-connect-addon`. A policy without it is
@@ -103,9 +103,9 @@ never changed, with one exception: the switched-off policy add-on 0.1.5 or 0.1.6
 created is switched on as above, once, and only if it is exactly as those versions
 left it.
 
-If the log says `Edge protection is OFF: tunnel ... has no rule named
-'protected'`, the policy exists but covers nothing. Restart the add-on, and
-report it if that persists.
+If the log says `!!! Edge protection is OFF: tunnel ... has no rule named
+'protected'`, the policy covers nothing. Restart the add-on, and report it if
+that persists.
 
 Why these settings:
 
@@ -119,15 +119,20 @@ Why these settings:
 If the log says `Edge protection NOT set up` or `Edge protection still OFF`,
 the tunnel still works, but without the firewall. The usual cause is a service
 account that may not create or update WAF policies. Grant that permission and
-restart the add-on.
+restart the add-on. A failure is never fatal and is retried every time the
+tunnel starts, so one caused by a brief outage at boot fixes itself on the
+next start.
 
 ## Request timeout
 
 Datum's edge ends any response 15 seconds after the request by default. That
 is too short for Home Assistant: live views such as an add-on's log stop
-after 15-20 seconds, and so does any download that takes longer. On every
-start, the add-on therefore raises the limit for its tunnel to 1 hour, the
-most the platform allows, with a policy named `<tunnel id>-timeout`.
+after 15-20 seconds, and so does any download that takes longer. Every time
+it starts the tunnel, the add-on's daemon therefore raises the limit for it
+to 1 hour, the most the platform allows, with a policy named
+`<tunnel id>-timeout`. The log says
+`Edge request timeout raised to 1h (policy ...)` when it creates the policy,
+and `Edge request timeout set (existing policy ... kept)` after that.
 
 As with the WAF, the policy is only created when it is missing. If one
 already exists, it is kept as is, so a value changed since survives restarts.
@@ -135,7 +140,7 @@ already exists, it is kept as is, so a value changed since survives restarts.
 If the log says `Edge request timeout NOT raised`, the tunnel still works, but
 long streams and downloads are cut at about 15 seconds. The usual cause is a
 service account that may not create traffic policies. Grant that permission
-and restart the add-on.
+and restart the add-on. As with the WAF, it is retried on every start.
 
 ## Why the image is prebuilt
 

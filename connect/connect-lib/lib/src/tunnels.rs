@@ -33,6 +33,7 @@ use crate::datum_apis::traffic_protection_policy::{
     TrafficProtectionPolicyRuleSetType, TrafficProtectionPolicySpec,
 };
 use crate::datum_cloud::DatumCloudClient;
+use crate::edge_policies::{self, EdgeTarget};
 use crate::kube_error::is_quota_check_timeout;
 use crate::{DEFAULT_PCP_NAMESPACE, Advertisment, ListenNode, TcpProxyData, state::ProxyState};
 const DEFAULT_CONNECTOR_CLASS_NAME: &str = "datum-connect";
@@ -99,6 +100,10 @@ pub struct TunnelService {
     /// `desired_proxy_rules`. `None` (the default, and what every caller
     /// except the daemon gets) keeps the proxy's rules exactly as before.
     waf_exempt_matches: Option<Vec<HTTPRouteMatch>>,
+    /// Ensure the WAF and request-timeout policies on create and on every
+    /// enable — see `edge_policies`. Off (the default, and what every caller
+    /// except the daemon gets) touches no policy at all.
+    edge_policies: bool,
 }
 
 fn proxy_state_from_summary(
@@ -363,6 +368,7 @@ impl TunnelService {
             publish_tickets: publish_tickets_enabled(),
             create_traffic_protection_policies: create_traffic_protection_policies_enabled(),
             waf_exempt_matches: None,
+            edge_policies: false,
         }
     }
 
@@ -373,6 +379,42 @@ impl TunnelService {
     pub fn with_waf_exempt_matches(mut self, matches: Vec<HTTPRouteMatch>) -> Self {
         self.waf_exempt_matches = (!matches.is_empty()).then_some(matches);
         self
+    }
+
+    /// After writing or confirming a proxy's rules on create and on every
+    /// enable, also ensure its edge policies: the WAF scoped to `protected`
+    /// and the 1h request timeout. Runs in the background, and failures are
+    /// only logged, so it can never hold a tunnel back. Re-running on every
+    /// enable is what retries a failure.
+    pub fn with_edge_policies(mut self, enabled: bool) -> Self {
+        self.edge_policies = enabled;
+        self
+    }
+
+    /// Starts the edge-policy pass for one tunnel, if this service does them
+    /// and the tunnel is being turned on.
+    fn spawn_edge_policies(
+        &self,
+        client: &kube::Client,
+        project_id: &str,
+        tunnel_id: &str,
+        label: &str,
+        enabling: bool,
+        rules: &[HTTPProxyRule],
+    ) {
+        let Some(target) = edge_policy_target(self.edge_policies, enabling, || EdgeTarget {
+            project_id: project_id.to_string(),
+            tunnel_id: tunnel_id.to_string(),
+            label: label.to_string(),
+            portal_url: self.datum.web_url().into_owned(),
+        }) else {
+            return;
+        };
+        tokio::spawn(edge_policies::ensure_edge_policies(
+            client.clone(),
+            target,
+            edge_policies::has_protected_rule(rules),
+        ));
     }
 
     pub async fn list_active(&self) -> Result<Vec<TunnelSummary>> {
@@ -921,6 +963,8 @@ impl TunnelService {
             );
         }
 
+        self.spawn_edge_policies(&client, project_id, &proxy_name, label, true, &proxy.spec.rules);
+
         let proxy_state = proxy_state_from_summary(&proxy_name, &endpoint, label, true)?;
         if self.publish_tickets {
             debug!(%proxy_name, "publishing ticket for tunnel");
@@ -1111,7 +1155,8 @@ impl TunnelService {
         let pcp = self.datum.project_control_plane_client(project_id).await?;
         let client = pcp.client();
         let proxies: Api<HTTPProxy> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
-        let ads: Api<ConnectorAdvertisement> = Api::namespaced(client, DEFAULT_PCP_NAMESPACE);
+        let ads: Api<ConnectorAdvertisement> =
+            Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
 
         let proxy = proxies
             .get(tunnel_id)
@@ -1131,6 +1176,10 @@ impl TunnelService {
         // if we don't update the proxy here the operator watches a connector
         // that no longer exists and the Ready/IrohDNSPublished conditions
         // never become True.
+        //
+        // `proxy_rules` is what the proxy carries afterwards, for the edge
+        // policy pass below.
+        let proxy_rules: Vec<HTTPProxyRule>;
         {
             let target = parse_target(&endpoint)?;
             let desired_rules = desired_proxy_rules(
@@ -1138,16 +1187,20 @@ impl TunnelService {
                 &connector_name,
                 self.waf_exempt_matches.as_deref(),
             );
-            if !http_proxy_spec_matches(&proxy, &label, &desired_rules) {
+            if http_proxy_spec_matches(&proxy, &label, &desired_rules) {
+                proxy_rules = proxy.spec.rules.clone();
+            } else {
                 let hostnames = proxy.spec.hostnames.clone().unwrap_or_default();
                 let patch = json!({
                     "metadata": { "annotations": { DISPLAY_NAME_ANNOTATION: &label } },
                     "spec": { "hostnames": hostnames, "rules": desired_rules },
                 });
-                proxies
+                proxy_rules = proxies
                     .patch(tunnel_id, &PatchParams::default(), &Patch::Merge(&patch))
                     .await
-                    .std_context("Failed to patch HTTPProxy connector reference")?;
+                    .std_context("Failed to patch HTTPProxy connector reference")?
+                    .spec
+                    .rules;
             }
             let _ = target; // used above
         }
@@ -1193,6 +1246,8 @@ impl TunnelService {
                 .await
                 .std_context("Failed to delete ConnectorAdvertisement")?;
         }
+
+        self.spawn_edge_policies(&client, project_id, tunnel_id, &label, enabled, &proxy_rules);
 
         let connector_name = proxy_connector_name(&proxy);
 
@@ -1719,10 +1774,10 @@ fn proxy_rule(endpoint: &str, connector_name: &str) -> HTTPProxyRule {
     }
 }
 
-/// Rule names used only when WAF exemptions are configured. A
-/// TrafficProtectionPolicy targets `protected` by `sectionName`; if that
-/// name ever stops resolving, the policy applies to nothing, so these are
-/// a contract with whoever creates the policy (the Home Assistant add-on).
+/// Rule names used only when WAF exemptions are configured. The WAF policy
+/// in `edge_policies` targets `protected` by `sectionName`; if that name
+/// ever stops resolving, the policy applies to nothing, so both sides use
+/// this one constant.
 pub const WAF_EXEMPT_RULE_NAME: &str = "streams";
 pub const WAF_PROTECTED_RULE_NAME: &str = "protected";
 
@@ -1934,6 +1989,17 @@ where
         }
     }
     f().await
+}
+
+/// Whether a create or enable should run the edge-policy pass. Off unless
+/// the service opted in, and never on a disable. Split out so the off path,
+/// which is every caller but the Home Assistant add-on, is testable.
+fn edge_policy_target(
+    edge_policies: bool,
+    enabling: bool,
+    target: impl FnOnce() -> EdgeTarget,
+) -> Option<EdgeTarget> {
+    (edge_policies && enabling).then(target)
 }
 
 fn publish_tickets_enabled() -> bool {
@@ -2382,6 +2448,41 @@ mod tests {
             assert!(rule.filters.is_none());
             assert_eq!(serde_json::to_value(&rule.backends).unwrap(), expected_backends);
         }
+    }
+
+    /// Without the opt-in, no create or enable path builds an edge target,
+    /// so no policy is read or written: desktop and CLI behave as before.
+    #[test]
+    fn edge_policies_off_unless_opted_in_and_enabling() {
+        let target = || EdgeTarget {
+            project_id: "p".into(),
+            tunnel_id: "tunnel-abc12".into(),
+            label: "home-assistant".into(),
+            portal_url: "https://cloud.datum.net".into(),
+        };
+        assert!(edge_policy_target(false, true, || -> EdgeTarget {
+            panic!("must not even build a target when off")
+        })
+        .is_none());
+        assert!(edge_policy_target(false, false, target).is_none());
+        assert!(edge_policy_target(true, false, target).is_none(), "never on disable");
+        let t = edge_policy_target(true, true, target).expect("opted in and enabling");
+        assert_eq!(t.tunnel_id, "tunnel-abc12");
+    }
+
+    /// The rules the add-on's exemptions produce satisfy the WAF's
+    /// `sectionName`; the default rules do not, which is what the loud
+    /// warning catches.
+    #[test]
+    fn exempt_rules_carry_the_rule_the_waf_targets() {
+        let with = desired_proxy_rules(EP, CONN, Some(&ha_matches()));
+        assert!(edge_policies::has_protected_rule(&with));
+        let without = desired_proxy_rules(EP, CONN, None);
+        assert!(!edge_policies::has_protected_rule(&without));
+        assert_eq!(
+            edge_policies::desired_waf_spec("t")["targetRefs"][0]["sectionName"],
+            WAF_PROTECTED_RULE_NAME
+        );
     }
 
     fn proxy_with_rules(label: &str, rules: Vec<HTTPProxyRule>) -> HTTPProxy {
