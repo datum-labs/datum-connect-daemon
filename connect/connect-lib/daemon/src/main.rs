@@ -914,13 +914,11 @@ async fn run() -> n0_error::Result<()> {
         ));
     }
 
-    let token_source = ExternalTokenSource::from_env(session.clone())
+    // A service account key (DATUM_SA_KEY_FILE, the Home Assistant add-on)
+    // mints tokens in-process; otherwise the credentials helper, as before.
+    let token_source = ExternalTokenSource::from_env_with_refresh(session.clone())
+        .await
         .map_err(|e| n0_error::anyerr!("failed to create token source: {e}"))?;
-    if let Some(ref s) = session {
-        if let Ok(helper) = std::env::var("DATUM_CREDENTIALS_HELPER") {
-            token_source.start_refresh(helper, s.clone());
-        }
-    }
     let datum = DatumCloudClient::with_external_token_source(ApiEnv::default(), token_source);
 
     let project_id = args

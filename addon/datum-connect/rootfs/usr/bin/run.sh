@@ -10,7 +10,6 @@ set -euo pipefail
 
 PORT=47780
 CONNECT_DIR=/data/connect
-CREDENTIALS_HELPER=/usr/bin/sa-credentials-helper.sh
 
 PROJECT="$(bashio::config 'project')"
 PASTED_KEY="$(bashio::config 'service_account_key')"
@@ -20,7 +19,7 @@ LABEL="$(bashio::config 'tunnel_label')"
 LOG_LEVEL="$(bashio::config 'log_level')"
 
 # A pasted key wins over a file. It is written to the add-on's private /data,
-# readable by this add-on only, because the credentials helper reads a file.
+# readable by this add-on only, because the daemon reads the key from a file.
 # The browser strips the line breaks from a pasted multi-line file, which is
 # harmless: whitespace between JSON tokens is insignificant, and the PEM key
 # inside is stored with escaped \n, not real line breaks.
@@ -41,8 +40,8 @@ unset PASTED_KEY
 
 # Checked here rather than left for the daemon to fail on later: a wrong file
 # in the right place is a confusing failure, and this is cheap.
-if ! jq -e 'select(.type == "datum_service_account") | .client_id, .private_key, .scope' "${KEY_FILE}" >/dev/null 2>&1; then
-    bashio::exit.nok "${KEY_SOURCE} is not a Datum service account key (expected JSON with type, client_id, private_key and scope). Paste the whole file, braces included. A personal login token will not work here."
+if ! jq -e '.type == "datum_service_account" and (.client_id and .private_key_id and .private_key and .scope)' "${KEY_FILE}" >/dev/null 2>&1; then
+    bashio::exit.nok "${KEY_SOURCE} is not a Datum service account key (expected JSON with type, client_id, private_key_id, private_key and scope). Paste the whole file, braces included. A personal login token will not work here."
 fi
 
 # A service account's client_email is <name>@<project>.identity.miloapis.com,
@@ -59,13 +58,14 @@ elif [ -n "${KEY_PROJECT}" ] && [ "${KEY_PROJECT}" != "${PROJECT}" ]; then
 fi
 
 mkdir -p "${CONNECT_DIR}"
+# The daemon signs a short-lived assertion with this key and exchanges it for
+# an access token, a fresh one on every refresh, with no helper process.
 export DATUM_SA_KEY_FILE="${KEY_FILE}"
 
 export DATUM_PLUGIN_MODE=1
 export DATUM_PROJECT="${PROJECT}"
 export DATUM_CONNECT_DIR="${CONNECT_DIR}"
 export DATUM_SESSION="service-account@${PROJECT}"
-export DATUM_CREDENTIALS_HELPER="${CREDENTIALS_HELPER}"
 export RUST_LOG="datum_connect_daemon=${LOG_LEVEL},connect_lib=${LOG_LEVEL}"
 
 # The daemon force-stops any tunnel left on for 24h. That backstop exists for

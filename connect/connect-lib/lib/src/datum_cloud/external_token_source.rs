@@ -7,6 +7,8 @@ use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
+use super::service_account::{self, ServiceAccount};
+
 /// Errors that can occur when constructing an [`ExternalTokenSource`] from environment.
 #[derive(Debug, thiserror::Error)]
 pub enum ExternalTokenError {
@@ -20,6 +22,35 @@ pub enum ExternalTokenError {
     InvalidToken(String),
     #[error("failed to parse JWT payload: {0}")]
     JwtParse(#[source] serde_json::Error),
+    #[error("service account: {0}")]
+    ServiceAccount(String),
+}
+
+/// Points the daemon at a Datum service account key file. When set, tokens
+/// are minted in-process from the key instead of by a credentials helper.
+pub const SA_KEY_FILE_ENV: &str = "DATUM_SA_KEY_FILE";
+/// The IdP the service account's assertion is exchanged with.
+pub const AUTH_ISSUER_ENV: &str = "DATUM_AUTH_ISSUER";
+
+/// Where a fresh token comes from, for the startup fetch and every refresh.
+#[derive(Clone)]
+enum TokenFetcher {
+    /// `DATUM_CREDENTIALS_HELPER auth get-token --session <session>`.
+    Helper { helper: String, session: String },
+    /// A JWT-bearer exchange with a service account key. Every call is a new
+    /// exchange, so a forced refresh always gets a genuinely new token.
+    ServiceAccount(std::sync::Arc<ServiceAccount>),
+}
+
+impl TokenFetcher {
+    async fn fetch(&self) -> Result<String, ExternalTokenError> {
+        match self {
+            TokenFetcher::Helper { helper, session } => {
+                ExternalTokenSource::exec_helper(helper, session)
+            }
+            TokenFetcher::ServiceAccount(sa) => sa.mint().await,
+        }
+    }
 }
 
 /// How many consecutive no-op forced refreshes before the credential is treated
@@ -84,17 +115,65 @@ impl ExternalTokenSource {
             "ExternalTokenSource::from_env — token loaded from helper"
         );
 
+        Ok(Self::with_token(token))
+    }
+
+    /// Picks the token source from the environment and starts its refresh
+    /// loop. Must be called from within a tokio runtime.
+    ///
+    /// With `DATUM_SA_KEY_FILE` set, tokens are minted in-process from that
+    /// service account key ([`Self::from_service_account_key_file`]).
+    /// Otherwise this is exactly what the daemon and CLI always did:
+    /// [`Self::from_env`], then a helper refresh loop when both a session and
+    /// `DATUM_CREDENTIALS_HELPER` are set.
+    pub async fn from_env_with_refresh(session: Option<String>) -> Result<Self, ExternalTokenError> {
+        if let Some(path) = env::var_os(SA_KEY_FILE_ENV).filter(|p| !p.is_empty()) {
+            let issuer = env::var(AUTH_ISSUER_ENV)
+                .ok()
+                .filter(|i| !i.is_empty())
+                .unwrap_or_else(|| service_account::DEFAULT_ISSUER.to_string());
+            return Self::from_service_account_key_file(std::path::Path::new(&path), &issuer).await;
+        }
+        let source = Self::from_env(session.clone())?;
+        if let Some(session) = session
+            && let Ok(helper) = env::var("DATUM_CREDENTIALS_HELPER")
+        {
+            source.start_refresh(helper, session);
+        }
+        Ok(source)
+    }
+
+    /// Mints the first token from a service account key file, then keeps it
+    /// fresh with the same refresh loop the helper uses: proactively before
+    /// expiry, and immediately on [`force_refresh()`](Self::force_refresh).
+    /// Must be called from within a tokio runtime.
+    pub async fn from_service_account_key_file(
+        path: &std::path::Path,
+        issuer: &str,
+    ) -> Result<Self, ExternalTokenError> {
+        let sa = ServiceAccount::from_file(path, issuer)?;
+        info!(
+            client_id = sa.client_id(),
+            issuer,
+            "Datum auth: minting tokens from the service account key at {}",
+            path.display()
+        );
+        let fetcher = TokenFetcher::ServiceAccount(std::sync::Arc::new(sa));
+        let token = fetcher.fetch().await?;
+        let source = Self::with_token(token);
+        source.spawn_refresh(fetcher);
+        Ok(source)
+    }
+
+    fn with_token(token: String) -> Self {
         let (token_tx, _) = watch::channel(token.clone());
         let (refresh_tx, _) = watch::channel(0u64);
-
-        Ok(Self {
-            token: std::sync::Arc::new(ArcSwap::from_pointee(SecretString::new(
-                token.clone().into(),
-            ))),
+        Self {
+            token: std::sync::Arc::new(ArcSwap::from_pointee(SecretString::new(token.into()))),
             token_tx: std::sync::Arc::new(token_tx),
             refresh_trigger: std::sync::Arc::new(refresh_tx),
             ineffective_forced: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        })
+        }
     }
 
     /// Returns the current token as a plain `String`.
@@ -135,6 +214,10 @@ impl ExternalTokenSource {
     /// token expires, calls [`swap_token()`](Self::swap_token) with the result,
     /// and responds to [`force_refresh()`](Self::force_refresh) signals.
     pub fn start_refresh(&self, helper: String, session: String) {
+        self.spawn_refresh(TokenFetcher::Helper { helper, session });
+    }
+
+    fn spawn_refresh(&self, fetcher: TokenFetcher) {
         let this = self.clone();
         let mut refresh_rx = self.refresh_trigger.subscribe();
         let initial_exp = match parse_jwt_expiry(&self.token()) {
@@ -142,7 +225,7 @@ impl ExternalTokenSource {
             Err(_) => None,
         };
         tokio::spawn(async move {
-            this.run_refresh_loop(helper, session, &mut refresh_rx, initial_exp)
+            this.run_refresh_loop(fetcher, &mut refresh_rx, initial_exp)
                 .await;
         });
     }
@@ -185,8 +268,7 @@ impl ExternalTokenSource {
 
     async fn run_refresh_loop(
         self,
-        helper: String,
-        session: String,
+        fetcher: TokenFetcher,
         refresh_rx: &mut watch::Receiver<u64>,
         initial_exp: Option<u64>,
     ) {
@@ -253,8 +335,8 @@ impl ExternalTokenSource {
                 continue;
             }
 
-            // Execute helper to get a fresh token
-            match Self::exec_helper(&helper, &session) {
+            // Run the helper, or exchange the key, for a fresh token
+            match fetcher.fetch().await {
                 Ok(new_token) => {
                     let previous = self.token();
                     let prev_exp = parse_jwt_expiry(&previous).ok().flatten();
@@ -662,5 +744,184 @@ mod tests {
             "rotated token should come from the counter helper: {new_token}"
         );
         assert_eq!(*rx.borrow(), new_token, "watchers notified of new token");
+    }
+
+    // --- Service account (DATUM_SA_KEY_FILE) -----------------------------
+
+    use crate::datum_cloud::service_account::tests::{
+        pkcs1_key_json, test_key, verify_assertion,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A stand-in for the IdP's token endpoint, on loopback. Every POST gets
+    /// a different JWT (far-future `exp`, so the proactive timer stays out
+    /// of the way), and each request's form body is recorded.
+    async fn fake_token_endpoint() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = bodies.clone();
+        tokio::spawn(async move {
+            let mut n = 0u64;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                n += 1;
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let read = sock.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..read]);
+                    let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                    let len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + len {
+                        let body = String::from_utf8_lossy(&buf[end + 4..end + 4 + len]);
+                        seen.lock().unwrap().push(body.into_owned());
+                        break;
+                    }
+                }
+                let body = serde_json::json!({
+                    "access_token": make_jwt_with_exp(9_999_000_000 + n),
+                    "token_type": "Bearer",
+                    "expires_in": 43199,
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (issuer, bodies)
+    }
+
+    fn form(body: &str) -> std::collections::HashMap<String, String> {
+        url::form_urlencoded::parse(body.as_bytes()).into_owned().collect()
+    }
+
+    /// The issue #12 lesson, for the native path: a forced refresh (a 401)
+    /// must come back with a genuinely new token from a new exchange, never
+    /// a cached copy of the one that was just refused.
+    #[tokio::test]
+    async fn service_account_mints_a_new_token_on_every_forced_refresh() {
+        let (issuer, bodies) = fake_token_endpoint().await;
+        let key = test_key();
+        let dir = TempDir::new("sa-key");
+        let key_path = dir.path().join("service-account.json");
+        std::fs::write(&key_path, pkcs1_key_json(&key)).unwrap();
+
+        let source = ExternalTokenSource::from_service_account_key_file(&key_path, &issuer)
+            .await
+            .expect("first token minted at startup");
+        let first = source.token();
+        assert!(first.starts_with("eyJ"));
+
+        {
+            let bodies = bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 1, "one exchange at startup");
+            let sent = form(&bodies[0]);
+            assert_eq!(sent["grant_type"], "urn:ietf:params:oauth:grant-type:jwt-bearer");
+            assert_eq!(
+                sent["scope"],
+                "openid profile urn:zitadel:iam:org:project:id:zitadel:aud"
+            );
+            let (_, claims) = verify_assertion(&sent["assertion"], &key.public_der);
+            assert_eq!(claims["aud"], issuer);
+        }
+
+        let rx = source.watch();
+        for round in 1..=2 {
+            let before = source.token();
+            source.force_refresh();
+            for _ in 0..100 {
+                if source.token() != before {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_ne!(source.token(), before, "round {round}: forced refresh must rotate");
+            assert_eq!(*rx.borrow(), source.token(), "watchers notified");
+            assert_eq!(bodies.lock().unwrap().len(), 1 + round, "one new exchange per refresh");
+        }
+        assert_eq!(source.ineffective_forced_refreshes(), 0);
+    }
+
+    #[tokio::test]
+    async fn service_account_key_problems_fail_before_any_request() {
+        let dir = TempDir::new("sa-bad-key");
+        let missing = dir.path().join("nope.json");
+        let err = ExternalTokenSource::from_service_account_key_file(&missing, "http://127.0.0.1:9")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ExternalTokenError::ServiceAccount(_)), "{err}");
+
+        let not_a_key = dir.path().join("token.json");
+        std::fs::write(&not_a_key, "\"eyJhbGciOi.personal.token\"").unwrap();
+        let err = ExternalTokenSource::from_service_account_key_file(&not_a_key, "http://127.0.0.1:9")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ExternalTokenError::ServiceAccount(_)), "{err}");
+    }
+
+    /// Tolerates a lock poisoned by an unrelated failing test, which on
+    /// Windows the shell-script helper tests reliably are.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[tokio::test]
+    async fn key_file_env_selects_the_native_source() {
+        let _lock = env_lock();
+        let (issuer, bodies) = fake_token_endpoint().await;
+        let dir = TempDir::new("sa-env");
+        let key_path = dir.path().join("service-account.json");
+        std::fs::write(&key_path, pkcs1_key_json(&test_key())).unwrap();
+        unsafe {
+            std::env::set_var(SA_KEY_FILE_ENV, &key_path);
+            std::env::set_var(AUTH_ISSUER_ENV, &issuer);
+            // Not needed, and would be ignored if it were set.
+            std::env::remove_var("DATUM_CREDENTIALS_HELPER");
+        }
+        let result = ExternalTokenSource::from_env_with_refresh(Some("s".into())).await;
+        unsafe {
+            std::env::remove_var(SA_KEY_FILE_ENV);
+            std::env::remove_var(AUTH_ISSUER_ENV);
+        }
+        assert!(result.expect("native source").token().starts_with("eyJ"));
+        assert_eq!(bodies.lock().unwrap().len(), 1);
+    }
+
+    /// Without the key file variable (or with it empty) selection is what it
+    /// always was: the credentials helper, which here is missing.
+    #[tokio::test]
+    async fn without_key_file_env_the_helper_path_is_unchanged() {
+        let _lock = env_lock();
+        for key_file in [None, Some("")] {
+            unsafe {
+                match key_file {
+                    Some(v) => std::env::set_var(SA_KEY_FILE_ENV, v),
+                    None => std::env::remove_var(SA_KEY_FILE_ENV),
+                }
+                std::env::remove_var("DATUM_CREDENTIALS_HELPER");
+                std::env::set_var("DATUM_SESSION", "test-session");
+            }
+            let result = ExternalTokenSource::from_env_with_refresh(None).await;
+            assert!(
+                matches!(result, Err(ExternalTokenError::MissingHelper)),
+                "{key_file:?}: {:?}",
+                result.err()
+            );
+        }
+        unsafe { std::env::remove_var(SA_KEY_FILE_ENV) };
     }
 }

@@ -48,5 +48,12 @@ iroh-proxy-utils = { git = "https://github.com/n0-computer/iroh-proxy-utils", re
 # postcard for ticket serialization
 postcard = "1"
 
+# RS256 for the service account's JWT-bearer assertion. Already compiled in
+# through iroh's QUIC stack and the daemon's rustls provider.
+ring = "0.17"
+
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
+# Generates throwaway RSA keys for the service account tests, which ring
+# cannot do. Already in the tree through rustls.
+aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys"] }

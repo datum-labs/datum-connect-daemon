@@ -71,9 +71,12 @@ only be restored by a human at a browser.
 An appliance in a house with nobody watching the logs fails exactly those ways,
 and the only visible symptom is that the hostname stops working.
 
-A service account avoids both. The add-on signs a short-lived assertion with
-the key and exchanges it for an access token on every request the daemon makes
-for one, so there is no browser step and no cached token to get stuck on.
+A service account avoids both. The add-on's daemon reads the key itself,
+signs a short-lived assertion with it, and exchanges that for an access
+token. It does this again every time it needs a token, including straight
+after one is refused, so there is no browser step, no helper process, and no
+cached token to get stuck on. If the exchange fails, the log line says
+`service account:` and why.
 
 The service account also needs permission to create WAF policies (see below).
 
@@ -170,11 +173,10 @@ everything — in particular, a healthy-looking daemon can still have a tunnel
 that serves nothing, because the local side and the cloud side fail
 independently.
 
-`connect/scripts/auth-probe.py` in this repository checks the credential path
-on its own and reports three stages separately: whether the helper can mint a
-token, whether that token is fresh, and whether the control plane accepts it.
-Those fail for different reasons and need different fixes, and an error from
-the public hostname looks identical for all three.
+The add-on mints its tokens inside the daemon, so a credential problem shows
+up in the add-on's log as a `service account:` error: an unreadable or
+malformed key at startup, or a refused token exchange later. A key that is
+deleted or disabled in Datum is refused at the exchange, not silently kept.
 
 **The public address returns `502` with `upstream error: client error
 (Connect)`.** The tunnel works, but nothing answered at `target`. If you set
