@@ -173,7 +173,10 @@ AUTH="Authorization: Bearer $(cat "${TOKEN_FILE}")"
 #
 # Idempotent across restarts: the tunnel is found again by its label, and the
 # daemon persists it, so a restart re-uses the same public hostname rather than
-# minting a new one each boot.
+# minting a new one each boot. The tunnel found may predate this install (an
+# uninstall wipes /data, the tunnel lives on in Datum Cloud), so the start
+# below always passes the target: the daemon then gives the tunnel a local
+# inspector for it if it has none, and repoints it if 'target' changed.
 # Keep the status and body apart: a 401/403 here means the service account is
 # not allowed into the project, anything else is not a credential problem, and
 # telling the user to recheck their key for a non-credential failure sends
@@ -191,23 +194,43 @@ case "${STATUS}" in
 esac
 TUNNEL_ID=$(jq -r --arg l "${LABEL}" 'map(select(.label == $l)) | first | .id // empty' <<<"${TUNNELS}")
 
+# POSTs a JSON body to the daemon. Sets RESPONSE to the response body and
+# RESPONSE_STATUS to the HTTP status, or 000 when nothing answered.
+post_json() {
+    local url=$1 body=$2 file
+    file=$(mktemp)
+    RESPONSE_STATUS=$(curl -s -o "${file}" -w '%{http_code}' -X POST "${url}" -H "${AUTH}" -H "Content-Type: application/json" -d "${body}" || true)
+    RESPONSE=$(cat "${file}")
+    rm -f "${file}"
+}
+
+# The daemon's reason for a failed call, short enough for one log line: its
+# .error field if the body is JSON, else the raw body, flattened and cut at
+# 200 characters.
+error_excerpt() {
+    local msg
+    msg=$(jq -r '.error // empty' <<<"${RESPONSE}" 2>/dev/null || true)
+    [ -n "${msg}" ] || msg=${RESPONSE:-no response body}
+    msg=$(printf '%s' "${msg}" | tr '\r\n\t' '   ')
+    printf '%s' "${msg:0:200}"
+}
+
 if [ -z "${TUNNEL_ID}" ]; then
     bashio::log.info "Creating tunnel '${LABEL}' → ${TARGET}"
     BODY=$(jq -n --arg l "${LABEL}" --arg e "${TARGET}" '{label: $l, endpoint: $e}')
-    if ! CREATED=$(curl -sf -X POST "${API}/tunnels" -H "${AUTH}" -H "Content-Type: application/json" -d "${BODY}"); then
-        bashio::exit.nok "Could not create the tunnel. Check that the service account can create tunnels in project ${PROJECT}."
+    post_json "${API}/tunnels" "${BODY}"
+    if [ "${RESPONSE_STATUS}" != 200 ]; then
+        bashio::exit.nok "Could not create the tunnel (HTTP ${RESPONSE_STATUS:-000}): $(error_excerpt). Check that the service account can create tunnels in project ${PROJECT}."
     fi
-    TUNNEL_ID=$(jq -r '.id' <<<"${CREATED}")
+    TUNNEL_ID=$(jq -r '.id' <<<"${RESPONSE}")
 else
-    EXISTING_TARGET=$(jq -r --arg id "${TUNNEL_ID}" '.[] | select(.id == $id) | .endpoint' <<<"${TUNNELS}")
-    bashio::log.info "Using existing tunnel '${LABEL}' (${TUNNEL_ID}) → ${EXISTING_TARGET}"
-    if [ "${EXISTING_TARGET%/}" != "${TARGET%/}" ]; then
-        bashio::log.warning "The 'target' option is ${TARGET}, but tunnel '${LABEL}' already points at ${EXISTING_TARGET}. Change 'tunnel_label' to create a new tunnel for the new target."
-    fi
+    bashio::log.info "Using existing tunnel '${LABEL}' (${TUNNEL_ID}); pointing it at ${TARGET}"
 fi
 
-if ! curl -sf -X POST "${API}/tunnels/${TUNNEL_ID}/start" -H "${AUTH}" >/dev/null; then
-    bashio::exit.nok "Could not start tunnel ${TUNNEL_ID}. Check the log above."
+BODY=$(jq -n --arg t "${TARGET}" '{target: $t}')
+post_json "${API}/tunnels/${TUNNEL_ID}/start" "${BODY}"
+if [ "${RESPONSE_STATUS}" != 200 ]; then
+    bashio::exit.nok "Could not start tunnel ${TUNNEL_ID} (HTTP ${RESPONSE_STATUS:-000}): $(error_excerpt)"
 fi
 
 # Hostname assignment and DNS publication take a little while after start.
