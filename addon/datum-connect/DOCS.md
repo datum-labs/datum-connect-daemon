@@ -196,6 +196,16 @@ pointed at.
 **The public address returns `400: Bad Request`.** Home Assistant doesn't
 trust the proxy yet. See step 4 of "Installing".
 
+**The log warns "Re-using tunnel ... its connector had to be replaced", and
+the public address shows "Service offline".** The add-on found a tunnel from
+an earlier install by its label, but the key that tunnel's connector was
+registered under was deleted with `/data` when the add-on was uninstalled, so
+the tunnel got a new connector. Such a tunnel has been seen to stay offline
+even though everything on Datum's side reports ready. Set a new
+`tunnel_label` on the Configuration tab and restart the add-on to get a fresh
+tunnel, with a new public address. The old tunnel stays in the portal until
+you delete it there.
+
 **Every request fails with "not set-up for reverse proxies", or Home Assistant
 warns "HTTP YAML configuration is ignored after migration".** Home Assistant
 2026.x stops reading the `http:` block in `configuration.yaml` once it has

@@ -225,6 +225,17 @@ if [ -z "${TUNNEL_ID}" ]; then
     TUNNEL_ID=$(jq -r '.id' <<<"${RESPONSE}")
 else
     bashio::log.info "Using existing tunnel '${LABEL}' (${TUNNEL_ID}); pointing it at ${TARGET}"
+    # The daemon keeps each tunnel's iroh key at <connect dir>/<project>/<id>/
+    # listen_key, and the tunnel's connector is registered under that key.
+    # With no key here, this tunnel came from an earlier install (an uninstall
+    # wipes /data), so the start below has to give it a new key and a new
+    # connector. Checked now because the start writes the new key. A tunnel
+    # adopted this way has been seen to stay "Service offline" while a fresh
+    # one worked, which looks like a platform issue; the warning after the
+    # start says what to do about it.
+    if [ ! -s "${CONNECT_DIR}/${PROJECT}/${TUNNEL_ID}/listen_key" ]; then
+        CONNECTOR_REPLACED=true
+    fi
 fi
 
 BODY=$(jq -n --arg t "${TARGET}" '{target: $t}')
@@ -247,6 +258,10 @@ if [ -n "${HOSTNAME}" ]; then
     bashio::log.info "Home Assistant is reachable at https://${HOSTNAME}"
 else
     bashio::log.warning "Tunnel started, but no public hostname was reported within 2 minutes. It may still be provisioning; restart the add-on to check again."
+fi
+
+if [ "${CONNECTOR_REPLACED:-false}" = true ]; then
+    bashio::log.warning "Re-using tunnel '${LABEL}' (${TUNNEL_ID}) from an earlier install: its connector had to be replaced. If https://${HOSTNAME:-<its hostname>} shows 'Service offline', set a new 'tunnel_label' on the Configuration tab and restart."
 fi
 
 # Surface the daemon's exit status as the container's.
