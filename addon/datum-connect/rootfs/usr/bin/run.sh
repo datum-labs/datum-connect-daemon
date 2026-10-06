@@ -18,23 +18,77 @@ TARGET="$(bashio::config 'target')"
 LABEL="$(bashio::config 'tunnel_label')"
 LOG_LEVEL="$(bashio::config 'log_level')"
 
-# A pasted key wins over a file. It is written to the add-on's private /data,
-# readable by this add-on only, because the daemon reads the key from a file.
-# The browser strips the line breaks from a pasted multi-line file, which is
-# harmless: whitespace between JSON tokens is insignificant, and the PEM key
-# inside is stored with escaped \n, not real line breaks.
+if bashio::var.is_empty "${PROJECT}" || [ "${PROJECT}" = "null" ]; then
+    PROJECT=""
+fi
+
+# Where each kind of key lives in the add-on's private /data, readable by
+# this add-on only. Kept apart so that clearing a pasted key falls back to
+# the paired one, never to a leftover copy of the paste.
+PASTED_KEY_FILE=/data/pasted-service-account.json
+PAIRED_KEY_FILE=/data/service-account.json
+# Left by a pairing that stopped at the access grant, so that the next one
+# reuses its service account instead of making another. Names only.
+PAIRING_PROGRESS="${PAIRED_KEY_FILE}.pending"
+
+# Which key, in order: a pasted key, a key file placed by hand, the key an
+# earlier pairing saved, and otherwise pair now.
+#
+# A pasted key is written to a file because the daemon reads the key from
+# one. The browser strips the line breaks from a pasted multi-line file,
+# which is harmless: whitespace between JSON tokens is insignificant, and the
+# PEM key inside is stored with escaped \n, not real line breaks.
 if ! bashio::var.is_empty "${PASTED_KEY}" && [ "${PASTED_KEY}" != "null" ]; then
-    KEY_FILE=/data/service-account.json
+    # Before 0.2.0 the paste was copied to the path a paired key now uses.
+    # Remove that copy, so that clearing the paste later does not pass it off
+    # as a paired key. A real paired key differs from the paste and is kept.
+    if [ -f "${PAIRED_KEY_FILE}" ] && [ "$(cat "${PAIRED_KEY_FILE}")" = "${PASTED_KEY}" ]; then
+        rm -f "${PAIRED_KEY_FILE}"
+    fi
+    KEY_FILE="${PASTED_KEY_FILE}"
     (umask 077 && printf '%s' "${PASTED_KEY}" > "${KEY_FILE}")
     KEY_SOURCE="the pasted service_account_key"
+    if bashio::config.true 'repair'; then
+        bashio::log.warning "'repair' is on, but the pasted service_account_key is in use, so there is nothing to re-pair. Turn 'repair' off."
+    fi
 else
+    rm -f "${PASTED_KEY_FILE}"
     if bashio::var.is_empty "${KEY_FILE}" || [ "${KEY_FILE}" = "null" ]; then
         KEY_FILE=/share/datum-service-account.json
     fi
-    if [ ! -s "${KEY_FILE}" ]; then
-        bashio::exit.nok "No service account key. Paste the key file's contents into 'service_account_key' on the Configuration tab (or place the file at ${KEY_FILE})."
+
+    # Re-pairing: forget the paired key so that a new one is made below. The
+    # old service account is not deleted: the add-on holds no login that
+    # could. Name it, so it can be deleted by hand.
+    if bashio::config.true 'repair'; then
+        if [ -s "${PAIRED_KEY_FILE}" ]; then
+            OLD_ACCOUNT=$(jq -r '.client_email // "an unnamed service account"' "${PAIRED_KEY_FILE}" 2>/dev/null || echo "an unnamed service account")
+            rm -f "${PAIRED_KEY_FILE}"
+            bashio::log.warning "'repair' is on: deleted the paired key for ${OLD_ACCOUNT}. That service account still exists in Datum. Once pairing again has worked, delete it in the portal, under the project's Service accounts."
+        fi
+        rm -f "${PAIRING_PROGRESS}"
+        bashio::log.warning "'repair' is on. Turn it off on the Configuration tab once pairing has worked, or every restart pairs again."
     fi
-    KEY_SOURCE="${KEY_FILE}"
+
+    if [ -s "${KEY_FILE}" ]; then
+        KEY_SOURCE="${KEY_FILE}"
+    else
+        if [ ! -s "${PAIRED_KEY_FILE}" ]; then
+            bashio::log.info "No service account key yet, so pairing this add-on with Datum. A link and a code follow."
+            # --hold-port: while pairing waits for approval the daemon is not
+            # listening yet, and the Supervisor's watchdog (config.yaml)
+            # would restart the add-on mid-approval, replacing the code.
+            PAIR_ARGS=(pair --key-out "${PAIRED_KEY_FILE}" --hold-port "${PORT}")
+            if [ -n "${PROJECT}" ]; then
+                PAIR_ARGS+=(--project "${PROJECT}")
+            fi
+            if ! /usr/bin/datum-connect-daemon "${PAIR_ARGS[@]}"; then
+                bashio::exit.nok "Pairing with Datum did not finish; the reason is above. Restart the add-on to try again, or use your own service account key (see the Documentation tab)."
+            fi
+        fi
+        KEY_FILE="${PAIRED_KEY_FILE}"
+        KEY_SOURCE="the key saved by pairing"
+    fi
 fi
 unset PASTED_KEY
 
@@ -47,7 +101,11 @@ fi
 # A service account's client_email is <name>@<project>.identity.miloapis.com,
 # so the project it belongs to can be read off the key rather than typed in.
 KEY_PROJECT=$(jq -r '.client_email // empty' "${KEY_FILE}" | sed -n 's/^[^@]*@\([^.]*\)\.identity\..*$/\1/p')
-if bashio::var.is_empty "${PROJECT}" || [ "${PROJECT}" = "null" ]; then
+# A paired key was granted access to the one project it was made in.
+if [ "${KEY_FILE}" = "${PAIRED_KEY_FILE}" ] && [ -n "${PROJECT}" ] && [ -n "${KEY_PROJECT}" ] && [ "${KEY_PROJECT}" != "${PROJECT}" ]; then
+    bashio::exit.nok "'project' is ${PROJECT}, but this add-on was paired with project ${KEY_PROJECT}. Clear 'project' to keep using ${KEY_PROJECT}, or turn on 'repair' to pair with ${PROJECT}."
+fi
+if [ -z "${PROJECT}" ]; then
     if [ -z "${KEY_PROJECT}" ]; then
         bashio::exit.nok "Could not tell which project the service account key belongs to. Set 'project' on the Configuration tab."
     fi

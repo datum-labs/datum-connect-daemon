@@ -283,6 +283,34 @@ struct Args {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     edge_policies: bool,
+    /// Without a subcommand, runs the daemon.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Get a service account key by approving this device in a browser,
+    /// instead of making one in the portal. Prints a link and a code, waits
+    /// for approval, creates a service account with `editor` on the project
+    /// and a key for it, saves the key, and exits 0. Used by the Home
+    /// Assistant add-on when no key is configured; see
+    /// `connect_lib::datum_cloud::pairing`.
+    Pair {
+        /// The project to pair with. Empty or omitted means the only
+        /// project the approving login can see.
+        #[clap(long)]
+        project: Option<String>,
+        /// Where to write the key file. Must not exist yet.
+        #[clap(long)]
+        key_out: std::path::PathBuf,
+        /// Accept (and at once close) connections on 127.0.0.1:<port> while
+        /// pairing waits, so a watchdog that checks the daemon's port by TCP
+        /// connect does not restart the process mid-approval. Released
+        /// before `pair` exits, so the daemon can bind it straight after.
+        #[clap(long)]
+        hold_port: Option<u16>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -474,6 +502,68 @@ mod args_tests {
                 Args::try_parse_from(["datum-connect-daemon", "--edge-policies", raw]).unwrap();
             assert_eq!(args.edge_policies, want, "{raw}");
         }
+    }
+
+    /// The add-on runs `pair --project "$PROJECT" --key-out <path>`, with
+    /// an empty project when none is set.
+    #[test]
+    fn pair_subcommand_parses() {
+        let args = Args::try_parse_from([
+            "datum-connect-daemon", "pair", "--project", "p-1", "--key-out", "/data/k.json",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Pair { project, key_out, hold_port: None }) => {
+                assert_eq!(project.as_deref(), Some("p-1"));
+                assert_eq!(key_out, std::path::PathBuf::from("/data/k.json"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let args =
+            Args::try_parse_from(["datum-connect-daemon", "pair", "--key-out", "k.json"]).unwrap();
+        assert!(matches!(args.command, Some(Command::Pair { project: None, .. })));
+        assert!(Args::try_parse_from(["datum-connect-daemon", "pair"]).is_err(), "--key-out is required");
+        // No subcommand still means "run the daemon".
+        let args = Args::try_parse_from(["datum-connect-daemon", "--port", "1"]).unwrap();
+        assert!(args.command.is_none());
+    }
+
+    /// The watchdog's view: while held, a connect succeeds; once released,
+    /// the daemon can bind the same port.
+    #[tokio::test]
+    async fn held_port_answers_and_is_free_after_release() {
+        let holder = PortHolder::bind(0).await.unwrap();
+        let addr = holder.addr;
+        for _ in 0..3 {
+            tokio::net::TcpStream::connect(addr).await.expect("watchdog connect");
+        }
+        holder.release().await;
+        let rebound = tokio::net::TcpListener::bind(addr).await.expect("port free after release");
+        drop(rebound);
+    }
+
+    #[tokio::test]
+    async fn a_busy_port_cannot_be_held() {
+        let busy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = busy.local_addr().unwrap().port();
+        assert!(PortHolder::bind(port).await.is_err());
+    }
+
+    #[test]
+    fn hold_port_parses() {
+        let args = Args::try_parse_from([
+            "datum-connect-daemon", "pair", "--key-out", "k.json", "--hold-port", "47780",
+        ])
+        .unwrap();
+        assert!(matches!(args.command, Some(Command::Pair { hold_port: Some(47780), .. })));
+    }
+
+    #[test]
+    fn expiry_reads_naturally() {
+        assert_eq!(minutes(std::time::Duration::from_secs(300)), "5 minutes");
+        assert_eq!(minutes(std::time::Duration::from_secs(60)), "1 minute");
+        assert_eq!(minutes(std::time::Duration::from_secs(90)), "2 minutes");
+        assert_eq!(minutes(std::time::Duration::from_secs(45)), "45 seconds");
     }
 }
 
@@ -1133,6 +1223,151 @@ async fn stop_tunnel(
     stop_tunnel_internal(&state, &id, StopReason::Manual, &actor.audit_label()).await
 }
 
+/// `datum-connect-daemon pair`. Its stdout is what a person reads (the Home
+/// Assistant add-on's log), so it says what happens in plain words; tracing
+/// only carries retries, on stderr.
+async fn pair(
+    project: Option<String>,
+    key_out: std::path::PathBuf,
+    hold_port: Option<u16>,
+) -> n0_error::Result<()> {
+    use connect_lib::datum_cloud::pairing::{self, PairingConfig, PairingEvent};
+    use std::io::Write;
+
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("datum_connect_daemon=warn,connect_lib=warn")),
+        )
+        .init();
+
+    let cfg = PairingConfig::from_env(project, key_out);
+    let mut say = |event: PairingEvent| {
+        let line = match event {
+            PairingEvent::Code { url, user_code, expires_in } => format!(
+                "To connect this Home Assistant to Datum, open {url} and enter code {user_code} (expires in {})",
+                minutes(expires_in)
+            ),
+            PairingEvent::CodeExpired => "That code expired before it was approved. Here is a new one.".into(),
+            PairingEvent::Approved { email } => format!("Approved as {email}"),
+            PairingEvent::ProjectSelected { project, organization } => {
+                format!("Using project {project} (organization {organization})")
+            }
+            PairingEvent::ServiceAccountCreated { email, project } => {
+                format!("Created service account {email} in project {project}")
+            }
+            PairingEvent::ServiceAccountReused { email, project } => {
+                format!("Using service account {email} in project {project}, created by the previous attempt")
+            }
+            PairingEvent::AccessGranted => "Granted access".into(),
+            PairingEvent::AccessNotConfirmed { email, project } => format!(
+                "Could not grant access again; carrying on in case an owner has granted it. If tunnel calls are refused, ask an organization owner or editor to grant role 'editor' to service account {email} on project {project}."
+            ),
+            PairingEvent::KeySaved { .. } => "Saved key".into(),
+        };
+        println!("{line}");
+        let _ = std::io::stdout().flush();
+    };
+    // A port that cannot be held only matters if a watchdog is watching,
+    // so it is worth a warning, never a failed pairing.
+    let holder = match hold_port {
+        Some(port) => match PortHolder::bind(port).await {
+            Ok(h) => {
+                tracing::debug!(addr = %h.addr, "pair: holding the daemon's port while pairing");
+                Some(h)
+            }
+            Err(e) => {
+                tracing::warn!("pair: cannot hold port {port} for the watchdog, pairing anyway: {e}");
+                None
+            }
+        },
+        None => None,
+    };
+    // The add-on's stop is a SIGTERM. Stop pairing on it, like on Ctrl-C,
+    // so the port is released on that path too.
+    let outcome = tokio::select! {
+        r = pairing::pair(&cfg, &mut say) => Some(r),
+        _ = shutdown_signal() => None,
+    };
+    if let Some(holder) = holder {
+        holder.release().await;
+    }
+    let paired = match outcome {
+        Some(r) => r.map_err(|e| n0_error::anyerr!("Pairing with Datum failed: {e}"))?,
+        None => return Err(n0_error::anyerr!("Pairing with Datum stopped before it finished.")),
+    };
+    println!(
+        "Paired: this device now uses service account {} in project {}. To revoke it, delete that service account in the Datum portal under the project's Service accounts.",
+        paired.service_account_email, paired.project
+    );
+    Ok(())
+}
+
+/// Keeps a TCP port answering while `pair` runs, in place of the daemon
+/// that will listen there afterwards. Connections are accepted and dropped:
+/// the Home Assistant Supervisor's `tcp://` watchdog only checks that a
+/// connect succeeds. Same address as the daemon's own listener.
+struct PortHolder {
+    addr: SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl PortHolder {
+    async fn bind(port: u16) -> std::io::Result<Self> {
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;
+        let addr = listener.local_addr()?;
+        let task = tokio::spawn(async move {
+            loop {
+                if let Ok((socket, _)) = listener.accept().await {
+                    drop(socket);
+                }
+            }
+        });
+        Ok(Self { addr, task })
+    }
+
+    /// Returns once the listener is closed, so the port is free to bind.
+    async fn release(self) {
+        self.task.abort();
+        // Awaiting the aborted task is what guarantees it, and the listener
+        // it owns, has been dropped.
+        let _ = self.task.await;
+    }
+}
+
+/// Ctrl-C, or SIGTERM where there is one.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// "5 minutes", "1 minute", "45 seconds".
+fn minutes(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        return format!("{secs} seconds");
+    }
+    let m = secs.div_ceil(60);
+    if m == 1 { "1 minute".into() } else { format!("{m} minutes") }
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
@@ -1147,6 +1382,10 @@ async fn run() -> n0_error::Result<()> {
         .map_err(|_| n0_error::anyerr!("failed to install ring crypto provider for rustls"))?;
 
     let args = Args::parse();
+
+    if let Some(Command::Pair { project, key_out, hold_port }) = args.command {
+        return pair(project, key_out, hold_port).await;
+    }
 
     let session = std::env::var("DATUM_SESSION").ok();
     if session.is_none() && std::env::var("DATUM_PLUGIN_MODE").map(|v| v != "1").unwrap_or(true) {

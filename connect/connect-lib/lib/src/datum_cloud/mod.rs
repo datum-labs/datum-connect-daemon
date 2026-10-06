@@ -12,6 +12,7 @@ use crate::{ProjectControlPlaneClient, Repo, SelectedContext};
 
 pub mod env;
 pub mod external_token_source;
+pub mod pairing;
 pub mod service_account;
 
 pub use self::{
