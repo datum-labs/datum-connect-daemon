@@ -307,7 +307,21 @@ impl Supervisor {
         )))
     }
 
-    fn redact(&self, message: String) -> String {
+    /// For `ha_core`, which talks to Home Assistant Core through the
+    /// Supervisor with the same token.
+    pub(crate) fn base(&self) -> &str {
+        &self.base
+    }
+
+    pub(crate) fn token(&self) -> &SecretString {
+        &self.token
+    }
+
+    pub(crate) fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    pub(crate) fn redact(&self, message: String) -> String {
         let secret = self.token.expose_secret();
         if secret.is_empty() {
             message
