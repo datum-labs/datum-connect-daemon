@@ -27,8 +27,9 @@ Home Assistant OS does not allow that — and nothing is built on the device.
    and lists your projects, grouped by organization. Choose one (with only
    one, it is already chosen) and click **Continue**. The page shows each
    step as it is done: a service account, its access to the project, and
-   its key. Then it says `Done. Starting the tunnel…` and, a few seconds
-   later, switches to the tunnel's status with its public address.
+   its key. Then it says `Key saved. Starting the tunnel…` and, a few
+   seconds later, moves on to step 5, or straight to the tunnel's status
+   with its public address if Home Assistant is already set up for it.
 
    **A new address can take 10-20 minutes before it works in every
    browser.** On a real install, a brand-new address gave Firefox a `503`
@@ -42,29 +43,37 @@ Home Assistant OS does not allow that — and nothing is built on the device.
 
    If you set `project` on the Configuration tab before starting, that
    project is preselected; you still click **Continue**.
-5. **Let Home Assistant accept connections through Datum.** Home Assistant
-   rejects requests that arrive through a proxy it does not trust, and every
-   request through the tunnel does: without this step the public address
-   returns `400: Bad Request`. Once connected, the Datum Connect page shows
-   the step: "Let Home Assistant accept connections through Datum: turns on
-   X-Forwarded-For and adds 127.0.0.1 and ::1 as trusted proxies. Home
-   Assistant will restart." Click **Allow**. The add-on changes only those
-   two settings and keeps every other network setting as it is. Home
-   Assistant restarts (the page goes blank for a minute or two and comes
-   back by itself); the add-on then sends a request the way Datum does, and
-   only confirms the change once Home Assistant accepts it. If that check
-   fails, the change is not confirmed and Home Assistant goes back to the
-   previous setting by itself within 5 minutes. The page then says
-   `Home Assistant accepts connections through Datum ✓`.
+5. **Last step: let Home Assistant accept connections through Datum.**
+   Home Assistant rejects requests that arrive through a proxy it does not
+   trust, and every request through the tunnel does: until this is done,
+   the public address returns `400: Bad Request`. The page asks right after
+   the key is saved: "Last step: let Home Assistant accept connections
+   through Datum. This turns on 'Trust X-Forwarded-For' and adds 127.0.0.1
+   and ::1 as trusted proxies, so Home Assistant still sees each visitor's
+   real address. Home Assistant will restart." Click **Allow**. The add-on
+   changes only those two settings and keeps every other network setting
+   as it is. Home Assistant restarts: inside Home Assistant the page goes
+   blank or says `Home Assistant is restarting with the new setting…` for a
+   minute or two, and comes back by itself. The add-on then sends a request
+   the way Datum does, and only confirms the change once Home Assistant
+   accepts it. The page then says `Done ✓`. The tunnel is already running
+   meanwhile; it starts whether or not you answer.
 
-   If someone has a change to these settings waiting for confirmation, the
-   page leaves it alone and asks you to finish it in **Settings → System →
-   Network** first.
+   If the check fails, the change is not confirmed and Home Assistant goes
+   back to the previous setting by itself within 5 minutes. The page says
+   why and offers **Retry** or **Skip**. If someone has a change to these
+   settings waiting for confirmation, the page leaves it alone and asks you
+   to finish it in **Settings → System → Network** first. If Home Assistant
+   already trusts the add-on (set up by hand, or by an earlier version), the
+   page doesn't ask.
 
-   **Or by hand:** go to **Settings → System → Network**, turn on **Use
+   **Or by hand:** click **Skip: I'll set it up myself in Settings → System
+   → Network**. Then go to **Settings → System → Network**, turn on **Use
    X-Forwarded-For**, and add `127.0.0.1` and `::1` as trusted proxies. If
    Home Assistant asks you to confirm the change, confirm it, or it reverts
-   after a few minutes.
+   after a few minutes. Until then, the page's **Home Assistant proxy
+   settings** row warns `Not set up: your public address returns 400 Bad
+   Request until this is done`, with **Allow**.
 
    Don't use an `http:` block in `configuration.yaml` for this. Current Home
    Assistant ignores it once the setting has moved into its own storage, and
@@ -215,8 +224,9 @@ A paired one has it, through `editor`.
 
 Once connected, the page shows the tunnel at the top: its public address,
 whether it is online, its edge protection and request timeout (below). Below
-it are Home Assistant's trusted-proxy step (step 5 of "Installing"), older
-tunnels, the project, and the service account the add-on runs on. It
+it are Home Assistant's proxy settings (step 5 of "Installing", which comes
+first until it is done or skipped), older tunnels, the project, and the
+service account the add-on runs on. It
 refreshes by itself. The note that a new address can take 10-20 minutes is
 only shown for a tunnel created less than half an hour ago.
 
@@ -346,7 +356,8 @@ independently.
 add-on's Info tab, or click **Open Web UI** there.
 
 **The page says "Waiting for the add-on…".** The add-on is starting,
-restarting, or stopped. Check that it is running, and its Log tab. If the log
+restarting, or stopped, or Home Assistant itself is restarting (the page
+reaches you through Home Assistant). It comes back by itself. Check that it is running, and its Log tab. If the log
 says `cannot serve the Datum Connect page`, the add-on pairs from the log
 and notification instead, as before 0.3.0.
 
@@ -411,15 +422,17 @@ your network shows it: no port in the address means port 80. After changing
 pointed at.
 
 **The public address returns `400: Bad Request`.** Home Assistant doesn't
-trust the proxy yet. Click **Allow** on the Datum Connect page, or see step 5
-of "Installing". The log says so at every start while it is missing:
+trust the proxy yet: the last step of setting up was skipped or did not
+finish. Click **Allow** on the Datum Connect page (under **Home Assistant
+proxy settings**), or see step 5 of "Installing". The log says so at every
+start while it is missing:
 `Home Assistant does not accept connections through Datum yet`.
 
 **Allow says "still got 400: Bad Request" or "did not come back with the new
 setting".** The change was not confirmed, and Home Assistant goes back to
 the previous setting by itself within 5 minutes; nothing else changed. Click
-**Try again** once Home Assistant is back, or set it by hand (step 5 of
-"Installing"). If the page says a change is waiting for confirmation, finish
+**Retry** (or **Try again**) once Home Assistant is back, or set it by hand
+(step 5 of "Installing"). If the page says a change is waiting for confirmation, finish
 or discard it in **Settings → System → Network** first.
 
 **The log says "Re-using tunnel ... from an earlier install: its connector was

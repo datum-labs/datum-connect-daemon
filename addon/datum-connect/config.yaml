@@ -3,7 +3,7 @@
 # Reaches this Home Assistant from anywhere through a Datum tunnel, with no
 # inbound ports opened on the router.
 name: Datum Connect
-version: "0.3.3"
+version: "0.3.4"
 slug: datum_connect
 description: >-
   Reach this Home Assistant from anywhere over a Datum tunnel, with no inbound
@@ -82,7 +82,7 @@ hassio_api: true
 # Supervisor's /core/api proxy, which only lets through add-ons with this
 # set; hassio_api does not cover it. Reading the saved options while pairing
 # waits for a project (/addons/self/options/config) needs neither.
-# The page's Allow (trusted proxies) needs it too: it uses Core's websocket
+# The page's Allow (trusted proxies, the last step of setup) needs it too: it uses Core's websocket
 # API (http/config, http/config/configure, http/config/promote, all
 # admin-only) through the Supervisor's /core/websocket, which relays as the
 # Supervisor's own admin user. See connect-lib's datum_cloud/ha_core.rs.
