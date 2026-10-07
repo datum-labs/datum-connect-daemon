@@ -53,6 +53,9 @@ postcard = "1"
 ring = "0.17"
 
 [dev-dependencies]
+# kube's client needs a crypto provider even for the plain-HTTP fake API
+# server in test_util. Already in the tree, with ring, through the daemon.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 uuid = { version = "1", features = ["v4"] }
 # Generates throwaway RSA keys for the service account tests, which ring
 # cannot do. Already in the tree through rustls.

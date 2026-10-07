@@ -244,6 +244,7 @@ mod tests {
             connector_ready: ready,
             connector_name: None,
             connector_device: None,
+            created_at: None,
         }
     }
 
