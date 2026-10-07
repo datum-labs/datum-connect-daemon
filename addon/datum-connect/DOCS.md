@@ -323,9 +323,12 @@ Supervisor connects from an unusual address on this system. If the page
 itself does not load, report the address the log names.
 
 **Datum's approval page says "Something went wrong. Please try again."** The
-sign-in failed on Datum's side. Click **Get a new code** next to the code
-on the Datum Connect page (0.3.1 and later), then approve the new code right
-away.
+usual cause is a stale Datum sign-in in that browser: Authorize fails even
+with a fresh code. Open the link in a private window or another browser, sign
+in to Datum there, and click Authorize. Signing out of auth.datum.net in your
+usual browser fixes it for next time. If the code has expired in the
+meantime, click **Get a new code** on the Datum Connect page (0.3.1 and
+later).
 
 **The page says "This page is out of date".** The add-on restarted since the
 page was opened. Reload the page.
