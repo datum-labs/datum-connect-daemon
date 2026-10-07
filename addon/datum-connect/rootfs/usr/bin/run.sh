@@ -229,6 +229,17 @@ if bashio::var.is_empty "${LABEL}" || [ "${LABEL}" = "null" ]; then
     LABEL="home-assistant"
 fi
 
+# The add-on owns exactly one tunnel: the first with this label, as found
+# below. Changing the label makes a new tunnel, and without this the daemon
+# would also bring the old one back on every start (its target and key are
+# still in /data/connect) and resume it, so both stayed publicly online. With
+# it, the daemon stops any other tunnel it has local state for, never
+# resumes it, and the Datum Connect page offers to remove it. Tunnels it has
+# no local state for (another machine in a shared project) are left alone.
+# Passed to the daemon rather than handled here, because the daemon resumes
+# tunnels before its API answers.
+export DATUM_TUNNEL_EXCLUSIVE_LABEL="${LABEL}"
+
 # No target set means "this Home Assistant". Ask the Supervisor which port it
 # serves on rather than assuming 8123: the first real install was on port 80,
 # and the hard-coded default produced a 502 at the public hostname.
@@ -351,9 +362,9 @@ else
     # With no key here, this tunnel came from an earlier install (an uninstall
     # wipes /data), so the start below has to give it a new key and a new
     # connector. Checked now because the start writes the new key. A tunnel
-    # adopted this way has been seen to stay "Service offline" while a fresh
-    # one worked, which looks like a platform issue; the warning after the
-    # start says what to do about it.
+    # adopted this way can show "Service offline" for a few minutes; on a
+    # real device it came back within about 4 minutes. The line after the
+    # start says what to do if it doesn't.
     if [ ! -s "${CONNECT_DIR}/${PROJECT}/${TUNNEL_ID}/listen_key" ]; then
         CONNECTOR_REPLACED=true
     fi
@@ -379,7 +390,8 @@ if [ -n "${HOSTNAME}" ]; then
     if [ "${TUNNEL_CREATED:-false}" = true ]; then
         # Seen on a real install: a brand-new address gave Firefox a 503
         # and Chrome "Unable to connect" for 15-20 minutes, while plain
-        # HTTP/1.1 worked after about 8.
+        # HTTP/1.1 worked after about 8. Only said when the tunnel was just
+        # created: a reused one's address is not new.
         bashio::log.info "Home Assistant is reachable at https://${HOSTNAME} (a new address can take up to 20 minutes to work everywhere)"
     else
         bashio::log.info "Home Assistant is reachable at https://${HOSTNAME}"
@@ -389,7 +401,7 @@ else
 fi
 
 if [ "${CONNECTOR_REPLACED:-false}" = true ]; then
-    bashio::log.warning "Re-using tunnel '${LABEL}' (${TUNNEL_ID}) from an earlier install: its connector had to be replaced. If https://${HOSTNAME:-<its hostname>} shows 'Service offline', set a new 'tunnel_label' on the Configuration tab and restart."
+    bashio::log.info "Re-using tunnel '${LABEL}' (${TUNNEL_ID}) from an earlier install: its connector was replaced, so https://${HOSTNAME:-<its hostname>} may show 'Service offline' for a few minutes. If it's still offline after 20 minutes, restart the add-on; if that doesn't help, set a new 'tunnel_label'."
 fi
 
 # Surface the daemon's exit status as the container's.

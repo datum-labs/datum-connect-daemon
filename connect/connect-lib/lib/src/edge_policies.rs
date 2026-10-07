@@ -28,7 +28,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, PostParams};
+use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, GroupVersionKind, PostParams};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
@@ -417,6 +417,83 @@ async fn ensure_waf(client: &kube::Client, t: &EdgeTarget, proxy_has_protected_r
     }
 }
 
+// ---- Removing them with their tunnel ----
+
+/// What removing a tunnel did to its edge policies.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct EdgePolicyRemoval {
+    /// `<id>-waf`, deleted: it carried [`MANAGED_BY_ANNOTATION`].
+    pub waf_deleted: Option<String>,
+    /// `<id>-waf`, kept: it did not, so someone else made it, and only they
+    /// know whether it still has a use.
+    pub waf_kept: Option<String>,
+    /// `<id>-timeout`, deleted. Named after the tunnel, it targets only the
+    /// tunnel's route, so it has no use once that is gone.
+    pub timeout_deleted: Option<String>,
+}
+
+/// Deletes a tunnel's edge policies, for removing the tunnel: the WAF only
+/// if this code made it, the request timeout always. Run it before the
+/// tunnel's HTTPProxy is deleted, so that a failure here leaves the tunnel
+/// listed, and removing it can be tried again.
+///
+/// A refusal (401/403) is not an error: the caller may not have made them
+/// either, and failing every delete over a policy that cannot be touched
+/// would leave the tunnel undeletable. It is logged, and the policy kept.
+pub async fn delete_edge_policies(client: &kube::Client, tunnel_id: &str) -> Result<EdgePolicyRemoval, String> {
+    let mut out = EdgePolicyRemoval::default();
+
+    let waf: Api<DynamicObject> = Api::namespaced_with(client.clone(), DEFAULT_PCP_NAMESPACE, &waf_resource());
+    let name = waf_policy_name(tunnel_id);
+    match call(waf.get_opt(&name)).await {
+        Ok(Some(policy)) => {
+            let as_json = serde_json::to_value(&policy).unwrap_or_default();
+            if has_managed_by(&as_json) {
+                if delete_policy(&waf, &name).await? {
+                    out.waf_deleted = Some(name);
+                }
+            } else {
+                info!("Kept WAF policy {name}: it was not set up by this add-on. Delete it in the Datum portal if it has no other use.");
+                out.waf_kept = Some(name);
+            }
+        }
+        Ok(None) => {}
+        Err(e) if is_denied(&e) => warn!("Could not check WAF policy {name}, so it was kept ({e})"),
+        Err(e) => return Err(format!("could not check WAF policy {name} ({e})")),
+    }
+
+    let timeout: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), DEFAULT_PCP_NAMESPACE, &timeout_resource());
+    let name = timeout_policy_name(tunnel_id);
+    match call(timeout.get_opt(&name)).await {
+        Ok(Some(_)) => {
+            if delete_policy(&timeout, &name).await? {
+                out.timeout_deleted = Some(name);
+            }
+        }
+        Ok(None) => {}
+        Err(e) if is_denied(&e) => warn!("Could not check request timeout policy {name}, so it was kept ({e})"),
+        Err(e) => return Err(format!("could not check request timeout policy {name} ({e})")),
+    }
+    Ok(out)
+}
+
+/// True if deleted, false if it was gone already or deleting it was refused.
+async fn delete_policy(api: &Api<DynamicObject>, name: &str) -> Result<bool, String> {
+    match call(api.delete(name, &DeleteParams::default())).await {
+        Ok(_) => {
+            info!("Deleted policy {name}");
+            Ok(true)
+        }
+        Err(CallError::Status(404, _)) => Ok(false),
+        Err(e) if is_denied(&e) => {
+            warn!("Could not delete policy {name}, so it was kept ({e})");
+            Ok(false)
+        }
+        Err(e) => Err(format!("could not delete policy {name} ({e})")),
+    }
+}
+
 // ---- Reading them back, for the add-on's status page ----
 
 /// One tunnel's edge policies as they are now, for a person to read.
@@ -760,5 +837,103 @@ mod tests {
         assert!(is_denied(&e));
         assert!(!is_denied(&CallError::Status(500, String::new())));
         assert!(!is_denied(&CallError::NoResponse("connect refused".into())));
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+    use crate::test_util::{FakeKube, serve_fake_kube};
+
+    const TUNNEL: &str = "tunnel-old12";
+
+    fn waf(managed: bool) -> Value {
+        let mut annotations = json!({DISPLAY_NAME_ANNOTATION: "home-assistant"});
+        if managed {
+            annotations[MANAGED_BY_ANNOTATION] = json!(MANAGED_BY_VALUE);
+        }
+        json!({
+            "apiVersion": "networking.datumapis.com/v1alpha",
+            "kind": "TrafficProtectionPolicy",
+            "metadata": {"name": waf_policy_name(TUNNEL), "namespace": "default", "annotations": annotations},
+            "spec": desired_waf_spec(TUNNEL),
+        })
+    }
+
+    fn timeout() -> Value {
+        json!({
+            "apiVersion": "gateway.envoyproxy.io/v1alpha1",
+            "kind": "BackendTrafficPolicy",
+            "metadata": {"name": timeout_policy_name(TUNNEL), "namespace": "default"},
+            "spec": desired_timeout_spec(TUNNEL),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_managed_waf_and_the_timeout_are_deleted() {
+        let mut fake = FakeKube::new();
+        fake.put("trafficprotectionpolicies", waf(true));
+        fake.put("backendtrafficpolicies", timeout());
+        let (client, fake) = serve_fake_kube(fake).await;
+        let out = delete_edge_policies(&client, TUNNEL).await.unwrap();
+        assert_eq!(
+            out,
+            EdgePolicyRemoval {
+                waf_deleted: Some("tunnel-old12-waf".into()),
+                waf_kept: None,
+                timeout_deleted: Some("tunnel-old12-timeout".into()),
+            }
+        );
+        let fake = fake.lock().unwrap();
+        assert!(!fake.has("trafficprotectionpolicies", "tunnel-old12-waf"));
+        assert!(!fake.has("backendtrafficpolicies", "tunnel-old12-timeout"));
+    }
+
+    /// A WAF without the add-on's annotation was made by someone else, in
+    /// the portal or by hand: it is never deleted.
+    #[tokio::test]
+    async fn a_waf_without_the_annotation_is_kept() {
+        let mut fake = FakeKube::new();
+        fake.put("trafficprotectionpolicies", waf(false));
+        fake.put("backendtrafficpolicies", timeout());
+        let (client, fake) = serve_fake_kube(fake).await;
+        let out = delete_edge_policies(&client, TUNNEL).await.unwrap();
+        assert_eq!(out.waf_deleted, None);
+        assert_eq!(out.waf_kept.as_deref(), Some("tunnel-old12-waf"));
+        assert_eq!(out.timeout_deleted.as_deref(), Some("tunnel-old12-timeout"));
+        let fake = fake.lock().unwrap();
+        assert!(fake.has("trafficprotectionpolicies", "tunnel-old12-waf"));
+        assert_eq!(fake.deleted(), ["tunnel-old12-timeout"], "only the timeout");
+    }
+
+    #[tokio::test]
+    async fn missing_policies_are_nothing_to_do() {
+        let (client, fake) = serve_fake_kube(FakeKube::new()).await;
+        assert_eq!(delete_edge_policies(&client, TUNNEL).await.unwrap(), EdgePolicyRemoval::default());
+        assert!(fake.lock().unwrap().deleted().is_empty());
+    }
+
+    /// A server error stops the removal before the tunnel itself goes, so it
+    /// can be retried; a refusal does not.
+    #[tokio::test]
+    async fn a_server_error_fails_and_a_refusal_does_not() {
+        let mut fake = FakeKube::new();
+        fake.put("trafficprotectionpolicies", waf(true));
+        fake.fail.insert(
+            "/apis/networking.datumapis.com/v1alpha/namespaces/default/trafficprotectionpolicies/tunnel-old12-waf".into(),
+            503,
+        );
+        let (client, _fake) = serve_fake_kube(fake).await;
+        let err = delete_edge_policies(&client, TUNNEL).await.unwrap_err();
+        assert!(err.contains("tunnel-old12-waf") && err.contains("503"), "{err}");
+
+        let mut fake = FakeKube::new();
+        fake.put("backendtrafficpolicies", timeout());
+        fake.fail.insert(
+            "/apis/gateway.envoyproxy.io/v1alpha1/namespaces/default/backendtrafficpolicies/tunnel-old12-timeout".into(),
+            403,
+        );
+        let (client, _fake) = serve_fake_kube(fake).await;
+        assert_eq!(delete_edge_policies(&client, TUNNEL).await.unwrap(), EdgePolicyRemoval::default());
     }
 }

@@ -5,7 +5,9 @@
 //! it with a [`SetupController`]: the "Connect to Datum" button, the code,
 //! the project list, progress. Once paired, the daemon serves it with
 //! [`PairedView`]: the public address, the project, the service account,
-//! the tunnel and its edge policies, and Re-pair and Unpair. The page
+//! the tunnel and its edge policies, older tunnels from this Home Assistant
+//! with Remove, Home Assistant's trusted-proxy step with Allow, and Re-pair
+//! and Unpair. The page
 //! itself (`daemon/ingress/`) is the same, and reloads when the mode
 //! changes under it.
 //!
@@ -67,6 +69,13 @@ pub(crate) trait PairedView: Send + Sync {
     /// Forgets the paired key and restarts the add-on; `unpair` also stops
     /// the tunnel first.
     fn forget(&self, unpair: bool) -> BoxFuture<'_, Result<ForgetOutcome, ActionError>>;
+    /// Removes an older tunnel from this Home Assistant, in Datum and here.
+    /// Refuses any other tunnel.
+    fn remove(&self, id: String) -> BoxFuture<'_, Result<RemoveOutcome, ActionError>>;
+    /// Starts letting Home Assistant accept connections through Datum (see
+    /// `connect_lib::datum_cloud::ha_core`). Returns once started; the
+    /// status shows how it goes.
+    fn allow_proxies(&self) -> BoxFuture<'_, Result<(), ActionError>>;
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -76,7 +85,15 @@ pub(crate) struct PairedStatus {
     /// `paired` (made by pairing, so Re-pair and Unpair work) or
     /// `provided` (pasted or placed by hand).
     pub key_source: &'static str,
+    /// The add-on's tunnel (with several only outside the add-on, where no
+    /// tunnel is singled out).
     pub tunnels: Vec<TunnelView>,
+    /// Other tunnels this Home Assistant has local state for: stopped, and
+    /// offered for removal.
+    pub older: Vec<TunnelView>,
+    /// Whether Home Assistant accepts connections through Datum. `None`
+    /// without a Supervisor to ask.
+    pub trusted_proxies: Option<ProxyStepView>,
     pub can_forget: bool,
     /// Why Re-pair and Unpair are off, when they are.
     pub why_not: Option<String>,
@@ -94,6 +111,26 @@ pub(crate) struct TunnelView {
     pub state: &'static str,
     pub edge: Option<connect_lib::edge_policies::EdgePolicyStatus>,
     pub portal_url: Option<String>,
+    /// Created less than half an hour ago: its address may not work in
+    /// every browser yet.
+    pub new_address: bool,
+}
+
+/// Home Assistant's trusted-proxy step, as the page shows it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct ProxyStepView {
+    /// `ok`, `needed` (Allow), `pending` (someone else's change waits),
+    /// `working` (Allow is running), `failed` (the last Allow did not
+    /// finish; Allow again), or `unknown` (Home Assistant could not be
+    /// asked).
+    pub state: &'static str,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct RemoveOutcome {
+    pub id: String,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -150,6 +187,8 @@ pub(crate) fn router(backend: Backend, allowed: Vec<IpAddr>) -> Router {
         .route("/api/project", post(choose_project))
         .route("/api/repair", post(repair))
         .route("/api/unpair", post(unpair))
+        .route("/api/remove-tunnel", post(remove_tunnel))
+        .route("/api/allow-proxies", post(allow_proxies))
         .layer(middleware::from_fn_with_state(state.clone(), csrf_check))
         .layer(middleware::from_fn_with_state(state.clone(), peer_check))
         .layer(middleware::map_response(harden))
@@ -422,6 +461,31 @@ async fn unpair(State(state): State<Arc<Ingress>>) -> Response {
     forget(&state, true).await
 }
 
+#[derive(Deserialize)]
+struct RemoveBody {
+    id: String,
+}
+
+async fn remove_tunnel(State(state): State<Arc<Ingress>>, Json(body): Json<RemoveBody>) -> Response {
+    let Backend::Paired(view) = &state.backend else {
+        return wrong_mode(&state);
+    };
+    match view.remove(body.id).await {
+        Ok(outcome) => Json(outcome).into_response(),
+        Err(e) => (e.status, Json(json!({"error": "action", "message": e.message}))).into_response(),
+    }
+}
+
+async fn allow_proxies(State(state): State<Arc<Ingress>>) -> Response {
+    let Backend::Paired(view) = &state.backend else {
+        return wrong_mode(&state);
+    };
+    match view.allow_proxies().await {
+        Ok(()) => Json(state_body(&state).await).into_response(),
+        Err(e) => (e.status, Json(json!({"error": "action", "message": e.message}))).into_response(),
+    }
+}
+
 async fn forget(state: &Ingress, unpair: bool) -> Response {
     let Backend::Paired(view) = &state.backend else {
         return wrong_mode(state);
@@ -443,6 +507,8 @@ mod tests {
 
     struct FakePaired {
         forgets: std::sync::Mutex<Vec<bool>>,
+        removes: std::sync::Mutex<Vec<String>>,
+        allows: std::sync::Mutex<u32>,
     }
 
     impl PairedView for FakePaired {
@@ -459,7 +525,18 @@ mod tests {
                         state: "online",
                         edge: None,
                         portal_url: None,
+                        new_address: false,
                     }],
+                    older: vec![TunnelView {
+                        id: "t0".into(),
+                        label: "ha-old".into(),
+                        address: Some("https://old.datumproxy.net".into()),
+                        state: "off",
+                        edge: None,
+                        portal_url: None,
+                        new_address: false,
+                    }],
+                    trusted_proxies: Some(ProxyStepView { state: "needed", message: None }),
                     can_forget: true,
                     why_not: None,
                     error: None,
@@ -469,6 +546,20 @@ mod tests {
         fn forget(&self, unpair: bool) -> BoxFuture<'_, Result<ForgetOutcome, ActionError>> {
             self.forgets.lock().unwrap().push(unpair);
             Box::pin(async { Ok(ForgetOutcome { restarting: true, service_account: Some("sa@x".into()) }) })
+        }
+        fn remove(&self, id: String) -> BoxFuture<'_, Result<RemoveOutcome, ActionError>> {
+            self.removes.lock().unwrap().push(id.clone());
+            Box::pin(async move {
+                if id == "t0" {
+                    Ok(RemoveOutcome { id, label: "ha-old".into() })
+                } else {
+                    Err(ActionError { status: StatusCode::CONFLICT, message: "not an older tunnel".into() })
+                }
+            })
+        }
+        fn allow_proxies(&self) -> BoxFuture<'_, Result<(), ActionError>> {
+            *self.allows.lock().unwrap() += 1;
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -480,7 +571,7 @@ mod tests {
     }
 
     fn paired_backend() -> (Backend, Arc<FakePaired>) {
-        let fake = Arc::new(FakePaired { forgets: Default::default() });
+        let fake = Arc::new(FakePaired { forgets: Default::default(), removes: Default::default(), allows: Default::default() });
         (Backend::Paired(fake.clone()), fake)
     }
 
@@ -703,6 +794,87 @@ mod tests {
         let (status, _, _) = send(&app, post_json("/api/unpair", Some(&token)).body(Body::from("{}")).unwrap()).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(*fake.forgets.lock().unwrap(), [false, true]);
+    }
+
+    /// Remove and Allow change things in Datum and in Home Assistant, so
+    /// they get the same gate as every other POST: only the Supervisor, and
+    /// only with the page's token and a same-origin request.
+    #[tokio::test]
+    async fn remove_and_allow_need_the_supervisor_and_the_page_token() {
+        let (backend, fake) = paired_backend();
+        let app = app(backend);
+        let (_, token) = page(&app).await;
+        let bodies = [("/api/remove-tunnel", r#"{"id":"t0"}"#), ("/api/allow-proxies", "{}")];
+
+        for (path, body) in bodies {
+            for from in ["172.30.33.5", "192.168.1.20", "127.0.0.1"] {
+                let req = request(Method::POST, path, from)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::HOST, "homeassistant.local:8123")
+                    .header(CSRF_HEADER, &token);
+                let (status, _, reply) = send(&app, req.body(Body::from(body)).unwrap()).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{path} from {from}");
+                assert!(reply.contains("\"forbidden\""), "{path} {from}: {reply}");
+            }
+            let refused: Vec<(&str, axum::http::request::Builder)> = vec![
+                ("no token", post_json(path, None)),
+                ("wrong token", post_json(path, Some(&"0".repeat(64)))),
+                ("cross-site origin", post_json(path, Some(&token)).header(header::ORIGIN, "https://evil.example")),
+                ("cross-site fetch", post_json(path, Some(&token)).header("sec-fetch-site", "cross-site")),
+            ];
+            for (what, builder) in refused {
+                let (status, _, reply) = send(&app, builder.body(Body::from(body)).unwrap()).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {what}");
+                assert!(reply.contains("\"csrf\""), "{path} {what}: {reply}");
+            }
+        }
+        assert!(fake.removes.lock().unwrap().is_empty(), "refused before acting");
+        assert_eq!(*fake.allows.lock().unwrap(), 0, "refused before acting");
+
+        let ok = post_json("/api/remove-tunnel", Some(&token)).header(header::ORIGIN, "http://homeassistant.local:8123");
+        let (status, _, reply) = send(&app, ok.body(Body::from(r#"{"id":"t0"}"#)).unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&reply).unwrap()["label"], "ha-old");
+        // The view decides what may go; its refusal is passed on.
+        let (status, _, reply) =
+            send(&app, post_json("/api/remove-tunnel", Some(&token)).body(Body::from(r#"{"id":"t1"}"#)).unwrap()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{reply}");
+        assert!(reply.contains("not an older tunnel"));
+        assert_eq!(*fake.removes.lock().unwrap(), ["t0", "t1"]);
+        // A body without an id is refused before the view sees it.
+        let (status, _, _) = send(&app, post_json("/api/remove-tunnel", Some(&token)).body(Body::from("{}")).unwrap()).await;
+        assert!(status.is_client_error());
+        assert_eq!(fake.removes.lock().unwrap().len(), 2);
+
+        let (status, _, reply) = send(&app, post_json("/api/allow-proxies", Some(&token)).body(Body::from("{}")).unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&reply).unwrap()["mode"], "paired");
+        assert_eq!(*fake.allows.lock().unwrap(), 1);
+
+        // Not setup actions.
+        let app = self::app(setup_backend());
+        let (_, token) = page(&app).await;
+        for (path, body) in bodies {
+            let (status, _, _) = send(&app, post_json(path, Some(&token)).body(Body::from(body)).unwrap()).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{path}");
+        }
+    }
+
+    /// What the page gets: the tunnels, older ones and the proxy step, and
+    /// nothing secret.
+    #[tokio::test]
+    async fn paired_state_carries_older_tunnels_and_the_proxy_step() {
+        let (backend, _) = paired_backend();
+        let app = app(backend);
+        let (status, _, body) = send(&app, request(Method::GET, "/api/state", SUPERVISOR).body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["paired"]["older"][0]["id"], "t0");
+        assert_eq!(v["paired"]["tunnels"][0]["new_address"], false);
+        assert_eq!(v["paired"]["trusted_proxies"]["state"], "needed");
+        for secret in ["token", "SUPERVISOR", "private_key", "Bearer"] {
+            assert!(!body.contains(secret), "{secret} in {body}");
+        }
     }
 
     #[tokio::test]

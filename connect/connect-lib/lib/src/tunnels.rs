@@ -64,6 +64,10 @@ pub struct TunnelSummary {
     pub connector_name: Option<String>,
     /// Device name from the Connector's `datum.net/device-name` annotation.
     pub connector_device: Option<String>,
+    /// When the tunnel's HTTPProxy was created (RFC 3339), if the server
+    /// said. A brand-new public address takes a while to work everywhere;
+    /// see [`TunnelSummary::created_within`].
+    pub created_at: Option<String>,
 }
 
 /// A Connector that exists in the project but is not referenced by any tunnel.
@@ -84,6 +88,29 @@ impl TunnelSummary {
             .ok()
             .map(Authority::from)
     }
+
+    /// Whether the tunnel was created less than `age` before `now`. False
+    /// when the creation time is unknown or unreadable: "this address is
+    /// new, give it time" is only worth saying when it is known to be true.
+    pub fn created_within(&self, age: std::time::Duration, now: std::time::SystemTime) -> bool {
+        let Some(created) = self
+            .created_at
+            .as_deref()
+            .and_then(|c| chrono::DateTime::parse_from_rfc3339(c).ok())
+        else {
+            return false;
+        };
+        let now: chrono::DateTime<chrono::Utc> = now.into();
+        let elapsed = now.signed_duration_since(created);
+        // A clock behind the server's makes a just-created tunnel look as if
+        // it were created in the future; that is still new.
+        elapsed < chrono::Duration::from_std(age).unwrap_or(chrono::Duration::MAX)
+    }
+}
+
+/// The HTTPProxy's `creationTimestamp`, as RFC 3339.
+fn proxy_created_at(proxy: &HTTPProxy) -> Option<String> {
+    proxy.metadata.creation_timestamp.as_ref().map(|t| t.0.to_rfc3339())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,6 +120,11 @@ pub struct TunnelDeleteOutcome {
     pub connector_ad: Option<String>,
     pub traffic_protection_policy: Option<String>,
     pub connector: Option<String>,
+    /// `<id>-waf`, if it was the add-on's own (see
+    /// [`edge_policies::delete_edge_policies`]).
+    pub waf_policy: Option<String>,
+    /// `<id>-timeout`.
+    pub timeout_policy: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -773,6 +805,7 @@ impl TunnelService {
                 connector_device: connector_name
                     .as_deref()
                     .and_then(|cn| connector_device_by_name.get(cn).cloned()),
+                created_at: proxy_created_at(&proxy),
             });
         }
 
@@ -1026,6 +1059,7 @@ impl TunnelService {
             connector_ready: false,
             connector_name: Some(connector_name.clone()),
             connector_device: Some(friendly_device_name()),
+            created_at: proxy_created_at(&proxy),
         })
     }
 
@@ -1142,6 +1176,7 @@ impl TunnelService {
             connector_ready: false,
             connector_name,
             connector_device: None,
+            created_at: proxy_created_at(&existing),
         };
 
         if !self.publish_tickets
@@ -1243,6 +1278,7 @@ impl TunnelService {
             connector_ready: false,
             connector_name: proxy_connector_name(&existing),
             connector_device: None,
+            created_at: proxy_created_at(&existing),
         };
 
         // Same local bookkeeping as `update_project`.
@@ -1394,6 +1430,7 @@ impl TunnelService {
             connector_ready: false,
             connector_name,
             connector_device: None,
+            created_at: proxy_created_at(&proxy),
         };
 
         if !self.publish_tickets
@@ -1421,7 +1458,6 @@ impl TunnelService {
         let proxies: Api<HTTPProxy> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
         let ads: Api<ConnectorAdvertisement> =
             Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
-        let connectors: Api<Connector> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
 
         let existing_proxy = proxies
             .get_opt(tunnel_id)
@@ -1436,6 +1472,13 @@ impl TunnelService {
             Some(name) => Some(name),
             None => self.find_connector(project_id).await?.map(|c| c.name_any()),
         };
+
+        // First, while the proxy still lists the tunnel: a failure here
+        // leaves it in place, so the delete can be retried. Left behind,
+        // these would target a route that no longer exists.
+        let edge = edge_policies::delete_edge_policies(&client, tunnel_id)
+            .await
+            .map_err(|e| n0_error::anyerr!("Failed to delete the tunnel's edge policies: {e}"))?;
 
         let mut http_proxy_name: Option<String> = None;
         if existing_proxy.is_some() {
@@ -1483,52 +1526,10 @@ impl TunnelService {
             warn!(%tunnel_id, "Failed to remove proxy state: {err:#}");
         }
 
-        let mut connector_name_out: Option<String> = None;
-        if let Some(connector_name) = connector_name {
-            let remaining = proxies
-                .list(&ListParams::default())
-                .await
-                .std_context("Failed to list remaining HTTPProxy objects")?;
-            let mut remaining_for_connector = remaining
-                .items
-                .into_iter()
-                .filter(|proxy| {
-                    // Skip proxies already marked for deletion — the API
-                    // server returns them in list responses until
-                    // finalizers complete, but they won't keep using the
-                    // connector.
-                    proxy.metadata.deletion_timestamp.is_none()
-                        && proxy_connector_name(proxy).as_deref() == Some(connector_name.as_str())
-                })
-                .peekable();
-            if remaining_for_connector.peek().is_none() {
-                let ad_selector = format!("{ADVERTISEMENT_CONNECTOR_FIELD}={connector_name}");
-                let ads_list = ads
-                    .list(&ListParams::default().fields(&ad_selector))
-                    .await
-                    .std_context("Failed to list remaining ConnectorAdvertisements")?;
-                for ad in ads_list.items {
-                    if let Some(name) = ad.metadata.name.clone()
-                        && let Err(err) = ads.delete(&name, &DeleteParams::default()).await
-                    {
-                        warn!(%name, "Failed to delete connector advertisement: {err:#}");
-                    }
-                }
-
-                if connectors
-                    .get_opt(&connector_name)
-                    .await
-                    .std_context("Failed to load Connector")?
-                    .is_some()
-                {
-                    connectors
-                        .delete(&connector_name, &DeleteParams::default())
-                        .await
-                        .std_context("Failed to delete Connector")?;
-                    connector_name_out = Some(connector_name);
-                }
-            }
-        }
+        let connector_name_out = match connector_name {
+            Some(name) => delete_connector_if_unused(&client, &name).await?,
+            None => None,
+        };
 
         if let Err(err) = self.listen.repo().delete_tunnel_dir(project_id, tunnel_id).await {
             warn!(%tunnel_id, "Failed to delete tunnel local state: {err:#}");
@@ -1540,6 +1541,8 @@ impl TunnelService {
             connector_ad: connector_ad_name,
             traffic_protection_policy: tpp_name,
             connector: connector_name_out,
+            waf_policy: edge.waf_deleted,
+            timeout_policy: edge.timeout_deleted,
         })
     }
 
@@ -1681,6 +1684,61 @@ impl TunnelService {
 
         Ok(connector)
     }
+}
+
+/// Deletes `connector_name`, and the advertisements still pointing at it,
+/// unless another HTTPProxy still uses it: two tunnels on one device share
+/// one connector, and deleting one of them must not take the other offline.
+/// Call it once the deleted tunnel's own proxy is gone (or going). Returns
+/// the connector's name if it was deleted.
+async fn delete_connector_if_unused(client: &kube::Client, connector_name: &str) -> Result<Option<String>> {
+    let proxies: Api<HTTPProxy> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
+    let ads: Api<ConnectorAdvertisement> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
+    let connectors: Api<Connector> = Api::namespaced(client.clone(), DEFAULT_PCP_NAMESPACE);
+
+    let remaining = proxies
+        .list(&ListParams::default())
+        .await
+        .std_context("Failed to list remaining HTTPProxy objects")?;
+    let in_use = remaining.items.iter().any(|proxy| {
+        // Skip proxies already marked for deletion: the API server returns
+        // them in list responses until finalizers complete, but they won't
+        // keep using the connector.
+        proxy.metadata.deletion_timestamp.is_none()
+            && proxy_connector_name(proxy).as_deref() == Some(connector_name)
+    });
+    if in_use {
+        debug!(%connector_name, "connector still used by another tunnel, kept");
+        return Ok(None);
+    }
+
+    let ad_selector = format!("{ADVERTISEMENT_CONNECTOR_FIELD}={connector_name}");
+    let ads_list = ads
+        .list(&ListParams::default().fields(&ad_selector))
+        .await
+        .std_context("Failed to list remaining ConnectorAdvertisements")?;
+    // Checked here too, not left to the field selector alone.
+    for ad in ads_list.items.iter().filter(|ad| ad.spec.connector_ref.name == connector_name) {
+        if let Some(name) = ad.metadata.name.clone()
+            && let Err(err) = ads.delete(&name, &DeleteParams::default()).await
+        {
+            warn!(%name, "Failed to delete connector advertisement: {err:#}");
+        }
+    }
+
+    if connectors
+        .get_opt(connector_name)
+        .await
+        .std_context("Failed to load Connector")?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    connectors
+        .delete(connector_name, &DeleteParams::default())
+        .await
+        .std_context("Failed to delete Connector")?;
+    Ok(Some(connector_name.to_string()))
 }
 
 #[derive(Debug, Clone)]
@@ -2819,5 +2877,125 @@ mod tests {
         let mut unlabelled = proxy_with_backend("ha", EP, CONN);
         unlabelled.metadata.annotations = None;
         assert_eq!(proxy_label(&unlabelled, "tunnel-test"), "tunnel-test");
+    }
+
+    // ---- Removing a tunnel: the shared-connector guard ----
+
+    fn proxy_json(name: &str, connector: &str) -> serde_json::Value {
+        let mut p = proxy_with_backend("ha", EP, connector);
+        p.metadata.name = Some(name.into());
+        serde_json::to_value(p).unwrap()
+    }
+
+    fn connector_json(name: &str) -> serde_json::Value {
+        json!({
+            "apiVersion": "networking.datumapis.com/v1alpha1", "kind": "Connector",
+            "metadata": {"name": name}, "spec": {"connectorClassName": "iroh-quic-tunnel"},
+        })
+    }
+
+    fn ad_json(name: &str, connector: &str) -> serde_json::Value {
+        json!({
+            "apiVersion": "networking.datumapis.com/v1alpha1", "kind": "ConnectorAdvertisement",
+            "metadata": {"name": name}, "spec": {"connectorRef": {"name": connector}},
+        })
+    }
+
+    /// The old tunnel's connector goes with it, with whatever advertisement
+    /// still names it, but nothing that belongs to another connector.
+    #[tokio::test]
+    async fn an_unused_connector_is_deleted_with_its_advertisements() {
+        use crate::test_util::{FakeKube, serve_fake_kube};
+        let mut fake = FakeKube::new();
+        fake.put("httpproxies", proxy_json("tunnel-new", "datum-connect-new"));
+        fake.put("connectors", connector_json("datum-connect-old"));
+        fake.put("connectors", connector_json("datum-connect-new"));
+        fake.put("connectoradvertisements", ad_json("tunnel-stray", "datum-connect-old"));
+        fake.put("connectoradvertisements", ad_json("tunnel-new", "datum-connect-new"));
+        let (client, fake) = serve_fake_kube(fake).await;
+        let deleted = delete_connector_if_unused(&client, "datum-connect-old").await.unwrap();
+        assert_eq!(deleted.as_deref(), Some("datum-connect-old"));
+        let fake = fake.lock().unwrap();
+        assert!(!fake.has("connectors", "datum-connect-old"));
+        assert!(!fake.has("connectoradvertisements", "tunnel-stray"));
+        assert!(fake.has("connectors", "datum-connect-new"));
+        assert!(fake.has("connectoradvertisements", "tunnel-new"), "another connector's advertisement is kept");
+    }
+
+    /// Two tunnels on one device share its connector: removing the older
+    /// one must not take the active one offline.
+    #[tokio::test]
+    async fn a_connector_another_proxy_uses_is_kept() {
+        use crate::test_util::{FakeKube, serve_fake_kube};
+        let mut fake = FakeKube::new();
+        fake.put("httpproxies", proxy_json("tunnel-new", "datum-connect-shared"));
+        fake.put("connectors", connector_json("datum-connect-shared"));
+        fake.put("connectoradvertisements", ad_json("tunnel-new", "datum-connect-shared"));
+        let (client, fake) = serve_fake_kube(fake).await;
+        assert_eq!(delete_connector_if_unused(&client, "datum-connect-shared").await.unwrap(), None);
+        let fake = fake.lock().unwrap();
+        assert!(fake.deleted().is_empty(), "{:?}", fake.requests);
+        assert!(fake.has("connectors", "datum-connect-shared"));
+    }
+
+    /// A proxy that is already being deleted no longer counts as a user.
+    #[tokio::test]
+    async fn a_proxy_being_deleted_does_not_hold_the_connector() {
+        use crate::test_util::{FakeKube, serve_fake_kube};
+        let mut fake = FakeKube::new();
+        let mut going = proxy_json("tunnel-old", "datum-connect-old");
+        going["metadata"]["deletionTimestamp"] = json!("2026-10-07T10:00:00Z");
+        fake.put("httpproxies", going);
+        fake.put("connectors", connector_json("datum-connect-old"));
+        let (client, _fake) = serve_fake_kube(fake).await;
+        assert_eq!(
+            delete_connector_if_unused(&client, "datum-connect-old").await.unwrap().as_deref(),
+            Some("datum-connect-old")
+        );
+    }
+
+    // ---- The "new address" age rule ----
+
+    fn summary_created(created_at: Option<&str>) -> TunnelSummary {
+        TunnelSummary {
+            id: "tunnel-test".into(),
+            label: "ha".into(),
+            endpoint: EP.into(),
+            hostnames: vec![],
+            enabled: true,
+            accepted: true,
+            programmed: true,
+            connector_metadata_programmed: true,
+            connector_ready: true,
+            connector_name: None,
+            connector_device: None,
+            created_at: created_at.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn created_within_reads_the_proxys_creation_time() {
+        let now: std::time::SystemTime =
+            chrono::DateTime::parse_from_rfc3339("2026-10-07T12:00:00Z").unwrap().with_timezone(&chrono::Utc).into();
+        let half_hour = std::time::Duration::from_secs(30 * 60);
+        assert!(summary_created(Some("2026-10-07T11:45:00Z")).created_within(half_hour, now));
+        assert!(summary_created(Some("2026-10-07T11:30:01Z")).created_within(half_hour, now));
+        assert!(!summary_created(Some("2026-10-07T11:30:00Z")).created_within(half_hour, now));
+        assert!(!summary_created(Some("2026-10-01T09:00:00+00:00")).created_within(half_hour, now));
+        // Our clock behind the server's: still new.
+        assert!(summary_created(Some("2026-10-07T12:02:00Z")).created_within(half_hour, now));
+        // Unknown is not new.
+        assert!(!summary_created(None).created_within(half_hour, now));
+        assert!(!summary_created(Some("yesterday")).created_within(half_hour, now));
+    }
+
+    #[test]
+    fn created_at_comes_from_the_proxy() {
+        let mut p = proxy_with_backend("ha", EP, CONN);
+        assert_eq!(proxy_created_at(&p), None);
+        p.metadata.creation_timestamp = Some(Time(
+            chrono::DateTime::parse_from_rfc3339("2026-10-07T11:45:00Z").unwrap().with_timezone(&chrono::Utc),
+        ));
+        assert_eq!(proxy_created_at(&p).as_deref(), Some("2026-10-07T11:45:00+00:00"));
     }
 }
