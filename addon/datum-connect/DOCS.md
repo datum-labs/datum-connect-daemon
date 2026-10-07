@@ -322,6 +322,11 @@ Something other than the Supervisor tried to open the page, or the
 Supervisor connects from an unusual address on this system. If the page
 itself does not load, report the address the log names.
 
+**Datum's approval page says "Something went wrong. Please try again."** The
+sign-in failed on Datum's side. Click **Get a new code** next to the code
+on the Datum Connect page (0.3.1 and later), then approve the new code right
+away.
+
 **The page says "This page is out of date".** The add-on restarted since the
 page was opened. Reload the page.
 

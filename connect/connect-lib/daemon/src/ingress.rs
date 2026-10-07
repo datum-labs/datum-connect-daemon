@@ -44,7 +44,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use connect_lib::datum_cloud::ha_supervisor::Supervisor;
-use connect_lib::datum_cloud::pairing_setup::{ChooseError, SetupController, SetupStatus};
+use connect_lib::datum_cloud::pairing_setup::{ChooseError, RestartError, SetupController, SetupStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -146,6 +146,7 @@ pub(crate) fn router(backend: Backend, allowed: Vec<IpAddr>) -> Router {
         .route("/app.css", get(app_css))
         .route("/api/state", get(get_state))
         .route("/api/connect", post(connect))
+        .route("/api/new-code", post(new_code))
         .route("/api/project", post(choose_project))
         .route("/api/repair", post(repair))
         .route("/api/unpair", post(unpair))
@@ -373,6 +374,23 @@ async fn connect(State(state): State<Arc<Ingress>>) -> Response {
     };
     ctl.start();
     Json(state_body(&state).await).into_response()
+}
+
+/// "Get a new code": drops the code on the page and asks for another, for
+/// when Datum's approval page failed on it. Refused once approved.
+async fn new_code(State(state): State<Arc<Ingress>>) -> Response {
+    let Backend::Setup(ctl) = &state.backend else {
+        return wrong_mode(&state);
+    };
+    match ctl.restart() {
+        Ok(()) => Json(state_body(&state).await).into_response(),
+        Err(e) => {
+            let status = match e {
+                RestartError::Approved | RestartError::Done => StatusCode::CONFLICT,
+            };
+            (status, Json(json!({"error": "new_code", "message": e.to_string()}))).into_response()
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -607,6 +625,57 @@ mod tests {
         assert_eq!(v["setup"]["suggested"], "project-7r4rl");
         assert!(v.get("paired").is_none());
         let (status, _, _) = send(&app, post_json("/api/unpair", Some(&token)).body(Body::from("{}")).unwrap()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn new_code_needs_the_supervisor_and_the_page_token() {
+        // A run that does start dials only a closed loopback port, never
+        // Datum, and fails there.
+        let dir = std::env::temp_dir().join("ingress-test-new-code-unused");
+        let mut cfg = PairingConfig::from_env(None, dir.join("k.json"));
+        cfg.issuer = "http://127.0.0.1:9".into();
+        cfg.api_url = "http://127.0.0.1:9".into();
+        let app = app(Backend::Setup(SetupController::new(cfg, None, None)));
+        let (_, token) = page(&app).await;
+
+        for from in ["172.30.33.5", "192.168.1.20", "127.0.0.1"] {
+            let req = request(Method::POST, "/api/new-code", from)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::HOST, "homeassistant.local:8123")
+                .header(CSRF_HEADER, &token);
+            let (status, _, body) = send(&app, req.body(Body::from("{}")).unwrap()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{from}");
+            assert!(body.contains("\"forbidden\""), "{from}: {body}");
+        }
+        let refused: Vec<(&str, axum::http::request::Builder)> = vec![
+            ("no token", post_json("/api/new-code", None)),
+            ("wrong token", post_json("/api/new-code", Some(&"0".repeat(64)))),
+            ("cross-site origin", post_json("/api/new-code", Some(&token)).header(header::ORIGIN, "https://evil.example")),
+            ("cross-site fetch", post_json("/api/new-code", Some(&token)).header("sec-fetch-site", "cross-site")),
+        ];
+        for (what, builder) in refused {
+            let (status, _, body) = send(&app, builder.body(Body::from("{}")).unwrap()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{what}");
+            assert!(body.contains("\"csrf\""), "{what}: {body}");
+        }
+        let (_, _, body) = send(&app, request(Method::GET, "/api/state", SUPERVISOR).body(Body::empty()).unwrap()).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["setup"]["phase"], "idle", "nothing started by a refused request");
+
+        // With the token it goes through, and answers with the new state.
+        let ok = post_json("/api/new-code", Some(&token)).header(header::ORIGIN, "http://homeassistant.local:8123");
+        let (status, _, body) = send(&app, ok.body(Body::from("{}")).unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["mode"], "setup");
+        assert!(matches!(v["setup"]["phase"].as_str(), Some("starting" | "failed")), "{body}");
+
+        // Not a paired action.
+        let (backend, _) = paired_backend();
+        let paired = self::app(backend);
+        let (_, token) = page(&paired).await;
+        let (status, _, _) = send(&paired, post_json("/api/new-code", Some(&token)).body(Body::from("{}")).unwrap()).await;
         assert_eq!(status, StatusCode::CONFLICT);
     }
 
