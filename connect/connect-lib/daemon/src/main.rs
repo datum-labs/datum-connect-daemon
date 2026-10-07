@@ -1711,22 +1711,23 @@ async fn setup(
     cfg.session_file = session_file;
     cfg.max_wait = SETUP_MAX_WAIT;
     let fallback = options_source.resolve(supervisor.as_ref());
-    let panel = match &supervisor {
+    let slug = match &supervisor {
         Some(s) => match s.self_info().await {
-            Ok(info) => panel_path(&info.slug),
+            Ok(info) => Some(info.slug),
             Err(e) => {
-                tracing::warn!("setup: cannot ask the Supervisor for this add-on's slug, so the notification cannot link to the page: {e}");
+                tracing::warn!("setup: cannot ask the Supervisor for this add-on's slug, so the notification cannot link to the page, nor the page to the add-on's tabs: {e}");
                 None
             }
         },
         None => None,
     };
+    let panel = slug.as_deref().and_then(panel_path);
     let log = Arc::new(SetupLog {
         notifier: std::sync::Mutex::new(supervisor.clone().map(PairingNotifier::spawn)),
         panel: panel.clone(),
     });
     let ctl = SetupController::new(cfg, fallback, Some(log.clone()));
-    let server = ingress::serve_on(listener, ingress::router(ingress::Backend::Setup(ctl.clone()), allowed.clone()));
+    let server = ingress::serve_on(listener, ingress::router(ingress::Backend::Setup(ctl.clone()), allowed.clone(), slug.as_deref()));
     tracing::info!(%bind, port, ?allowed, "serving the Datum Connect page");
 
     let holder = match hold_port {
@@ -2101,13 +2102,24 @@ async fn run() -> n0_error::Result<()> {
         match ingress::resolve_addresses(&args.ingress_bind, &args.ingress_allow, supervisor.as_ref()).await {
             Ok((bind, allowed)) => match ingress::bind(bind, port).await {
                 Ok(listener) => {
+                    // For the page's links back to the add-on's tabs.
+                    let slug = match &supervisor {
+                        Some(s) => match s.self_info().await {
+                            Ok(info) => Some(info.slug),
+                            Err(e) => {
+                                tracing::warn!("cannot ask the Supervisor for this add-on's slug, so the page cannot link to the add-on's tabs: {e}");
+                                None
+                            }
+                        },
+                        None => None,
+                    };
                     let view = addon_page::DaemonPaired::new(
                         state.clone(),
                         std::env::var_os("DATUM_SA_KEY_FILE").map(std::path::PathBuf::from),
                         args.paired_key_file.clone(),
                         supervisor,
                     );
-                    let router = ingress::router(ingress::Backend::Paired(Arc::new(view)), allowed.clone());
+                    let router = ingress::router(ingress::Backend::Paired(Arc::new(view)), allowed.clone(), slug.as_deref());
                     // Detached: it serves for as long as the daemon runs.
                     drop(ingress::serve_on(listener, router));
                     tracing::info!(%bind, port, ?allowed, "serving the Datum Connect page");

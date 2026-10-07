@@ -370,8 +370,14 @@ fn nth_host(cidr: &str, n: u32) -> Option<IpAddr> {
 
 /// Where Home Assistant opens this add-on's page: see the module docs.
 pub fn panel_path(slug: &str) -> Option<String> {
+    valid_slug(slug).map(|slug| format!("/app/{slug}"))
+}
+
+/// `slug`, if it is one the Supervisor could have given (letters, digits,
+/// `_` and `-`), and so safe to put in a Home Assistant path or a link.
+pub fn valid_slug(slug: &str) -> Option<&str> {
     let ok = !slug.is_empty() && slug.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'));
-    ok.then(|| format!("/app/{slug}"))
+    ok.then_some(slug)
 }
 
 /// `options.project`, normalised, with empty meaning unset.

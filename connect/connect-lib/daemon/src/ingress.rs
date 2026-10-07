@@ -170,18 +170,45 @@ impl Backend {
     }
 }
 
+/// Home Assistant's own tabs for this add-on (Info, Documentation,
+/// Configuration, Log), which it does not show around an ingress page.
+/// Paths on Home Assistant's origin, as its frontend routes them
+/// (`src/panels/config/apps/ha-config-app-dashboard.ts`); the page links
+/// to them with `target="_top"` to leave its frame.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct HaLinks {
+    pub info: String,
+    pub documentation: String,
+    pub config: String,
+    pub logs: String,
+}
+
+impl HaLinks {
+    /// The tabs of the add-on `slug`, or none for a slug that is missing
+    /// or not one the Supervisor could have given, so nothing else reaches
+    /// an `href`.
+    pub(crate) fn for_slug(slug: &str) -> Option<Self> {
+        let slug = connect_lib::datum_cloud::ha_supervisor::valid_slug(slug)?;
+        let tab = |t: &str| format!("/config/app/{slug}/{t}");
+        Some(Self { info: tab("info"), documentation: tab("documentation"), config: tab("config"), logs: tab("logs") })
+    }
+}
+
 struct Ingress {
     backend: Backend,
     csrf: String,
     allowed: Vec<IpAddr>,
+    ha: Option<HaLinks>,
 }
 
 /// The page's router. Serve it with
 /// `into_make_service_with_connect_info::<SocketAddr>()`: the peer check
-/// needs the connection's address.
-pub(crate) fn router(backend: Backend, allowed: Vec<IpAddr>) -> Router {
+/// needs the connection's address. `slug` is the add-on's, when known,
+/// for the links back to its tabs in Home Assistant.
+pub(crate) fn router(backend: Backend, allowed: Vec<IpAddr>, slug: Option<&str>) -> Router {
     let state = Arc::new(Ingress {
         backend,
+        ha: slug.and_then(HaLinks::for_slug),
         csrf: new_csrf_token(),
         allowed: allowed.into_iter().map(|ip| ip.to_canonical()).collect(),
     });
@@ -395,12 +422,16 @@ struct StateBody {
     setup: Option<SetupStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     paired: Option<PairedStatus>,
+    /// The links back to the add-on's tabs; absent outside an add-on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ha: Option<HaLinks>,
 }
 
 async fn state_body(state: &Ingress) -> StateBody {
+    let ha = state.ha.clone();
     match &state.backend {
-        Backend::Setup(ctl) => StateBody { mode: "setup", setup: Some(ctl.status()), paired: None },
-        Backend::Paired(view) => StateBody { mode: "paired", setup: None, paired: Some(view.status().await) },
+        Backend::Setup(ctl) => StateBody { mode: "setup", setup: Some(ctl.status()), paired: None, ha },
+        Backend::Paired(view) => StateBody { mode: "paired", setup: None, paired: Some(view.status().await), ha },
     }
 }
 
@@ -605,7 +636,7 @@ mod tests {
     }
 
     fn app(backend: Backend) -> Router {
-        router(backend, vec![SUPERVISOR.parse().unwrap()])
+        router(backend, vec![SUPERVISOR.parse().unwrap()], None)
     }
 
     fn request(method: Method, path: &str, from: &str) -> axum::http::request::Builder {
@@ -932,9 +963,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn state_links_to_the_addon_tabs_only_for_a_valid_slug() {
+        let state_of = |backend: Backend, slug: Option<&'static str>| async move {
+            let app = router(backend, vec![SUPERVISOR.parse().unwrap()], slug);
+            let (status, _, body) =
+                send(&app, request(Method::GET, "/api/state", SUPERVISOR).body(Body::empty()).unwrap()).await;
+            assert_eq!(status, StatusCode::OK);
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()
+        };
+        for mode in ["setup", "paired"] {
+            let backend = || if mode == "setup" { setup_backend() } else { paired_backend().0 };
+            let v = state_of(backend(), Some("61221542_datum_connect")).await;
+            assert_eq!(v["mode"], mode);
+            assert_eq!(
+                v["ha"],
+                json!({
+                    "info": "/config/app/61221542_datum_connect/info",
+                    "documentation": "/config/app/61221542_datum_connect/documentation",
+                    "config": "/config/app/61221542_datum_connect/config",
+                    "logs": "/config/app/61221542_datum_connect/logs",
+                }),
+                "{mode}"
+            );
+            for slug in [None, Some(""), Some("a/b"), Some("\"><script>"), Some("../x"), Some("x y"), Some("//evil.example")] {
+                let v = state_of(backend(), slug).await;
+                assert_eq!(v["mode"], mode);
+                assert!(v.get("ha").is_none(), "{mode} {slug:?}: {v}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn a_real_listener_refuses_other_peers() {
         // End to end over TCP: loopback is not the allowed peer here.
-        let app = router(setup_backend(), vec!["172.30.32.2".parse().unwrap()]);
+        let app = router(setup_backend(), vec!["172.30.32.2".parse().unwrap()], None);
         let listener = bind("127.0.0.1".parse().unwrap(), 0).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = serve_on(listener, app);
@@ -942,7 +1004,7 @@ mod tests {
         assert!(status.starts_with("HTTP/1.1 403"), "{status}");
         task.abort();
 
-        let app = router(setup_backend(), vec!["127.0.0.1".parse().unwrap()]);
+        let app = router(setup_backend(), vec!["127.0.0.1".parse().unwrap()], None);
         let listener = bind("127.0.0.1".parse().unwrap(), 0).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = serve_on(listener, app);
