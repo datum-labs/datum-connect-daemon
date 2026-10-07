@@ -169,6 +169,13 @@ pub struct PairingConfig {
     /// When set, a missing or unknown project is waited for instead of
     /// ending pairing.
     pub project_wait: Option<ProjectWait>,
+    /// With [`PairingConfig::project_wait`], wait for a project to be chosen
+    /// even when there is only one, or `project` names one that exists: a
+    /// person picking from a list on a page confirms the choice, rather than
+    /// having it made for them. `project` is then only a suggestion, and a
+    /// value the wait's source returns counts as chosen. Without a wait, it
+    /// changes nothing.
+    pub confirm_project: bool,
     /// Where the key file goes.
     pub key_out: PathBuf,
     /// Where to keep the person's login across a restart while waiting for
@@ -200,6 +207,7 @@ impl PairingConfig {
             issuer,
             project: project.as_deref().and_then(normalize_project),
             project_wait: None,
+            confirm_project: false,
             key_out,
             session_file: None,
             device_name: Some(crate::friendly_device_name()).filter(|n| !n.is_empty()),
@@ -412,7 +420,19 @@ async fn provision(
         Some(p) => p,
         None => list_projects(api, &login.sub).await?,
     };
-    let project = match choose_project(&projects, wanted) {
+    let chosen = match &cfg.project_wait {
+        // Confirming: always ask, with nothing taken as already judged, so
+        // that the first value the source returns, even the configured one,
+        // is the choice.
+        Some(wait) if cfg.confirm_project && !projects.is_empty() => {
+            if !resumed && let Some(path) = &cfg.session_file {
+                save_session(path, cfg, login, &projects);
+            }
+            Ok(wait_for_project(cfg, wait, &projects, None, login.expires_at, on_event).await?)
+        }
+        _ => choose_project(&projects, wanted),
+    };
+    let project = match chosen {
         Ok(p) => p,
         Err(e) => match &cfg.project_wait {
             Some(wait) if !projects.is_empty() => {
@@ -1540,8 +1560,9 @@ fn redact(message: String, token: &SecretString) -> String {
     }
 }
 
+/// The loopback fakes are shared with `pairing_setup`'s tests.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
 
@@ -1551,17 +1572,17 @@ mod tests {
     use crate::datum_cloud::ha_supervisor::{self, PairingNotifier, Supervisor};
     use crate::datum_cloud::service_account::tests::{pkcs1_key_json, test_key};
 
-    const TOKEN: &str = "user-access-token-SECRET-1234567890";
-    const SUP_TOKEN: &str = "supervisor-token-SECRET-0987654321";
-    const NOTIFY_PREFIX: &str = "/core/api/services/persistent_notification/";
-    const OPTIONS_PATH: &str = "/addons/self/options/config";
-    const SUB: &str = "300000000000000001";
-    const ORG: &str = "datum-demos-iy50km";
-    const PROJECT: &str = "project-7r4rl";
-    const PROJECT_UID: &str = "11111111-2222-3333-4444-555555555555";
+    pub(crate) const TOKEN: &str = "user-access-token-SECRET-1234567890";
+    pub(crate) const SUP_TOKEN: &str = "supervisor-token-SECRET-0987654321";
+    pub(crate) const NOTIFY_PREFIX: &str = "/core/api/services/persistent_notification/";
+    pub(crate) const OPTIONS_PATH: &str = "/addons/self/options/config";
+    pub(crate) const SUB: &str = "300000000000000001";
+    pub(crate) const ORG: &str = "datum-demos-iy50km";
+    pub(crate) const PROJECT: &str = "project-7r4rl";
+    pub(crate) const PROJECT_UID: &str = "11111111-2222-3333-4444-555555555555";
 
     #[derive(Clone, Copy, Debug)]
-    enum Poll {
+    pub(crate) enum Poll {
         Pending,
         SlowDown,
         Expired,
@@ -1570,45 +1591,47 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct Request {
-        method: String,
-        path: String,
-        authorization: Option<String>,
-        body: String,
+    pub(crate) struct Request {
+        pub(crate) method: String,
+        pub(crate) path: String,
+        pub(crate) authorization: Option<String>,
+        pub(crate) body: String,
     }
 
     /// Datum's IdP and API on loopback, in the style of the token-exchange
     /// tests in `external_token_source.rs`: just enough of each endpoint,
     /// scripted per test, recording every request.
-    struct Fake {
-        polls: VecDeque<Poll>,
-        codes_issued: u32,
-        code_expires_in: u64,
+    pub(crate) struct Fake {
+        pub(crate) polls: VecDeque<Poll>,
+        pub(crate) codes_issued: u32,
+        pub(crate) code_expires_in: u64,
         /// org -> [(name, uid, display name)]
-        projects: Vec<(String, Vec<(String, String, String)>)>,
+        pub(crate) projects: Vec<(String, Vec<(String, String, String)>)>,
         /// GETs of a fresh SA before its email appears.
-        email_after: u32,
-        sa_gets: u32,
-        sas: HashMap<String, (String, String)>, // name -> (uid, email)
-        binding_status: u16,
-        bindings: Vec<Value>,
-        ready_after: u32,
-        binding_gets: u32,
-        key_json: String,
+        pub(crate) email_after: u32,
+        pub(crate) sa_gets: u32,
+        pub(crate) sas: HashMap<String, (String, String)>, // name -> (uid, email)
+        pub(crate) binding_status: u16,
+        pub(crate) bindings: Vec<Value>,
+        pub(crate) ready_after: u32,
+        pub(crate) binding_gets: u32,
+        pub(crate) key_json: String,
         /// Make this path fail with a body that echoes the Authorization header.
-        echo_auth_on: Option<String>,
+        pub(crate) echo_auth_on: Option<String>,
         /// The token response's `expires_in`.
-        token_expires_in: u64,
+        pub(crate) token_expires_in: u64,
         /// The Supervisor's answer to a notification call.
-        notify_status: u16,
+        pub(crate) notify_status: u16,
         /// The saved `project`, one per read of the add-on's options; the
         /// last one repeats. `!500` answers HTTP 500 instead.
-        options: VecDeque<String>,
-        requests: Vec<Request>,
+        pub(crate) options: VecDeque<String>,
+        /// `POST /addons/self/restart` calls the Supervisor took.
+        pub(crate) restarts: u32,
+        pub(crate) requests: Vec<Request>,
     }
 
     impl Fake {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 polls: VecDeque::from([Poll::Approve]),
                 codes_issued: 0,
@@ -1629,6 +1652,7 @@ mod tests {
                 token_expires_in: 43199,
                 notify_status: 200,
                 options: VecDeque::from([String::new()]),
+                restarts: 0,
                 requests: Vec::new(),
             }
         }
@@ -1642,6 +1666,28 @@ mod tests {
             let path = req.path.as_str();
             let authed = req.authorization.as_deref() == Some(&format!("Bearer {TOKEN}"));
             let supervisor = req.authorization.as_deref() == Some(&format!("Bearer {SUP_TOKEN}"));
+            // What a Supervisor on a Home Assistant OS box answers for a
+            // host-network add-on (see `ha_supervisor`'s module docs).
+            if matches!(path, "/addons/self/info" | "/network/info" | "/addons/self/restart") {
+                if !supervisor {
+                    return (401, json!({"message": "401: Unauthorized"}));
+                }
+                return match path {
+                    "/addons/self/info" => (200, json!({"result": "ok", "data": {
+                        "slug": "a0d7b954_datum_connect", "ip_address": "172.30.32.1",
+                        "ingress": true, "ingress_port": 47781,
+                        "ingress_url": "/api/hassio_ingress/tok/", "ingress_panel": false,
+                    }})),
+                    "/network/info" => (200, json!({"result": "ok", "data": {"docker": {
+                        "interface": "hassio", "address": "172.30.32.0/23",
+                        "gateway": "172.30.32.1", "dns": "172.30.32.3",
+                    }}})),
+                    _ => {
+                        self.restarts += 1;
+                        (200, json!({"result": "ok", "data": {}}))
+                    }
+                };
+            }
             if path.starts_with(NOTIFY_PREFIX) || path == OPTIONS_PATH {
                 if !supervisor {
                     return (401, json!({"message": "401: Unauthorized"}));
@@ -1757,7 +1803,7 @@ mod tests {
         }
     }
 
-    async fn serve(fake: Fake) -> (String, Arc<Mutex<Fake>>) {
+    pub(crate) async fn serve(fake: Fake) -> (String, Arc<Mutex<Fake>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let fake = Arc::new(Mutex::new(fake));
@@ -1823,19 +1869,19 @@ mod tests {
         _dir: TempDir,
     }
 
-    struct TempDir(PathBuf);
+    pub(crate) struct TempDir(pub(crate) PathBuf);
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
-    fn temp_dir() -> TempDir {
+    pub(crate) fn temp_dir() -> TempDir {
         let dir = std::env::temp_dir().join(format!("pairing-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         TempDir(dir)
     }
 
-    fn config(base: &str, dir: &Path, project: Option<&str>) -> PairingConfig {
+    pub(crate) fn config(base: &str, dir: &Path, project: Option<&str>) -> PairingConfig {
         PairingConfig {
             issuer: base.into(),
             api_url: base.into(),
@@ -1843,6 +1889,7 @@ mod tests {
             scope: DEFAULT_SCOPE.into(),
             project: project.map(str::to_string),
             project_wait: None,
+            confirm_project: false,
             key_out: dir.join("service-account.json"),
             session_file: None,
             device_name: Some("homeassistant".into()),
@@ -1851,7 +1898,7 @@ mod tests {
         }
     }
 
-    fn good_key() -> String {
+    pub(crate) fn good_key() -> String {
         pkcs1_key_json(&test_key())
     }
 
@@ -2369,6 +2416,25 @@ mod tests {
         assert_eq!(messages[2], "dismiss ");
         assert!(chooses(&run.events).is_empty(), "project was set and valid");
         assert!(!run.fake.lock().unwrap().requests.iter().any(|r| r.path == OPTIONS_PATH), "no options read");
+    }
+
+    #[tokio::test]
+    async fn confirming_waits_even_for_the_only_project_and_a_configured_one() {
+        let mut fake = Fake::new();
+        fake.options = VecDeque::from(["".into(), "".into(), PROJECT.into()]);
+        let run = run_notified(fake, Some(PROJECT), |c| c.confirm_project = true).await;
+        assert_eq!(run.result.as_ref().expect("pairs once chosen").project, PROJECT);
+        // Asked with nothing taken as judged, so not as "isn't one of yours".
+        assert_eq!(chooses(&run.events), [None]);
+        assert!(run.fake.lock().unwrap().requests.iter().filter(|r| r.path == OPTIONS_PATH).count() >= 3);
+        assert_no_secrets(&run);
+    }
+
+    #[tokio::test]
+    async fn confirming_without_a_wait_changes_nothing() {
+        let run = run_with(Fake::new(), None, |c| c.confirm_project = true).await;
+        assert_eq!(run.result.expect("pairs").project, PROJECT);
+        assert!(chooses(&run.events).is_empty());
     }
 
     #[tokio::test]
