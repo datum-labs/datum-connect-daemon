@@ -28,6 +28,11 @@
   // What is on screen, so that an unchanged state is not drawn again every
   // second, which would close a project list someone has open.
   var rendered = null;
+  // When the code on screen expires, in this browser's clock, and which
+  // code that is. The server sends seconds left, not a time, so the two
+  // clocks need not agree.
+  var codeDeadline = null;
+  var codeFor = null;
 
   function el(tag, attrs) {
     var node = document.createElement(tag);
@@ -75,6 +80,7 @@
           return;
         }
         last = state;
+        syncDeadline(state);
         if (renderKey(state) !== rendered) render(state);
         schedule(state.mode === "paired" ? 10000 : 1000);
       })
@@ -112,8 +118,42 @@
 
   // ---- Setup (not paired yet) ----
 
+  // The seconds left change on every poll; the countdown ticks by itself,
+  // so they do not count as a change worth drawing again.
   function renderKey(state) {
-    return (busy ? "1" : "0") + JSON.stringify(state);
+    return (busy ? "1" : "0") + JSON.stringify(state, function (k, v) {
+      return k === "remaining_secs" ? undefined : v;
+    });
+  }
+
+  function syncDeadline(state) {
+    var c = state && state.mode === "setup" && state.setup && state.setup.code;
+    if (!c) {
+      codeDeadline = null;
+      codeFor = null;
+      return;
+    }
+    var d = Date.now() + c.remaining_secs * 1000;
+    // A new code (asked for, or renewed on expiry) starts over; the same
+    // one is only corrected if it drifted, so the countdown does not jitter.
+    if (codeFor !== c.user_code || codeDeadline === null || Math.abs(d - codeDeadline) > 1500) {
+      codeDeadline = d;
+      codeFor = c.user_code;
+    }
+  }
+
+  function countdownText() {
+    if (codeDeadline === null) return "";
+    var left = Math.max(0, Math.ceil((codeDeadline - Date.now()) / 1000));
+    if (left === 0) return "This code has expired; a new one appears here in a moment.";
+    var m = Math.floor(left / 60);
+    var sec = left % 60;
+    return "Expires in " + m + ":" + (sec < 10 ? "0" : "") + sec;
+  }
+
+  function tickCountdown() {
+    var node = document.getElementById("countdown");
+    if (node) node.textContent = countdownText();
   }
 
   function render(state) {
@@ -128,7 +168,7 @@
 
   function act(path, body) {
     post(path, body).then(function (s) {
-      if (s) { last = s; render(s); }
+      if (s) { last = s; syncDeadline(s); render(s); }
       schedule(300);
     }).catch(function (e) {
       if (last) render(last);
@@ -157,7 +197,15 @@
           el("p", null, el("a", { class: "button", href: s.code.url, target: "_blank", rel: "noopener noreferrer" }, "Open the approval page")),
           el("p", null, "2. Check that it shows this code, then approve:"),
           el("div", { class: "code", text: s.code.user_code }),
-          el("p", { class: "muted small", text: "The code expires in " + minutes(s.code.expires_in_secs) + "; a new one appears here if it does. The approval page says “datumctl”: that is expected." })));
+          el("div", { class: "code-row" },
+            el("span", { id: "countdown", class: "countdown", role: "timer", text: countdownText() }),
+            el("button", {
+              class: "secondary",
+              disabled: busy,
+              onclick: function () { act("api/new-code"); },
+            }, "Get a new code")),
+          el("p", { class: "note small", text: "If Datum's page says “Something went wrong”, click Get a new code and approve again right away." }),
+          el("p", { class: "muted small", text: "A new code also appears here by itself when this one expires. The approval page says “datumctl”: that is expected." })));
       case "approved":
         return show(card(
           el("p", { class: "ok", text: "Signed in as " + (s.email || "you") + "." }),
@@ -344,10 +392,6 @@
     }
   }
 
-  function minutes(secs) {
-    var m = Math.ceil(secs / 60);
-    return secs < 60 ? secs + " seconds" : m === 1 ? "1 minute" : m + " minutes";
-  }
-
+  setInterval(tickCountdown, 1000);
   poll();
 })();

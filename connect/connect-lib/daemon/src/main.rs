@@ -1607,6 +1607,10 @@ impl connect_lib::datum_cloud::pairing_setup::SetupObserver for SetupLog {
         }
     }
 
+    fn restarted(&self) {
+        say_line("New code requested from the Datum Connect page.");
+    }
+
     fn outcome(&self, result: &Result<connect_lib::datum_cloud::pairing::PairedKey, connect_lib::datum_cloud::pairing::PairingError>) {
         use connect_lib::datum_cloud::ha_supervisor::setup_failure_message;
         use connect_lib::datum_cloud::pairing_setup::error_view;

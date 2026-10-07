@@ -15,6 +15,12 @@
 //! 3. The choice ([`SetupController::choose`]), then each step as it
 //!    finishes, then done or why not. A failed run can be started again.
 //!
+//! Until the code is approved, the person can also throw it away and get a
+//! new one ([`SetupController::restart`]): Datum's approval page can fail
+//! on its own ("Something went wrong"), and waiting out the old code's five
+//! minutes is no way to retry. Nothing exists in Datum before approval, so
+//! the run is simply dropped and a new one started.
+//!
 //! The status never holds the person's token, nor anything that could
 //! carry it: only what [`PairingEvent`]s carry, which is plain data by
 //! design, and error messages, which pairing scrubs of the token.
@@ -28,6 +34,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -72,7 +79,14 @@ pub enum Phase {
 pub struct CodeView {
     pub url: String,
     pub user_code: String,
+    /// How long the code was good for when it was issued.
     pub expires_in_secs: u64,
+    /// How long it is still good for, as of [`SetupController::status`]:
+    /// the page's countdown. Relative, so the browser's clock does not
+    /// matter.
+    pub remaining_secs: u64,
+    #[serde(skip)]
+    expires_at: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -160,10 +174,24 @@ pub enum ChooseError {
     Unknown,
 }
 
+/// [`SetupController::restart`] refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RestartError {
+    #[error("The code was already approved, so there is no code to replace. Carry on below.")]
+    Approved,
+    #[error("Already connected to Datum.")]
+    Done,
+}
+
 /// Told about every event and the outcome, for the log and notifications.
+/// Only the current run's are passed on: a run thrown away by
+/// [`SetupController::restart`] says nothing more.
 pub trait SetupObserver: Send + Sync {
     fn event(&self, _event: &PairingEvent) {}
     fn outcome(&self, _result: &Result<PairedKey, PairingError>) {}
+    /// The code was thrown away on request; the new one follows as an
+    /// event.
+    fn restarted(&self) {}
 }
 
 struct NoObserver;
@@ -183,6 +211,10 @@ struct Inner {
     observer: Arc<dyn SetupObserver>,
     done: tokio::sync::watch::Sender<Option<PairedKey>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Which run is current. Only changed with `status` locked, and only
+    /// the current run may change `status`, so that a run being thrown
+    /// away cannot put its code, or an approval, back on the page.
+    run: AtomicU64,
 }
 
 impl SetupController {
@@ -228,13 +260,18 @@ impl SetupController {
                 observer: observer.unwrap_or_else(|| Arc::new(NoObserver)),
                 done,
                 task: Mutex::new(None),
+                run: AtomicU64::new(0),
             }),
         }
     }
 
     /// The page's view, as of now.
     pub fn status(&self) -> SetupStatus {
-        self.inner.status.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        let mut status = self.inner.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(code) = &mut status.code {
+            code.remaining_secs = code.expires_at.saturating_duration_since(Instant::now()).as_secs();
+        }
+        status
     }
 
     /// Whether a login saved by an earlier run is waiting to be picked up,
@@ -250,27 +287,69 @@ impl SetupController {
         if status.running() || status.phase == Phase::Done {
             return;
         }
+        self.spawn_run(&mut status);
+    }
+
+    /// "Get a new code": throws away the code on the page, unapproved, and
+    /// starts again with a new one. Before approval nothing exists in Datum
+    /// and no login is saved, so dropping the run leaves nothing behind.
+    /// Once approved, the run may be creating things, so this refuses.
+    /// With nothing running, it is [`SetupController::start`].
+    pub fn restart(&self) -> Result<(), RestartError> {
+        let mut status = self.inner.status.lock().unwrap_or_else(|e| e.into_inner());
+        let replacing = match status.phase {
+            Phase::Starting | Phase::Code => true,
+            Phase::Idle | Phase::Failed => false,
+            Phase::Approved | Phase::Choose | Phase::Working => return Err(RestartError::Approved),
+            Phase::Done => return Err(RestartError::Done),
+        };
+        self.spawn_run(&mut status);
+        drop(status);
+        if replacing {
+            self.inner.observer.restarted();
+        }
+        Ok(())
+    }
+
+    /// Makes a new run the current one, stopping the previous one if it is
+    /// still going. Called with `status` locked.
+    fn spawn_run(&self, status: &mut SetupStatus) {
+        let run = self.inner.run.fetch_add(1, Ordering::SeqCst) + 1;
         *status = SetupStatus {
             phase: Phase::Starting,
             suggested: status.suggested.clone(),
             ..Default::default()
         };
         *self.inner.source.page.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let mut slot = self.inner.task.lock().unwrap_or_else(|e| e.into_inner());
+        // Cancelled where it next waits, which before approval is asking
+        // for or polling a code. As on `stop`, pairing's own end (which
+        // deletes a saved login) is skipped.
+        let previous = slot.take();
+        if let Some(previous) = &previous {
+            previous.abort();
+        }
         let inner = self.inner.clone();
         let task = tokio::spawn(async move {
+            // Fully gone before the new code is asked for.
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
             let observer = inner.observer.clone();
             let mut on_event = |event: PairingEvent| {
-                inner.apply(&event);
-                observer.event(&event);
+                if inner.apply(run, &event) {
+                    observer.event(&event);
+                }
             };
             let result = pairing::pair(&inner.cfg, &mut on_event).await;
-            inner.finish(&result);
-            observer.outcome(&result);
+            if inner.finish(run, &result) {
+                observer.outcome(&result);
+            }
             if let Ok(key) = result {
                 inner.done.send_replace(Some(key));
             }
         });
-        *self.inner.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+        *slot = Some(task);
     }
 
     /// Chooses `project`, which must be one of those listed.
@@ -316,8 +395,18 @@ impl SetupController {
 }
 
 impl Inner {
-    fn apply(&self, event: &PairingEvent) {
+    /// Whether `run` is the current one. Asked with `status` locked.
+    fn current(&self, run: u64) -> bool {
+        self.run.load(Ordering::SeqCst) == run
+    }
+
+    /// Records `event` from `run`, unless that run was thrown away. Returns
+    /// whether it was recorded.
+    fn apply(&self, run: u64, event: &PairingEvent) -> bool {
         let mut s = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.current(run) {
+            return false;
+        }
         match event {
             PairingEvent::Code { url, user_code, expires_in } => {
                 s.phase = Phase::Code;
@@ -325,6 +414,8 @@ impl Inner {
                     url: url.clone(),
                     user_code: user_code.clone(),
                     expires_in_secs: expires_in.as_secs(),
+                    remaining_secs: expires_in.as_secs(),
+                    expires_at: Instant::now() + *expires_in,
                 });
             }
             PairingEvent::CodeExpired => s.code_renewed = true,
@@ -355,10 +446,15 @@ impl Inner {
             PairingEvent::AccessGranted | PairingEvent::AccessNotConfirmed { .. } => s.steps.access = true,
             PairingEvent::KeySaved { .. } => s.steps.key = true,
         }
+        true
     }
 
-    fn finish(&self, result: &Result<PairedKey, PairingError>) {
+    /// As [`Inner::apply`], for how `run` ended.
+    fn finish(&self, run: u64, result: &Result<PairedKey, PairingError>) -> bool {
         let mut s = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.current(run) {
+            return false;
+        }
         match result {
             Ok(key) => {
                 s.phase = Phase::Done;
@@ -373,6 +469,7 @@ impl Inner {
                 s.error = Some(error_view(e));
             }
         }
+        true
     }
 }
 
@@ -530,15 +627,11 @@ mod tests {
         assert!(s.fake.lock().unwrap().requests.is_empty(), "nothing asked of Datum before Connect");
 
         s.ctl.start();
-        let code = wait_for(&s.ctl, Phase::Code).await;
-        assert_eq!(
-            code.code,
-            Some(CodeView {
-                url: format!("{}/ui/v2/login/device?user_code=ABCD-EFG1", s.cfg.issuer),
-                user_code: "ABCD-EFG1".into(),
-                expires_in_secs: 300,
-            })
-        );
+        let code = wait_for(&s.ctl, Phase::Code).await.code.unwrap();
+        assert_eq!(code.url, format!("{}/ui/v2/login/device?user_code=ABCD-EFG1", s.cfg.issuer));
+        assert_eq!(code.user_code, "ABCD-EFG1");
+        assert_eq!(code.expires_in_secs, 300);
+        assert!((295..=300).contains(&code.remaining_secs), "{}", code.remaining_secs);
         s.ctl.start();
         assert_eq!(s.fake.lock().unwrap().codes_issued, 1, "a second Connect while one runs is ignored");
 
@@ -698,6 +791,178 @@ mod tests {
         let v: Value = serde_json::to_value(st).unwrap();
         assert_eq!(v["phase"], "choose");
         assert_eq!(v["projects"][0]["display_name"], "Demo");
+    }
+
+    /// What the log and notification would be told.
+    #[derive(Default)]
+    struct Recorder {
+        codes: Mutex<Vec<String>>,
+        restarts: Mutex<u32>,
+        outcomes: Mutex<u32>,
+    }
+
+    impl SetupObserver for Recorder {
+        fn event(&self, event: &PairingEvent) {
+            if let PairingEvent::Code { user_code, .. } = event {
+                self.codes.lock().unwrap().push(user_code.clone());
+            }
+        }
+        fn outcome(&self, _: &Result<PairedKey, PairingError>) {
+            *self.outcomes.lock().unwrap() += 1;
+        }
+        fn restarted(&self) {
+            *self.restarts.lock().unwrap() += 1;
+        }
+    }
+
+    /// Polls of the token endpoint for the `n`th code.
+    fn polls_for(fake: &Mutex<Fake>, n: u32) -> usize {
+        let wanted = format!("device_code=device-code-{n}");
+        let fake = fake.lock().unwrap();
+        fake.requests
+            .iter()
+            .filter(|r| r.path == "/oauth/v2/token" && r.body.split('&').any(|kv| kv == wanted))
+            .count()
+    }
+
+    async fn wait_for_code(ctl: &SetupController, user_code: &str) -> SetupStatus {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let st = ctl.status();
+            assert_no_token(&st);
+            if st.code.as_ref().is_some_and(|c| c.user_code == user_code) {
+                return st;
+            }
+            assert!(Instant::now() < deadline, "never showed {user_code}; last {st:?}");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn get_a_new_code_drops_the_old_one_and_asks_datum_again() {
+        let mut fake = Fake::new();
+        // Never approved, until the new code is, and never expiring on its
+        // own (pairing counts a test's seconds in milliseconds).
+        fake.polls = VecDeque::new();
+        fake.code_expires_in = 100_000;
+        let s = setup(fake, None).await;
+        let mut cfg = s.cfg.clone();
+        let session = s.dir.0.join("pairing-session.json");
+        cfg.session_file = Some(session.clone());
+        let rec = Arc::new(Recorder::default());
+        let ctl = SetupController::with_polls(
+            cfg,
+            None,
+            Some(rec.clone()),
+            Duration::from_millis(2),
+            Duration::from_millis(2),
+        );
+
+        ctl.start();
+        wait_for_code(&ctl, "ABCD-EFG1").await;
+        // Polling the first code, as when Datum's page failed.
+        while polls_for(&s.fake, 1) == 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        ctl.restart().expect("allowed while waiting for approval");
+        let now = ctl.status();
+        assert_eq!(now.phase, Phase::Starting);
+        assert_eq!(now.code, None, "the old code is off the page at once");
+
+        let st = wait_for_code(&ctl, "ABCD-EFG2").await;
+        assert_eq!(st.phase, Phase::Code);
+        assert!(!st.code_renewed, "asked for, not expired");
+        assert!(st.code.unwrap().remaining_secs > 290);
+        let issued = s
+            .fake
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|r| r.path == "/oauth/v2/device_authorization")
+            .count();
+        assert_eq!(issued, 2, "a second device authorization");
+        assert_eq!(*rec.codes.lock().unwrap(), ["ABCD-EFG1", "ABCD-EFG2"], "the notification gets the new code");
+        assert_eq!(*rec.restarts.lock().unwrap(), 1);
+        assert_eq!(*rec.outcomes.lock().unwrap(), 0, "the dropped run reports nothing");
+
+        // The old run is gone: it no longer polls, and never comes back.
+        let old_polls = polls_for(&s.fake, 1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(polls_for(&s.fake, 1), old_polls, "the first code is no longer polled");
+        assert!(polls_for(&s.fake, 2) > 0);
+        assert_eq!(ctl.status().code.unwrap().user_code, "ABCD-EFG2");
+        assert!(!session.exists(), "no login saved before approval");
+
+        // The new code works.
+        s.fake.lock().unwrap().polls = VecDeque::from([Poll::Approve]);
+        let choose = wait_for(&ctl, Phase::Choose).await;
+        assert_eq!(choose.code, None);
+        assert!(session.exists(), "the new run's login is kept as usual");
+        assert_eq!(s.fake.lock().unwrap().codes_issued, 2);
+        ctl.stop().await;
+    }
+
+    #[tokio::test]
+    async fn no_new_code_once_approved() {
+        let rec = Arc::new(Recorder::default());
+        let s = setup(Fake::new(), None).await;
+        let ctl = SetupController::with_polls(
+            s.cfg.clone(),
+            None,
+            Some(rec.clone()),
+            Duration::from_millis(2),
+            Duration::from_millis(2),
+        );
+        ctl.start();
+        wait_for(&ctl, Phase::Choose).await;
+        assert_eq!(ctl.restart(), Err(RestartError::Approved));
+        assert_eq!(ctl.status().phase, Phase::Choose, "the run carries on");
+        ctl.choose(PROJECT).unwrap();
+        assert_eq!(ctl.restart(), Err(RestartError::Approved), "nor while creating");
+        wait_for(&ctl, Phase::Done).await;
+        assert_eq!(ctl.restart(), Err(RestartError::Done));
+        assert_eq!(s.fake.lock().unwrap().codes_issued, 1);
+        assert_eq!(*rec.restarts.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_new_code_after_a_failure_is_a_fresh_start() {
+        let mut fake = Fake::new();
+        fake.polls = VecDeque::from([Poll::Denied]);
+        let s = setup(fake, None).await;
+        s.ctl.start();
+        wait_for(&s.ctl, Phase::Failed).await;
+        s.ctl.restart().unwrap();
+        wait_for_code(&s.ctl, "ABCD-EFG2").await;
+        assert_eq!(s.ctl.status().error, None);
+    }
+
+    #[tokio::test]
+    async fn the_status_json_has_the_codes_expiry_and_no_token() {
+        let mut fake = Fake::new();
+        fake.polls = VecDeque::new();
+        // Long enough not to be renewed meanwhile (see above).
+        fake.code_expires_in = 100_000;
+        let s = setup(fake, None).await;
+        s.ctl.start();
+        let st = wait_for(&s.ctl, Phase::Code).await;
+        let v: Value = serde_json::to_value(&st).unwrap();
+        let code = v["code"].as_object().unwrap();
+        let mut keys: Vec<&str> = code.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["expires_in_secs", "remaining_secs", "url", "user_code"]);
+        assert_eq!(code["expires_in_secs"], 100_000);
+        let remaining = code["remaining_secs"].as_u64().unwrap();
+        assert!((99_995..=100_000).contains(&remaining), "{remaining}");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(s.ctl.status().code.unwrap().remaining_secs < remaining, "counts down");
+        let json = v.to_string();
+        for secret in [TOKEN, SUP_TOKEN, "refresh-SECRET", "device-code-", "device_code", "access_token"] {
+            assert!(!json.contains(secret), "{secret} in {json}");
+        }
+        s.ctl.stop().await;
     }
 
     #[tokio::test]

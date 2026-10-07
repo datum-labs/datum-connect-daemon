@@ -107,6 +107,22 @@ button:disabled { opacity: 0.5; cursor: default; }
   word-break: break-all;
 }
 
+.code-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 0 8px;
+}
+
+.code-row button { margin: 0; }
+
+.countdown {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
 select {
   font: inherit;
   width: 100%;
