@@ -10,6 +10,12 @@ set -euo pipefail
 
 PORT=47780
 CONNECT_DIR=/data/connect
+# The Datum Connect page (ingress). The Supervisor says which port it
+# connects to; 47781 is what config.yaml asks for.
+INGRESS_PORT="$(bashio::addon.ingress_port 2>/dev/null || true)"
+if bashio::var.is_empty "${INGRESS_PORT}" || [ "${INGRESS_PORT}" = "null" ] || [ "${INGRESS_PORT}" = "0" ]; then
+    INGRESS_PORT=47781
+fi
 
 PROJECT="$(bashio::config 'project')"
 PASTED_KEY="$(bashio::config 'service_account_key')"
@@ -55,9 +61,16 @@ PAIRING_PROGRESS="${PAIRED_KEY_FILE}.pending"
 # so that a restart then (Home Assistant offers one on every save of the
 # options) needs no new approval. Pairing deletes it when it ends.
 PAIRING_SESSION=/data/pairing-session.json
-# What `pair` exits with when it was stopped while waiting, with the login
-# kept for the next start: a pause, not a failure.
+# What `setup` exits with when the add-on is stopped before pairing
+# finished, with or without a login kept for the next start: a pause, not a
+# failure.
 PAIR_PAUSED=75
+
+# Read by both `setup` and the daemon: the page's port, and which key file
+# the page's Re-pair and Unpair may delete. The page's address is asked of
+# the Supervisor (ingress.rs).
+export DATUM_INGRESS_PORT="${INGRESS_PORT}"
+export DATUM_PAIRED_KEY_FILE="${PAIRED_KEY_FILE}"
 
 # Which key, in order: a pasted key, a key file placed by hand, the key an
 # earlier pairing saved, and otherwise pair now.
@@ -102,25 +115,27 @@ else
         KEY_SOURCE="${KEY_FILE}"
     else
         if [ ! -s "${PAIRED_KEY_FILE}" ]; then
-            bashio::log.info "No service account key yet, so pairing this add-on with Datum. A link and a code follow, here and as a notification."
-            # --hold-port: while pairing waits for approval the daemon is not
-            # listening yet, and the Supervisor's watchdog (config.yaml)
-            # would restart the add-on mid-approval, replacing the code.
-            # --options-source supervisor: with several projects and none set,
-            # pairing waits for 'project' to be saved on the Configuration
-            # tab, reading it from the Supervisor, since /data/options.json
-            # only changes on a restart.
+            bashio::log.info "No service account key yet. Open Datum Connect in the sidebar (or Open Web UI on the Info tab) and click Connect to Datum."
+            # `setup` serves the Datum Connect page on the ingress port and
+            # pairs when Connect is clicked there; the link and code are
+            # still logged and shown as a notification. If the page cannot
+            # be served, it pairs from the log, as `pair` did before 0.3.0.
+            # --hold-port: the daemon's port answers while setup waits, as
+            # it did for `pair`.
+            # --options-source supervisor: 'project' saved on the
+            # Configuration tab still chooses the project, read from the
+            # Supervisor, since /data/options.json only changes on a restart.
             # --session-file: saving the options makes Home Assistant offer
             # a restart, which would otherwise mean a second approval.
-            PAIR_ARGS=(pair --key-out "${PAIRED_KEY_FILE}" --hold-port "${PORT}" --options-source supervisor --session-file "${PAIRING_SESSION}")
+            PAIR_ARGS=(setup --key-out "${PAIRED_KEY_FILE}" --hold-port "${PORT}" --options-source supervisor --session-file "${PAIRING_SESSION}")
             if [ -n "${PROJECT}" ]; then
                 PAIR_ARGS+=(--project "${PROJECT}")
             fi
             PAIR_STATUS=0
             /usr/bin/datum-connect-daemon "${PAIR_ARGS[@]}" || PAIR_STATUS=$?
             if [ "${PAIR_STATUS}" -eq "${PAIR_PAUSED}" ]; then
-                # Stopped while waiting for a project; pair has said it
-                # continues after the restart.
+                # Stopped before pairing finished; setup has said what
+                # happens on the next start.
                 exit 0
             elif [ "${PAIR_STATUS}" -ne 0 ]; then
                 bashio::exit.nok "Pairing with Datum did not finish; the reason is above. Restart the add-on to try again, or use your own service account key (see the Documentation tab)."
@@ -321,6 +336,7 @@ error_excerpt() {
 }
 
 if [ -z "${TUNNEL_ID}" ]; then
+    TUNNEL_CREATED=true
     bashio::log.info "Creating tunnel '${LABEL}' → ${TARGET}"
     BODY=$(jq -n --arg l "${LABEL}" --arg e "${TARGET}" '{label: $l, endpoint: $e}')
     post_json "${API}/tunnels" "${BODY}"
@@ -360,7 +376,14 @@ for _ in $(seq 1 60); do
 done
 
 if [ -n "${HOSTNAME}" ]; then
-    bashio::log.info "Home Assistant is reachable at https://${HOSTNAME}"
+    if [ "${TUNNEL_CREATED:-false}" = true ]; then
+        # Seen on a real install: a brand-new address gave Firefox a 503
+        # and Chrome "Unable to connect" for 15-20 minutes, while plain
+        # HTTP/1.1 worked after about 8.
+        bashio::log.info "Home Assistant is reachable at https://${HOSTNAME} (a new address can take up to 20 minutes to work everywhere)"
+    else
+        bashio::log.info "Home Assistant is reachable at https://${HOSTNAME}"
+    fi
 else
     bashio::log.warning "Tunnel started, but no public hostname was reported within 2 minutes. It may still be provisioning; restart the add-on to check again."
 fi
