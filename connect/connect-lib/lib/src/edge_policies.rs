@@ -417,6 +417,93 @@ async fn ensure_waf(client: &kube::Client, t: &EdgeTarget, proxy_has_protected_r
     }
 }
 
+// ---- Reading them back, for the add-on's status page ----
+
+/// One tunnel's edge policies as they are now, for a person to read.
+/// Strings rather than enums so the page can show a mode it does not know.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EdgePolicyStatus {
+    /// The WAF's `mode` (`Enforce`, `Observe`, `Disabled`), `missing`, or
+    /// `unknown` when it could not be read.
+    pub waf: String,
+    /// Whether this code set the WAF up (see [`MANAGED_BY_ANNOTATION`]).
+    pub waf_managed: bool,
+    /// The WAF covers only the `protected` rule, so streams skip it.
+    pub waf_scoped: bool,
+    /// The request timeout (`1h`), `missing`, or `unknown`.
+    pub timeout: String,
+}
+
+/// Reads both policies; never fails (see [`EdgePolicyStatus`]).
+pub async fn edge_policy_status(client: kube::Client, tunnel_id: &str) -> EdgePolicyStatus {
+    let waf: Api<DynamicObject> = Api::namespaced_with(client.clone(), DEFAULT_PCP_NAMESPACE, &waf_resource());
+    let timeout: Api<DynamicObject> = Api::namespaced_with(client, DEFAULT_PCP_NAMESPACE, &timeout_resource());
+    let (waf_name, timeout_name) = (waf_policy_name(tunnel_id), timeout_policy_name(tunnel_id));
+    let (waf, timeout) = tokio::join!(call(waf.get_opt(&waf_name)), call(timeout.get_opt(&timeout_name)));
+    let as_json = |o: &DynamicObject| serde_json::to_value(o).unwrap_or_default();
+    status_from(
+        waf.map(|o| o.as_ref().map(as_json)).map_err(|e| e.to_string()),
+        timeout.map(|o| o.as_ref().map(as_json)).map_err(|e| e.to_string()),
+    )
+}
+
+fn status_from(waf: Result<Option<Value>, String>, timeout: Result<Option<Value>, String>) -> EdgePolicyStatus {
+    let (waf, waf_managed, waf_scoped) = match waf {
+        Ok(Some(p)) => (
+            p.pointer("/spec/mode").and_then(Value::as_str).unwrap_or("unknown").to_string(),
+            has_managed_by(&p),
+            p.pointer("/spec/targetRefs")
+                .and_then(Value::as_array)
+                .is_some_and(|r| !r.is_empty() && r.iter().all(|t| t["sectionName"] == WAF_PROTECTED_RULE_NAME)),
+        ),
+        Ok(None) => ("missing".into(), false, false),
+        Err(e) => {
+            tracing::debug!("could not read the WAF policy: {e}");
+            ("unknown".into(), false, false)
+        }
+    };
+    let timeout = match timeout {
+        Ok(Some(p)) => p
+            .pointer("/spec/timeout/http/requestTimeout")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        Ok(None) => "missing".into(),
+        Err(e) => {
+            tracing::debug!("could not read the request timeout policy: {e}");
+            "unknown".into()
+        }
+    };
+    EdgePolicyStatus { waf, waf_managed, waf_scoped, timeout }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn reads_what_the_daemon_writes_and_what_it_cannot() {
+        let waf = json!({
+            "metadata": {"annotations": {MANAGED_BY_ANNOTATION: MANAGED_BY_VALUE}},
+            "spec": desired_waf_spec("t1"),
+        });
+        let timeout = json!({"spec": desired_timeout_spec("t1")});
+        assert_eq!(
+            status_from(Ok(Some(waf)), Ok(Some(timeout))),
+            EdgePolicyStatus { waf: "Enforce".into(), waf_managed: true, waf_scoped: true, timeout: "1h".into() }
+        );
+        let foreign = json!({"spec": {"mode": "Observe", "targetRefs": [{"kind": "HTTPRoute", "name": "t1"}]}});
+        assert_eq!(
+            status_from(Ok(Some(foreign)), Ok(None)),
+            EdgePolicyStatus { waf: "Observe".into(), waf_managed: false, waf_scoped: false, timeout: "missing".into() }
+        );
+        assert_eq!(
+            status_from(Err("HTTP 403".into()), Err("timed out".into())),
+            EdgePolicyStatus { waf: "unknown".into(), waf_managed: false, waf_scoped: false, timeout: "unknown".into() }
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

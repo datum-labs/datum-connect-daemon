@@ -28,41 +28,65 @@ Home Assistant OS does not allow that — and nothing is built on the device.
    Don't use an `http:` block in `configuration.yaml` for this. Current Home
    Assistant ignores it once the setting has moved into its own storage, and
    warns that it stops working altogether in 2027.2.
-4. **Start, and approve.** Start the add-on. A notification (bell icon)
-   appears with a link: click it, approve, and confirm the code. Sign in to
-   Datum as usual on the page it opens, check that the code there matches
-   the one in the notification, and approve. If the code expires first, the
-   notification shows a new one; the add-on keeps offering new codes for an
-   hour. Once pairing has worked, the notification goes away by itself.
+4. **Start, then open Datum Connect.** Start the add-on, then open
+   **Datum Connect** in the sidebar. If it isn't there, turn on **Show in
+   sidebar** on the add-on's Info tab, or click **Open Web UI** there.
+5. **Connect, approve, and pick a project.** Click **Connect to Datum**. The
+   page shows a link and a code: open the link (it opens in a new tab), sign
+   in to Datum as usual, check that the code there matches the one on the
+   page, and approve. Back in Home Assistant, the page says who signed in
+   and lists your projects, grouped by organization. Choose one (with only
+   one, it is already chosen) and click **Continue**. The page shows each
+   step as it is done: a service account, its access to the project, and
+   its key. Then it says `Done. Starting the tunnel…` and, a few seconds
+   later, switches to the tunnel's status with its public address.
 
-   The same link and code are in the add-on's **Log** tab, in case the
-   notification doesn't appear:
+   **A new address can take 10-20 minutes before it works in every
+   browser.** On a real install, a brand-new address gave Firefox a `503`
+   and Chrome "Unable to connect" for 15-20 minutes, while it already worked
+   in other clients after about 8. It is the new address settling in, not a
+   fault; later restarts reuse the same address, with no wait.
 
-   `To connect this Home Assistant to Datum, open https://auth.datum.net/ui/v2/login/device?user_code=ABCD-EFGH and enter code ABCD-EFGH (expires in 5 minutes)`
+   If the code expires first, the page shows a new one; after 20 minutes
+   without an approval it offers **Get a new code** instead. If something
+   goes wrong, the page says what in plain words, with **Try again**.
 
-5. **Choose the project, if asked.** If you have several projects, the
-   notification lists them: set `project` on the Configuration tab and click
-   Save. Use the project's id, as listed, not its display name; stray
-   spaces, quotes or capitals from copying it are ignored. Home Assistant
-   then offers to restart the add-on. Either answer works: pairing continues
-   without a new login, and the log says `Continuing pairing as <you> (no
-   new login needed)` after a restart. Pairing waits up to 30 minutes for
-   this, but a restart more than 15 minutes after approving asks you to
-   approve again. With only one project, it is used without asking. You can
-   also set `project` before starting.
+   If you set `project` on the Configuration tab before starting, that
+   project is preselected; you still click **Continue**.
 
-   Within a few seconds, the log says `Approved as <you>`,
-   `Created service account ...`, `Granted access` and `Saved key`, then
-   creates the tunnel and logs its address:
-   `Home Assistant is reachable at https://<name>.datumproxy.net`.
-   Later restarts reuse the same key, tunnel and address, with no approval.
+The page is the easiest way, but not the only one:
+
+- **The notification.** While the add-on is not connected, a notification
+  (bell icon) links to the page. Once a code has been issued, it also holds
+  the approval link and the code.
+- **The log.** The same link and code are in the add-on's **Log** tab:
+
+  `To connect this Home Assistant to Datum, open https://auth.datum.net/ui/v2/login/device?user_code=ABCD-EFGH and enter code ABCD-EFGH (expires in 5 minutes)`
+
+  After approving, instead of choosing on the page, you can set `project`
+  on the Configuration tab to one of the ids the log lists and click Save.
+  Use the project's id, not its display name; stray spaces, quotes or
+  capitals from copying it are ignored. Home Assistant then offers to
+  restart the add-on. Either answer works: pairing continues without a new
+  login. The log says `Continuing pairing as <you> (no new login needed)`
+  after a restart. A restart more than 15 minutes after approving asks you
+  to approve again.
+- **Your own key.** See "Advanced: use your own service account key".
+
+Either way, the log then says `Approved as <you>`,
+`Created service account ...`, `Granted access` and `Saved key`, creates
+the tunnel and logs its address:
+`Home Assistant is reachable at https://<name>.datumproxy.net (a new address can take up to 20 minutes to work everywhere)`.
+Later restarts reuse the same key, tunnel and address, with no approval.
 
 The approval screen says **datumctl**. That is expected: until the add-on has
 its own Datum login app, it borrows the public one that the `datumctl`
 command line tool uses. Approving lets the add-on act as you only while it
-pairs, usually under a minute, or until you choose a project if it asks you
-to (30 minutes at most), to make what is listed below. It never logs your
-login. While it waits for you to choose a project, it keeps your login in
+pairs: from the approval until you choose a project (30 minutes at most),
+then usually under a minute to make what is listed below. It never logs your
+login. It never sends your login to the page either: the page only ever gets the
+link, the code, your email, the project list and progress. While it waits for
+you to choose a project, it keeps your login in
 `/data/pairing-session.json`, readable by this add-on only and left out of
 backups, so that the restart Home Assistant offers when you save does not
 cost a second approval. That file is good for 15 minutes at most and is
@@ -84,20 +108,25 @@ Approving creates three things in your Datum project, and nothing else:
 
 To approve, your login must be able to create service accounts in the project
 and to grant access (an organization owner or editor can). If it can create
-the service account but not grant access, the log says so, names the service
-account, and stops. Ask an organization owner or editor to grant it the
-`editor` role on the project, then restart the add-on and approve again. It
-picks up the same service account rather than making another.
+the service account but not grant access, the page (and the log) says so and
+names the service account. Ask an organization owner or editor to grant it
+the `editor` role on the project, then click **Try again** and approve again.
+It picks up the same service account rather than making another.
 
 **To revoke access,** delete the service account in the Datum portal, under the
 project's **Service accounts**. The add-on stops working until it is paired
 again.
 
-**To pair again** (for example after revoking, or to switch projects), turn on
-`repair` on the Configuration tab and restart. The add-on forgets its key and
-shows a new code. It doesn't delete the old service account; the log names it
-so you can delete it in the portal. Turn `repair` off again afterwards, or
-every restart pairs again.
+**To pair again** (for example after revoking, or to switch projects), click
+**Re-pair** on the Datum Connect page. The add-on forgets its key, restarts,
+and shows **Connect to Datum** again. **Unpair** does the same, but stops the
+tunnel first, so the public address stops serving. Neither deletes the old
+service account, which the add-on cannot do with its own key; the page and
+the log name it so you can delete it in the portal. Both only work on a key
+made by pairing: with your own key, they are off.
+
+Without the page, turn on `repair` on the Configuration tab and restart: same
+as Re-pair. Turn `repair` off again afterwards, or every restart pairs again.
 
 **Backups.** The paired key, and your login while pairing waits for a
 project, are left out of Home Assistant backups, so a backup file never
@@ -109,10 +138,10 @@ Delete the old one in the portal.
 
 | Option | What it is |
 |---|---|
-| `project` | The Datum project the tunnel is created in, by id. When pairing, leave it empty to use the only project your login can see; with several, pairing lists them and waits for you to set one and click Save. With your own key, leave it empty to use the project the key belongs to. |
+| `project` | The Datum project the tunnel is created in, by id. Optional. When pairing, the Datum Connect page lists your projects and preselects this one, if set; without the page, set it after approving and click Save. With your own key, leave it empty to use the project the key belongs to. |
 | `target` | What the tunnel points at. Leave empty for this Home Assistant: the add-on asks Home Assistant which port it uses. Must be plain HTTP. Changing it repoints the existing tunnel on the next start; its address stays the same. |
 | `tunnel_label` | A name for the tunnel, to recognise it in the dashboard. The tunnel is found again by this name on every start, including after the add-on is reinstalled, so changing it creates a new tunnel with a new address. |
-| `repair` | Forget the paired key and pair again on the next start. See "What pairing creates". Leave off. |
+| `repair` | Forget the paired key and pair again on the next start, for when the page's Re-pair can't be used. See "What pairing creates". Leave off. |
 | `service_account_key` | Your own service account key JSON, pasted whole, instead of pairing. See "Advanced: use your own service account key". |
 | `service_account_key_file` | Where to read your own key from if `service_account_key` is empty. Defaults to `/share/datum-service-account.json`, for installs that already placed a file there. |
 | `log_level` | Daemon log verbosity. Leave at `info` unless diagnosing something. |
@@ -165,6 +194,19 @@ cached token to get stuck on. If the exchange fails, the log line says
 
 The service account also needs permission to create WAF policies (see below).
 A paired one has it, through `editor`.
+
+## The Datum Connect page
+
+Once connected, the page shows the tunnel: its public address, whether it is
+online, its edge protection and request timeout (below), the project, and the
+service account the add-on runs on. It refreshes by itself.
+
+The page is served by the add-on through Home Assistant's ingress, so it
+needs your Home Assistant login, and only administrators see it. The add-on
+runs on the host's network, so it serves the page only on the address Home
+Assistant's Supervisor connects to (`172.30.32.1`, not on your LAN) and
+answers no one but the Supervisor (`172.30.32.2`); the log says so if it
+refuses anything.
 
 ## Edge protection (WAF)
 
@@ -267,12 +309,32 @@ everything — in particular, a healthy-looking daemon can still have a tunnel
 that serves nothing, because the local side and the cloud side fail
 independently.
 
-**No notification appears.** The link and code are in the add-on's log as
-well; use those. A log line starting `Could not show the pairing link as a
-Home Assistant notification` says why the notification failed. Pairing
+**Datum Connect isn't in the sidebar.** Turn on **Show in sidebar** on the
+add-on's Info tab, or click **Open Web UI** there.
+
+**The page says "Waiting for the add-on…".** The add-on is starting,
+restarting, or stopped. Check that it is running, and its Log tab. If the log
+says `cannot serve the Datum Connect page`, the add-on pairs from the log
+and notification instead, as before 0.3.0.
+
+**The log says "Refused a request to the Datum Connect page from ...".**
+Something other than the Supervisor tried to open the page, or the
+Supervisor connects from an unusual address on this system. If the page
+itself does not load, report the address the log names.
+
+**The page says "This page is out of date".** The add-on restarted since the
+page was opened. Reload the page.
+
+**The public address doesn't load yet.** If it is new, wait: a new address
+can take 10-20 minutes before it works in every browser (see step 5 of
+"Installing").
+
+**No notification appears.** Open the page instead, or use the link and code
+in the add-on's log. A log line starting `Could not show the pairing link as
+a Home Assistant notification` says why the notification failed. Pairing
 works the same either way.
 
-**Pairing says "isn't one of your projects".** The `project` you saved is not
+**The log says "isn't one of your projects"** (pairing from the log, without the page). The `project` you saved is not
 an id your login can see. Set it to one of the ids listed, and click Save.
 Pairing is still waiting, so you can restart or not, as Home Assistant
 offers; either way there is no new login.
@@ -281,15 +343,18 @@ offers; either way there is no new login.
 pairing waited for a project. It continues when the add-on starts again,
 without a new login, as long as that is within 15 minutes of approving.
 
-**Pairing says "Choosing a project took too long".** Nobody set `project` in
-time. Set it on the Configuration tab, click Save, and restart the add-on.
-You approve again, and it pairs straight away with that project.
+**Pairing says "No project was chosen in time" or "Choosing a project took
+too long".** Nobody chose one within 30 minutes of approving, and the
+approval is no longer good. Click **Get a new code** on the page, or restart
+the add-on, and approve again.
 
 **Pairing stops with "can create the service account but can't grant it
 access".** See "What pairing creates".
 
-**Pairing says "Nobody approved a code within 60 minutes".** Restart the
-add-on to get a new code.
+**The page says "The code expired".** Nobody approved a code within 20
+minutes. Click **Get a new code**. (Pairing from the log without the page
+waits 60 minutes, then says `Nobody approved a code within 60 minutes`;
+restart the add-on to get a new code.)
 
 The add-on mints its tokens inside the daemon, so a credential problem shows
 up in the add-on's log as a `service account:` error: an unreadable or
@@ -331,7 +396,10 @@ most an hour, even with the request timeout raised (see "Request timeout").
 A live view, such as an add-on's log, left open longer than that is cut, and
 reloading the page starts a new hour. The same applies to downloads.
 
-The watchdog in `config.yaml` restarts the add-on if the daemon's local API
-stops answering. That proves the process is alive; it does **not** prove the
-tunnel is serving. Those are separate failure modes, and detecting the second
-one is tracked separately.
+The watchdog (off by default; turn it on on the Info tab) restarts the add-on
+if the Datum Connect page's port stops answering. Before 0.3.0 it watched the
+daemon's API port, which listens on `127.0.0.1` only, while the Supervisor's
+watchdog connects to `172.30.32.1`, so with the watchdog on it could never
+connect. That proves the process is alive; it does **not** prove the tunnel
+is serving. Those are separate failure modes, and detecting the second one is
+tracked separately.

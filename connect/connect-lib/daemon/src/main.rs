@@ -31,7 +31,9 @@ use serde_json::json;
 use tokio::sync::{Mutex, RwLock};
 use tracing_subscriber::prelude::*;
 
+mod addon_page;
 mod auth;
+mod ingress;
 mod inspector;
 mod logs;
 mod peer;
@@ -283,6 +285,27 @@ struct Args {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     edge_policies: bool,
+    /// Serve the Home Assistant add-on's page (ingress) on this port: the
+    /// tunnel's status, Re-pair and Unpair for the daemon; the "Connect to
+    /// Datum" flow for `setup`. Set by the add-on. Unset, there is no page.
+    /// See `ingress.rs`.
+    #[clap(long, env = "DATUM_INGRESS_PORT", global = true)]
+    ingress_port: Option<u16>,
+    /// Where the page listens: `auto` is the address the Home Assistant
+    /// Supervisor's ingress proxy connects to, asked of the Supervisor
+    /// (loopback outside an add-on), or an IP. Never every address: with
+    /// host networking that is the LAN.
+    #[clap(long, env = "DATUM_INGRESS_BIND", default_value = "auto", global = true)]
+    ingress_bind: String,
+    /// Whom the page answers: `auto` is the Supervisor's own address (the
+    /// ingress proxy), or a comma-separated list of IPs. Everyone else is
+    /// refused.
+    #[clap(long, env = "DATUM_INGRESS_ALLOW", default_value = "auto", global = true)]
+    ingress_allow: String,
+    /// Where pairing saves its key. The page's Re-pair and Unpair only ever
+    /// delete a key at this path, and only when the daemon runs on it.
+    #[clap(long, env = "DATUM_PAIRED_KEY_FILE", global = true)]
+    paired_key_file: Option<std::path::PathBuf>,
     /// Without a subcommand, runs the daemon.
     #[command(subcommand)]
     command: Option<Command>,
@@ -328,7 +351,38 @@ enum Command {
         #[clap(long, env = "DATUM_PAIRING_SESSION_FILE")]
         session_file: Option<std::path::PathBuf>,
     },
+    /// `pair`, from a page: serve the add-on's page on `--ingress-port`,
+    /// start pairing when "Connect to Datum" is clicked there, let the
+    /// project be chosen from a list, and exit 0 once the key is saved.
+    /// The link and code are still logged and shown as a notification, and
+    /// `project` saved on the Configuration tab still counts. If the page
+    /// cannot be served, this is `pair`. Used by the Home Assistant add-on
+    /// since 0.3.0.
+    Setup {
+        /// Preselected on the page; the person still confirms it.
+        #[clap(long)]
+        project: Option<String>,
+        #[clap(long)]
+        key_out: std::path::PathBuf,
+        /// As for `pair`.
+        #[clap(long)]
+        hold_port: Option<u16>,
+        /// As for `pair`: where else a chosen project may come from.
+        #[clap(long, env = "DATUM_PAIRING_OPTIONS_SOURCE", default_value = "auto")]
+        options_source: OptionsSource,
+        /// As for `pair`.
+        #[clap(long, env = "DATUM_PAIRING_SESSION_FILE")]
+        session_file: Option<std::path::PathBuf>,
+    },
 }
+
+/// How long `setup` keeps offering new codes after "Connect to Datum": a
+/// person clicked and is looking, so a code nobody approves within this
+/// ends in "Get a new code" rather than rotating for an hour.
+const SETUP_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+/// How long `setup` keeps the page up after the key is saved, so that the
+/// page shows "Done" before the daemon's own page replaces it.
+const SETUP_HANDOVER: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// `pair`'s exit status when the add-on is stopped while pairing waits with
 /// its login saved: not a failure, since the next start carries on.
@@ -669,6 +723,40 @@ mod args_tests {
         let again = choose_project_line(&projects, Some("nope"), std::time::Duration::from_secs(600));
         assert!(again.starts_with("'nope' isn't one of your projects. Your Datum login can see 2 projects."), "{again}");
         assert!(again.contains("(waiting up to 10 minutes)"), "{again}");
+    }
+
+    /// The add-on runs `setup --key-out <path> --hold-port 47780
+    /// --options-source supervisor --session-file <path> --ingress-port N`.
+    #[test]
+    fn setup_subcommand_parses_with_the_page_flags() {
+        let args = Args::try_parse_from([
+            "datum-connect-daemon", "setup", "--key-out", "/data/k.json", "--hold-port", "47780",
+            "--options-source", "supervisor", "--session-file", "/data/s.json", "--project", "p-1",
+            "--ingress-port", "47781",
+        ])
+        .unwrap();
+        assert_eq!(args.ingress_port, Some(47781));
+        match args.command {
+            Some(Command::Setup { project, key_out, hold_port: Some(47780), options_source: OptionsSource::Supervisor, session_file: Some(s) }) => {
+                assert_eq!(project.as_deref(), Some("p-1"));
+                assert_eq!(key_out, std::path::PathBuf::from("/data/k.json"));
+                assert_eq!(s, std::path::PathBuf::from("/data/s.json"));
+            }
+            other => panic!("{other:?}"),
+        }
+        if std::env::var_os("DATUM_INGRESS_BIND").is_none() && std::env::var_os("DATUM_INGRESS_ALLOW").is_none() {
+            assert_eq!((args.ingress_bind.as_str(), args.ingress_allow.as_str()), ("auto", "auto"));
+        }
+        // The daemon takes them too, before or without a subcommand.
+        let args = Args::try_parse_from([
+            "datum-connect-daemon", "--port", "1", "--ingress-port", "2", "--ingress-bind", "172.30.32.1",
+            "--paired-key-file", "/data/service-account.json",
+        ])
+        .unwrap();
+        assert!(args.command.is_none());
+        assert_eq!(args.ingress_port, Some(2));
+        assert_eq!(args.ingress_bind, "172.30.32.1");
+        assert_eq!(args.paired_key_file, Some(std::path::PathBuf::from("/data/service-account.json")));
     }
 
     #[test]
@@ -1371,15 +1459,6 @@ async fn pair(
 ) -> n0_error::Result<()> {
     use connect_lib::datum_cloud::ha_supervisor::{PairingNotifier, Supervisor};
     use connect_lib::datum_cloud::pairing::{self, PairingConfig, PairingEvent, ProjectWait};
-    use std::io::Write;
-
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("datum_connect_daemon=warn,connect_lib=warn")),
-        )
-        .init();
 
     let mut cfg = PairingConfig::from_env(project, key_out);
     cfg.session_file = session_file;
@@ -1393,37 +1472,7 @@ async fn pair(
         if let Some(n) = &notifier {
             n.event(&event);
         }
-        let line = match event {
-            PairingEvent::Code { url, user_code, expires_in } => format!(
-                "To connect this Home Assistant to Datum, open {url} and enter code {user_code} (expires in {})",
-                minutes(expires_in)
-            ),
-            PairingEvent::CodeExpired => "That code expired before it was approved. Here is a new one.".into(),
-            PairingEvent::Approved { email } => format!("Approved as {email}"),
-            PairingEvent::Resumed { email } => format!("Continuing pairing as {email} (no new login needed)"),
-            PairingEvent::SessionDropped { reason } => {
-                format!("Could not continue the earlier pairing: {reason}. Starting a new login.")
-            }
-            PairingEvent::ChooseProject { projects, rejected, wait } => {
-                choose_project_line(&projects, rejected.as_deref(), wait)
-            }
-            PairingEvent::ProjectSelected { project, organization } => {
-                format!("Using project {project} (organization {organization})")
-            }
-            PairingEvent::ServiceAccountCreated { email, project } => {
-                format!("Created service account {email} in project {project}")
-            }
-            PairingEvent::ServiceAccountReused { email, project } => {
-                format!("Using service account {email} in project {project}, created by the previous attempt")
-            }
-            PairingEvent::AccessGranted => "Granted access".into(),
-            PairingEvent::AccessNotConfirmed { email, project } => format!(
-                "Could not grant access again; carrying on in case an owner has granted it. If tunnel calls are refused, ask an organization owner or editor to grant role 'editor' to service account {email} on project {project}."
-            ),
-            PairingEvent::KeySaved { .. } => "Saved key".into(),
-        };
-        println!("{line}");
-        let _ = std::io::stdout().flush();
+        say_line(&pairing_line(&event));
     };
     // A port that cannot be held only matters if a watchdog is watching,
     // so it is worth a warning, never a failed pairing.
@@ -1464,8 +1513,7 @@ async fn pair(
     let paired = match outcome {
         Some(r) => r.map_err(|e| n0_error::anyerr!("Pairing with Datum failed: {e}"))?,
         None if paused => {
-            println!("Pairing paused; it continues after the restart without a new login.");
-            let _ = std::io::stdout().flush();
+            say_line("Pairing paused; it continues after the restart without a new login.");
             std::process::exit(PAIR_PAUSED_EXIT);
         }
         None => return Err(n0_error::anyerr!("Pairing with Datum stopped before it finished.")),
@@ -1474,6 +1522,226 @@ async fn pair(
         "Paired: this device now uses service account {} in project {}. To revoke it, delete that service account in the Datum portal under the project's Service accounts.",
         paired.service_account_email, paired.project
     );
+    Ok(())
+}
+
+/// What `pair` and `setup` print for each event. Their stdout is what a
+/// person reads (the add-on's log), so it says what happens in plain words.
+fn pairing_line(event: &connect_lib::datum_cloud::pairing::PairingEvent) -> String {
+    use connect_lib::datum_cloud::pairing::PairingEvent;
+    match event {
+        PairingEvent::Code { url, user_code, expires_in } => format!(
+            "To connect this Home Assistant to Datum, open {url} and enter code {user_code} (expires in {})",
+            minutes(*expires_in)
+        ),
+        PairingEvent::CodeExpired => "That code expired before it was approved. Here is a new one.".into(),
+        PairingEvent::Approved { email } => format!("Approved as {email}"),
+        PairingEvent::Resumed { email } => format!("Continuing pairing as {email} (no new login needed)"),
+        PairingEvent::SessionDropped { reason } => {
+            format!("Could not continue the earlier pairing: {reason}. Starting a new login.")
+        }
+        PairingEvent::ChooseProject { projects, rejected, wait } => {
+            choose_project_line(projects, rejected.as_deref(), *wait)
+        }
+        PairingEvent::ProjectSelected { project, organization } => {
+            format!("Using project {project} (organization {organization})")
+        }
+        PairingEvent::ServiceAccountCreated { email, project } => {
+            format!("Created service account {email} in project {project}")
+        }
+        PairingEvent::ServiceAccountReused { email, project } => {
+            format!("Using service account {email} in project {project}, created by the previous attempt")
+        }
+        PairingEvent::AccessGranted => "Granted access".into(),
+        PairingEvent::AccessNotConfirmed { email, project } => format!(
+            "Could not grant access again; carrying on in case an owner has granted it. If tunnel calls are refused, ask an organization owner or editor to grant role 'editor' to service account {email} on project {project}."
+        ),
+        PairingEvent::KeySaved { .. } => "Saved key".into(),
+    }
+}
+
+fn say_line(line: &str) {
+    use std::io::Write;
+    println!("{line}");
+    let _ = std::io::stdout().flush();
+}
+
+/// `setup`'s log and notification. The notification points at the page,
+/// with the link and code as the fallback; the log keeps every line `pair`
+/// prints, so a person with only the log can still pair.
+struct SetupLog {
+    notifier: std::sync::Mutex<Option<connect_lib::datum_cloud::ha_supervisor::PairingNotifier>>,
+    panel: Option<String>,
+}
+
+impl SetupLog {
+    fn notify(&self, f: impl FnOnce(&connect_lib::datum_cloud::ha_supervisor::PairingNotifier)) {
+        if let Some(n) = self.notifier.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            f(n);
+        }
+    }
+}
+
+impl connect_lib::datum_cloud::pairing_setup::SetupObserver for SetupLog {
+    fn event(&self, event: &connect_lib::datum_cloud::pairing::PairingEvent) {
+        use connect_lib::datum_cloud::ha_supervisor::{setup_choose_message, setup_code_message};
+        use connect_lib::datum_cloud::pairing::PairingEvent;
+        let panel = self.panel.as_deref();
+        match event {
+            PairingEvent::ChooseProject { projects, .. } => {
+                let mut line = format!(
+                    "Signed in. Choose the project on the Datum Connect page, or set 'project' on the add-on's Configuration tab to one of these {} ids and click Save:",
+                    projects.len()
+                );
+                for p in projects {
+                    line.push_str(&format!("\n  {} ({}, organization {})", p.id, p.display_name, p.organization));
+                }
+                say_line(&line);
+                self.notify(|n| n.show(setup_choose_message(panel, projects.len())));
+            }
+            PairingEvent::Code { url, user_code, expires_in } => {
+                say_line(&pairing_line(event));
+                self.notify(|n| n.show(setup_code_message(panel, url, user_code, *expires_in)));
+            }
+            other => say_line(&pairing_line(other)),
+        }
+    }
+
+    fn outcome(&self, result: &Result<connect_lib::datum_cloud::pairing::PairedKey, connect_lib::datum_cloud::pairing::PairingError>) {
+        use connect_lib::datum_cloud::ha_supervisor::setup_failure_message;
+        use connect_lib::datum_cloud::pairing_setup::error_view;
+        match result {
+            Ok(_) => self.notify(|n| n.dismiss()),
+            Err(e) => {
+                let message = error_view(e).message;
+                say_line(&format!("Pairing with Datum did not finish: {message} Open the Datum Connect page to try again."));
+                self.notify(|n| n.show(setup_failure_message(self.panel.as_deref(), &message)));
+            }
+        }
+    }
+}
+
+/// `datum-connect-daemon setup`. See `Command::Setup`.
+#[allow(clippy::too_many_arguments)]
+async fn setup(
+    project: Option<String>,
+    key_out: std::path::PathBuf,
+    hold_port: Option<u16>,
+    options_source: OptionsSource,
+    session_file: Option<std::path::PathBuf>,
+    ingress_port: Option<u16>,
+    ingress_bind: &str,
+    ingress_allow: &str,
+) -> n0_error::Result<()> {
+    use connect_lib::datum_cloud::ha_supervisor::{PairingNotifier, Supervisor, panel_path, setup_waiting_message};
+    use connect_lib::datum_cloud::pairing::PairingConfig;
+    use connect_lib::datum_cloud::pairing_setup::SetupController;
+
+    let supervisor = Supervisor::from_env();
+    // Without a page, pairing from the log and notification is still
+    // pairing: fall back to `pair` rather than fail.
+    let Some(port) = ingress_port else {
+        tracing::warn!("setup: no --ingress-port, so no page; pairing from the log instead");
+        return pair(project, key_out, hold_port, options_source, session_file).await;
+    };
+    let (bind, allowed) = match ingress::resolve_addresses(ingress_bind, ingress_allow, supervisor.as_ref()).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("setup: {e}; pairing from the log instead");
+            return pair(project, key_out, hold_port, options_source, session_file).await;
+        }
+    };
+    let listener = match ingress::bind(bind, port).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(
+                "setup: cannot serve the Datum Connect page on {bind}:{port} ({e}); pairing from the log and notification instead"
+            );
+            return pair(project, key_out, hold_port, options_source, session_file).await;
+        }
+    };
+
+    let mut cfg = PairingConfig::from_env(project, key_out);
+    cfg.session_file = session_file;
+    cfg.max_wait = SETUP_MAX_WAIT;
+    let fallback = options_source.resolve(supervisor.as_ref());
+    let panel = match &supervisor {
+        Some(s) => match s.self_info().await {
+            Ok(info) => panel_path(&info.slug),
+            Err(e) => {
+                tracing::warn!("setup: cannot ask the Supervisor for this add-on's slug, so the notification cannot link to the page: {e}");
+                None
+            }
+        },
+        None => None,
+    };
+    let log = Arc::new(SetupLog {
+        notifier: std::sync::Mutex::new(supervisor.clone().map(PairingNotifier::spawn)),
+        panel: panel.clone(),
+    });
+    let ctl = SetupController::new(cfg, fallback, Some(log.clone()));
+    let server = ingress::serve_on(listener, ingress::router(ingress::Backend::Setup(ctl.clone()), allowed.clone()));
+    tracing::info!(%bind, port, ?allowed, "serving the Datum Connect page");
+
+    let holder = match hold_port {
+        Some(p) => match PortHolder::bind(p).await {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::warn!("setup: cannot hold port {p} for the watchdog, carrying on: {e}");
+                None
+            }
+        },
+        None => None,
+    };
+
+    say_line(
+        "This Home Assistant isn't connected to Datum yet. Open Datum Connect (in the sidebar, or Settings > Apps > Datum Connect > Open Web UI) and click Connect to Datum.",
+    );
+    log.notify(|n| n.show(setup_waiting_message(panel.as_deref())));
+    // A login kept by a run stopped while choosing a project: carry on
+    // with it, so the page opens on the project list.
+    if ctl.has_saved_session() {
+        ctl.start();
+    }
+
+    let outcome = tokio::select! {
+        key = ctl.paired() => Some(key),
+        _ = shutdown_signal() => None,
+    };
+    let paused = match &outcome {
+        Some(key) => {
+            say_line(&format!(
+                "Paired: this device now uses service account {} in project {}. To revoke it, delete that service account in the Datum portal under the project's Service accounts.",
+                key.service_account_email, key.project
+            ));
+            tokio::time::sleep(SETUP_HANDOVER).await;
+            false
+        }
+        None => {
+            ctl.stop().await;
+            let paused = ctl.has_saved_session();
+            log.notify(|n| if paused { n.paused() } else { n.dismiss() });
+            paused
+        }
+    };
+    server.abort();
+    let _ = server.await;
+    let notifier = log.notifier.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(n) = notifier {
+        n.finish().await;
+    }
+    if let Some(holder) = holder {
+        holder.release().await;
+    }
+    if outcome.is_none() {
+        say_line(if paused {
+            "Pairing paused; it continues after the restart without a new login."
+        } else {
+            "Stopped before connecting to Datum; the page offers it again on the next start."
+        });
+        // Not a failure either way: the add-on was stopped.
+        std::process::exit(PAIR_PAUSED_EXIT);
+    }
     Ok(())
 }
 
@@ -1557,6 +1825,18 @@ fn choose_project_line(
     line
 }
 
+/// `pair` and `setup` log to stderr only, and quietly: their stdout is
+/// what a person reads.
+fn init_pairing_tracing() {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("datum_connect_daemon=warn,connect_lib=warn")),
+        )
+        .init();
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
@@ -1572,8 +1852,26 @@ async fn run() -> n0_error::Result<()> {
 
     let args = Args::parse();
 
-    if let Some(Command::Pair { project, key_out, hold_port, options_source, session_file }) = args.command {
-        return pair(project, key_out, hold_port, options_source, session_file).await;
+    match args.command {
+        Some(Command::Pair { project, key_out, hold_port, options_source, session_file }) => {
+            init_pairing_tracing();
+            return pair(project, key_out, hold_port, options_source, session_file).await;
+        }
+        Some(Command::Setup { project, key_out, hold_port, options_source, session_file }) => {
+            init_pairing_tracing();
+            return setup(
+                project,
+                key_out,
+                hold_port,
+                options_source,
+                session_file,
+                args.ingress_port,
+                &args.ingress_bind,
+                &args.ingress_allow,
+            )
+            .await;
+        }
+        None => {}
     }
 
     let session = std::env::var("DATUM_SESSION").ok();
@@ -1725,6 +2023,30 @@ async fn run() -> n0_error::Result<()> {
         .await
         {
             tracing::warn!("failed to auto-register daemon log source: {err}");
+        }
+    }
+
+    // The add-on's page, up before reconciling, so that it answers while
+    // the tunnels are brought back. Never fatal: the tunnel matters more.
+    if let Some(port) = args.ingress_port {
+        let supervisor = connect_lib::datum_cloud::ha_supervisor::Supervisor::from_env();
+        match ingress::resolve_addresses(&args.ingress_bind, &args.ingress_allow, supervisor.as_ref()).await {
+            Ok((bind, allowed)) => match ingress::bind(bind, port).await {
+                Ok(listener) => {
+                    let view = addon_page::DaemonPaired::new(
+                        state.clone(),
+                        std::env::var_os("DATUM_SA_KEY_FILE").map(std::path::PathBuf::from),
+                        args.paired_key_file.clone(),
+                        supervisor,
+                    );
+                    let router = ingress::router(ingress::Backend::Paired(Arc::new(view)), allowed.clone());
+                    // Detached: it serves for as long as the daemon runs.
+                    drop(ingress::serve_on(listener, router));
+                    tracing::info!(%bind, port, ?allowed, "serving the Datum Connect page");
+                }
+                Err(e) => tracing::warn!("cannot serve the Datum Connect page on {bind}:{port}: {e}"),
+            },
+            Err(e) => tracing::warn!("not serving the Datum Connect page: {e}"),
         }
     }
 

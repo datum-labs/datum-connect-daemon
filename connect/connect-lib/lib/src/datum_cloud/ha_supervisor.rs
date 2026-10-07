@@ -33,6 +33,35 @@
 //!   Supervisor's bypass list (`api/middleware/security.py`), so it needs no
 //!   role at all. It is used here rather than `/addons/self/info`, whose
 //!   `options` are the same values unvalidated, in a much larger reply.
+//!
+//! And for the setup page the add-on serves through ingress (the sidebar
+//! panel), from the same source (`supervisor/apps/app.py`,
+//! `docker/app.py`, `docker/network.py`, `api/ingress.py`,
+//! `misc/tasks.py`):
+//!
+//! - The ingress proxy connects to `http://{app.ip_address}:{ingress_port}`.
+//!   For a `host_network` add-on, `ip_address` is the `hassio` Docker
+//!   network's gateway, `172.30.32.1` (`DOCKER_IPV4_NETWORK_MASK[1]`, a
+//!   constant `172.30.32.0/23`): the host's own address on that bridge. It
+//!   is reported as `ip_address` by `GET /addons/self/info`.
+//! - The connection comes from the Supervisor's container, `172.30.32.2`
+//!   (`DOCKER_IPV4_NETWORK_MASK[2]`). Every other add-on on the `hassio`
+//!   network can reach the gateway address too, which is why the page also
+//!   checks who is connecting. `GET /network/info` reports the network as
+//!   `docker.address`.
+//! - The `tcp://` watchdog dials the same `ip_address`, not loopback, and
+//!   only when the user has turned the watchdog on (it is off by default).
+//! - `POST /addons/self/restart` and `GET /addons/self/info` are on the
+//!   bypass list, so they need no role; `/network/info` is allowed for the
+//!   default role (`/.+/info`), with `hassio_api: true`.
+//! - The page is opened in Home Assistant at `/app/<slug>` (frontend
+//!   `ha-panel-app`, the `app` panel Core registers since early 2026;
+//!   before that it was `/hassio/ingress/<slug>`), with or without "Show in
+//!   sidebar" turned on. A repository add-on's slug carries a prefix
+//!   derived from the repository (`<hash>_datum_connect`), so it is read
+//!   from `/addons/self/info`, never assumed.
+
+use std::net::{IpAddr, Ipv4Addr};
 
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -55,6 +84,12 @@ pub const DEFAULT_URL: &str = "http://supervisor";
 /// replaces it, so a new code or a new project list never stacks up.
 pub const NOTIFICATION_ID: &str = "datum_connect_pairing";
 pub const NOTIFICATION_TITLE: &str = "Datum Connect: connect to Datum";
+
+/// Where the Supervisor's ingress proxy connects to a host-network add-on,
+/// and where it connects from, when the Supervisor cannot be asked. Both
+/// are constants in the Supervisor (see the module docs).
+pub const DEFAULT_INGRESS_BIND: Ipv4Addr = Ipv4Addr::new(172, 30, 32, 1);
+pub const DEFAULT_INGRESS_PROXY: Ipv4Addr = Ipv4Addr::new(172, 30, 32, 2);
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the end of pairing waits for queued notifications to go out.
@@ -172,6 +207,106 @@ impl Supervisor {
         Ok(project_option(options))
     }
 
+    /// `GET <path>` and its `data`, as the Supervisor wraps every reply.
+    async fn get_data(&self, path: &str) -> Result<Value, String> {
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .bearer_auth(self.token.expose_secret())
+            .send()
+            .await
+            .map_err(|e| self.redact(format!("cannot reach the Supervisor: {e}")))?;
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(self.redact(format!(
+                "the Supervisor answered HTTP {status} for {path}: {}",
+                excerpt(&text)
+            )));
+        }
+        let v: Value =
+            serde_json::from_str(&text).map_err(|_| format!("the Supervisor's reply to {path} is not JSON"))?;
+        Ok(v.get("data").cloned().unwrap_or(Value::Null))
+    }
+
+    /// What the Supervisor says about this add-on: its slug, and the
+    /// address and port its ingress proxy connects to.
+    pub async fn self_info(&self) -> Result<SelfInfo, String> {
+        let data = self.get_data("/addons/self/info").await?;
+        Ok(SelfInfo {
+            slug: data.get("slug").and_then(Value::as_str).unwrap_or_default().to_string(),
+            ip_address: data.get("ip_address").and_then(Value::as_str).and_then(|a| a.parse().ok()),
+            ingress_port: data
+                .get("ingress_port")
+                .and_then(Value::as_u64)
+                .and_then(|p| u16::try_from(p).ok())
+                .filter(|p| *p != 0),
+        })
+    }
+
+    /// The Supervisor's own address on the `hassio` network, where the
+    /// ingress proxy connects from: the network's second host address, as
+    /// the Supervisor defines it (see the module docs).
+    pub async fn proxy_address(&self) -> Result<IpAddr, String> {
+        let data = self.get_data("/network/info").await?;
+        let cidr = data
+            .pointer("/docker/address")
+            .and_then(Value::as_str)
+            .ok_or("the Supervisor did not say what its Docker network is")?;
+        nth_host(cidr, 2).ok_or_else(|| format!("the Supervisor's Docker network {cidr:?} is not an IPv4 network"))
+    }
+
+    /// Where the ingress page listens, and the one address it serves.
+    /// Each falls back to the Supervisor's constant, with a warning, if the
+    /// Supervisor cannot be asked: a guess that matches every Home
+    /// Assistant OS install is better than no page.
+    pub async fn ingress_addresses(&self) -> IngressAddresses {
+        let bind = match self.self_info().await {
+            Ok(SelfInfo { ip_address: Some(ip), .. }) => ip,
+            Ok(_) => {
+                tracing::warn!(
+                    "The Supervisor did not say where its ingress proxy connects; assuming {DEFAULT_INGRESS_BIND}"
+                );
+                IpAddr::V4(DEFAULT_INGRESS_BIND)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Could not ask the Supervisor where its ingress proxy connects, assuming {DEFAULT_INGRESS_BIND}: {e}"
+                );
+                IpAddr::V4(DEFAULT_INGRESS_BIND)
+            }
+        };
+        let proxy = match self.proxy_address().await {
+            Ok(ip) => ip,
+            Err(e) => {
+                tracing::warn!("Could not ask the Supervisor for its own address, assuming {DEFAULT_INGRESS_PROXY}: {e}");
+                IpAddr::V4(DEFAULT_INGRESS_PROXY)
+            }
+        };
+        IngressAddresses { bind, proxy }
+    }
+
+    /// Asks the Supervisor to restart this add-on. It answers once the
+    /// restart has been scheduled, so the caller may not live to see it.
+    pub async fn restart_self(&self) -> Result<(), String> {
+        let response = self
+            .http
+            .post(format!("{}/addons/self/restart", self.base))
+            .bearer_auth(self.token.expose_secret())
+            .send()
+            .await
+            .map_err(|e| self.redact(format!("cannot reach the Supervisor: {e}")))?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let text = response.text().await.unwrap_or_default();
+        Err(self.redact(format!(
+            "the Supervisor refused to restart the add-on (HTTP {status}): {}",
+            excerpt(&text)
+        )))
+    }
+
     fn redact(&self, message: String) -> String {
         let secret = self.token.expose_secret();
         if secret.is_empty() {
@@ -180,6 +315,49 @@ impl Supervisor {
             message.replace(secret, "[redacted]")
         }
     }
+}
+
+/// From `GET /addons/self/info`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelfInfo {
+    pub slug: String,
+    /// Where the ingress proxy and the watchdog connect to.
+    pub ip_address: Option<IpAddr>,
+    pub ingress_port: Option<u16>,
+}
+
+/// See [`Supervisor::ingress_addresses`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngressAddresses {
+    pub bind: IpAddr,
+    pub proxy: IpAddr,
+}
+
+impl Default for IngressAddresses {
+    fn default() -> Self {
+        Self {
+            bind: IpAddr::V4(DEFAULT_INGRESS_BIND),
+            proxy: IpAddr::V4(DEFAULT_INGRESS_PROXY),
+        }
+    }
+}
+
+/// Host `n` of an IPv4 network written `a.b.c.d/len`: Python's
+/// `IPv4Network(...)[n]`, which is how the Supervisor numbers its own
+/// addresses.
+fn nth_host(cidr: &str, n: u32) -> Option<IpAddr> {
+    let (addr, len) = cidr.trim().split_once('/')?;
+    let addr: Ipv4Addr = addr.parse().ok()?;
+    let len: u32 = len.parse().ok().filter(|l| *l <= 30)?;
+    let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+    let host = (u32::from(addr) & mask).checked_add(n)?;
+    Some(IpAddr::V4(Ipv4Addr::from(host)))
+}
+
+/// Where Home Assistant opens this add-on's page: see the module docs.
+pub fn panel_path(slug: &str) -> Option<String> {
+    let ok = !slug.is_empty() && slug.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'));
+    ok.then(|| format!("/app/{slug}"))
 }
 
 /// `options.project`, normalised, with empty meaning unset.
@@ -260,6 +438,11 @@ impl PairingNotifier {
             }
             _ => return,
         };
+        let _ = self.tx.send(Note::Show(message));
+    }
+
+    /// Shows `message` as the notification, replacing what is shown.
+    pub fn show(&self, message: String) {
         let _ = self.tx.send(Note::Show(message));
     }
 
@@ -350,6 +533,59 @@ pub fn failure_message(reason: &str) -> String {
     } else {
         format!("Pairing with Datum failed: {escaped}\n\nRestart the add-on to try again.")
     }
+}
+
+// ---- The notifications pairing from the setup page shows ----
+//
+// With the page, the notification points at it rather than carrying the
+// whole flow. The approval link and code are still in it, and in the log,
+// for whoever cannot open the page.
+
+/// "[Open Datum Connect](/app/<slug>)", or where to find it when the slug
+/// is unknown.
+fn panel_link(panel: Option<&str>) -> String {
+    match panel {
+        Some(p) => format!("[Open Datum Connect]({})", link_target(p)),
+        None => "Open **Datum Connect** (Settings, Apps, Datum Connect, Open Web UI)".into(),
+    }
+}
+
+/// Before anything has been started on the page.
+pub fn setup_waiting_message(panel: Option<&str>) -> String {
+    format!(
+        "This Home Assistant isn't connected to Datum yet. {} and click **Connect to Datum**.",
+        panel_link(panel)
+    )
+}
+
+/// A code has been issued, from the page.
+pub fn setup_code_message(panel: Option<&str>, url: &str, user_code: &str, expires_in: Duration) -> String {
+    format!(
+        "{} to finish connecting to Datum. Or [open the Datum approval page]({}) and confirm code **{}** (expires in {}).",
+        panel_link(panel),
+        link_target(url),
+        escape(user_code),
+        duration_words(expires_in)
+    )
+}
+
+/// Approved; the page lists the projects.
+pub fn setup_choose_message(panel: Option<&str>, projects: usize) -> String {
+    let which = if projects == 1 {
+        "confirm the project".to_string()
+    } else {
+        format!("choose one of your {projects} projects")
+    };
+    format!(
+        "Signed in to Datum. {} to finish: {which} there, or set **project** on the add-on's Configuration tab and click Save.",
+        panel_link(panel)
+    )
+}
+
+/// Pairing stopped; the page offers to try again.
+pub fn setup_failure_message(panel: Option<&str>, reason: &str) -> String {
+    let escaped = escape(reason.trim()).replace('\n', "  \n");
+    format!("Connecting to Datum failed: {escaped}\n\n{} to try again.", panel_link(panel))
 }
 
 /// Markdown is rendered, so text from elsewhere (display names, a typed
@@ -455,6 +691,38 @@ mod tests {
             std::env::remove_var(TOKEN_ENV);
             std::env::remove_var(URL_ENV);
         }
+    }
+
+    #[test]
+    fn nth_host_numbers_like_the_supervisor() {
+        assert_eq!(nth_host("172.30.32.0/23", 1), Some(IpAddr::V4(DEFAULT_INGRESS_BIND)));
+        assert_eq!(nth_host("172.30.32.0/23", 2), Some(IpAddr::V4(DEFAULT_INGRESS_PROXY)));
+        assert_eq!(nth_host(" 10.1.2.77/24", 2), Some("10.1.2.2".parse().unwrap()), "host bits ignored");
+        assert_eq!(nth_host("fd0c::/64", 2), None);
+        assert_eq!(nth_host("172.30.32.0", 2), None);
+        assert_eq!(nth_host("172.30.32.0/32", 2), None);
+    }
+
+    #[test]
+    fn panel_path_only_takes_a_slug() {
+        assert_eq!(panel_path("a0d7b954_datum_connect").as_deref(), Some("/app/a0d7b954_datum_connect"));
+        assert_eq!(panel_path(""), None);
+        assert_eq!(panel_path("x)(javascript:alert(1)"), None);
+        assert_eq!(panel_path("../x"), None);
+    }
+
+    #[test]
+    fn setup_messages_point_at_the_page_and_escape() {
+        let m = setup_code_message(Some("/app/s_1"), "https://a.example/d?user_code=AB-CD", "AB-CD", Duration::from_secs(300));
+        assert_eq!(
+            m,
+            "[Open Datum Connect](/app/s_1) to finish connecting to Datum. Or [open the Datum approval page](https://a.example/d?user_code=AB-CD) and confirm code **AB-CD** (expires in 5 minutes)."
+        );
+        assert!(setup_waiting_message(None).contains("Open Web UI"));
+        assert!(setup_choose_message(Some("/app/s"), 1).contains("finish: confirm the project there"));
+        assert!(setup_choose_message(Some("/app/s"), 3).contains("finish: choose one of your 3 projects there"));
+        let f = setup_failure_message(Some("/app/s"), "no *access*\nat all");
+        assert_eq!(f, "Connecting to Datum failed: no \\*access\\*  \nat all\n\n[Open Datum Connect](/app/s) to try again.");
     }
 
     #[tokio::test]

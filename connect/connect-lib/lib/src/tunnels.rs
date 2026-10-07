@@ -7,7 +7,7 @@ use kube::{Api, ResourceExt};
 use n0_error::{Result, StdResultExt, StackResultExt};
 use serde::Serialize;
 use serde_json::json;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::datum_apis::connector::{
     CONNECTOR_CONDITION_IROH_DNS_PUBLISHED, CONNECTOR_CONDITION_READY,
@@ -36,7 +36,12 @@ use crate::datum_cloud::DatumCloudClient;
 use crate::edge_policies::{self, EdgeTarget};
 use crate::kube_error::is_quota_check_timeout;
 use crate::{DEFAULT_PCP_NAMESPACE, Advertisment, ListenNode, TcpProxyData, state::ProxyState};
-const DEFAULT_CONNECTOR_CLASS_NAME: &str = "datum-connect";
+/// The ConnectorClasses new Connectors use, in order of preference.
+/// `iroh-quic-tunnel` is the current name and `datum-connect` the legacy
+/// one, both for the same controller: network-services-operator's
+/// `allowedIrohControllerNames` (`internal/controller/iroh_dns_controller.go`)
+/// keeps the legacy name "alive while older desktop builds churn out".
+const CONNECTOR_CLASS_NAMES: [&str; 2] = ["iroh-quic-tunnel", "datum-connect"];
 const CONNECTOR_SELECTOR_FIELD: &str = "status.connectionDetails.publicKey.id";
 const ADVERTISEMENT_CONNECTOR_FIELD: &str = "spec.connectorRef.name";
 const DISPLAY_NAME_ANNOTATION: &str = "app.kubernetes.io/name";
@@ -1584,31 +1589,22 @@ impl TunnelService {
 
     async fn resolve_connector_class(client: kube::Client) -> Result<String> {
         let classes: Api<ConnectorClass> = Api::all(client);
+        let fallback = CONNECTOR_CLASS_NAMES[0];
         match classes.list(&ListParams::default()).await {
-            Ok(class_list) if !class_list.items.is_empty() => {
-                for c in &class_list.items {
-                    if c.name_any() == DEFAULT_CONNECTOR_CLASS_NAME {
-                        return Ok(DEFAULT_CONNECTOR_CLASS_NAME.to_string());
-                    }
+            Ok(class_list) => {
+                let names: Vec<String> = class_list.items.iter().map(|c| c.name_any()).collect();
+                let (name, how) = pick_connector_class(&names);
+                match how {
+                    ClassPick::Current => debug!(class = %name, "using ConnectorClass"),
+                    ClassPick::Legacy => info!(class = %name, "using the legacy ConnectorClass name; this cluster has no '{fallback}'"),
+                    ClassPick::Other => info!(class = %name, "neither ConnectorClass {CONNECTOR_CLASS_NAMES:?} exists; using '{name}'"),
+                    ClassPick::NoneListed => info!("no ConnectorClass listed in this cluster; using '{name}'"),
                 }
-                let fallback = class_list
-                    .items
-                    .first()
-                    .map(|c| c.name_any())
-                    .context("No ConnectorClass available")?;
-                warn!(
-                    %fallback,
-                    "ConnectorClass '{DEFAULT_CONNECTOR_CLASS_NAME}' not found, using '{fallback}'"
-                );
-                Ok(fallback)
-            }
-            Ok(_) => {
-                warn!("No ConnectorClass found in cluster; using default '{DEFAULT_CONNECTOR_CLASS_NAME}'");
-                Ok(DEFAULT_CONNECTOR_CLASS_NAME.to_string())
+                Ok(name)
             }
             Err(e) => {
-                warn!("Failed to list ConnectorClasses (using default '{DEFAULT_CONNECTOR_CLASS_NAME}'): {e:#}");
-                Ok(DEFAULT_CONNECTOR_CLASS_NAME.to_string())
+                warn!("Failed to list ConnectorClasses (using '{fallback}'): {e:#}");
+                Ok(fallback.to_string())
             }
         }
     }
@@ -2161,6 +2157,51 @@ fn create_traffic_protection_policies_enabled() -> bool {
         })
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
+}
+
+/// How [`pick_connector_class`] chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClassPick {
+    Current,
+    Legacy,
+    Other,
+    NoneListed,
+}
+
+/// The first of [`CONNECTOR_CLASS_NAMES`] that exists, else the first that
+/// does, else the current name.
+fn pick_connector_class(existing: &[String]) -> (String, ClassPick) {
+    let has = |n: &str| existing.iter().any(|e| e == n);
+    if has(CONNECTOR_CLASS_NAMES[0]) {
+        (CONNECTOR_CLASS_NAMES[0].to_string(), ClassPick::Current)
+    } else if has(CONNECTOR_CLASS_NAMES[1]) {
+        (CONNECTOR_CLASS_NAMES[1].to_string(), ClassPick::Legacy)
+    } else if let Some(first) = existing.first() {
+        (first.clone(), ClassPick::Other)
+    } else {
+        (CONNECTOR_CLASS_NAMES[0].to_string(), ClassPick::NoneListed)
+    }
+}
+
+#[cfg(test)]
+mod connector_class_tests {
+    use super::*;
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_current_name_wins_then_the_legacy_one() {
+        assert_eq!(
+            pick_connector_class(&names(&["datum-connect", "iroh-quic-tunnel"])),
+            ("iroh-quic-tunnel".into(), ClassPick::Current)
+        );
+        assert_eq!(pick_connector_class(&names(&["iroh-quic-tunnel"])), ("iroh-quic-tunnel".into(), ClassPick::Current));
+        assert_eq!(pick_connector_class(&names(&["other", "datum-connect"])), ("datum-connect".into(), ClassPick::Legacy));
+        assert_eq!(pick_connector_class(&names(&["other"])), ("other".into(), ClassPick::Other));
+        assert_eq!(pick_connector_class(&[]), ("iroh-quic-tunnel".into(), ClassPick::NoneListed));
+    }
 }
 
 #[cfg(test)]

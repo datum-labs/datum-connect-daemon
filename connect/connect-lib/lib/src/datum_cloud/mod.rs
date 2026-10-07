@@ -14,6 +14,7 @@ pub mod env;
 pub mod external_token_source;
 pub mod ha_supervisor;
 pub mod pairing;
+pub mod pairing_setup;
 pub mod service_account;
 
 pub use self::{
