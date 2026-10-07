@@ -76,6 +76,9 @@ pub(crate) trait PairedView: Send + Sync {
     /// `connect_lib::datum_cloud::ha_core`). Returns once started; the
     /// status shows how it goes.
     fn allow_proxies(&self) -> BoxFuture<'_, Result<(), ActionError>>;
+    /// Ends setup's trusted-proxy step without changing Home Assistant:
+    /// the person sets it up in Settings → System → Network instead.
+    fn skip_proxies(&self) -> BoxFuture<'_, Result<(), ActionError>>;
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -125,6 +128,11 @@ pub(crate) struct ProxyStepView {
     /// asked).
     pub state: &'static str,
     pub message: Option<String>,
+    /// Shown as the last step of setting up the add-on (with Allow and
+    /// Skip), rather than as a row of the tunnel's status: until it is
+    /// allowed, skipped or found already set up, and right after an Allow
+    /// that worked, for its ✓.
+    pub setup: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -189,6 +197,7 @@ pub(crate) fn router(backend: Backend, allowed: Vec<IpAddr>) -> Router {
         .route("/api/unpair", post(unpair))
         .route("/api/remove-tunnel", post(remove_tunnel))
         .route("/api/allow-proxies", post(allow_proxies))
+        .route("/api/skip-proxies", post(skip_proxies))
         .layer(middleware::from_fn_with_state(state.clone(), csrf_check))
         .layer(middleware::from_fn_with_state(state.clone(), peer_check))
         .layer(middleware::map_response(harden))
@@ -486,6 +495,16 @@ async fn allow_proxies(State(state): State<Arc<Ingress>>) -> Response {
     }
 }
 
+async fn skip_proxies(State(state): State<Arc<Ingress>>) -> Response {
+    let Backend::Paired(view) = &state.backend else {
+        return wrong_mode(&state);
+    };
+    match view.skip_proxies().await {
+        Ok(()) => Json(state_body(&state).await).into_response(),
+        Err(e) => (e.status, Json(json!({"error": "action", "message": e.message}))).into_response(),
+    }
+}
+
 async fn forget(state: &Ingress, unpair: bool) -> Response {
     let Backend::Paired(view) = &state.backend else {
         return wrong_mode(state);
@@ -509,6 +528,7 @@ mod tests {
         forgets: std::sync::Mutex<Vec<bool>>,
         removes: std::sync::Mutex<Vec<String>>,
         allows: std::sync::Mutex<u32>,
+        skips: std::sync::Mutex<u32>,
     }
 
     impl PairedView for FakePaired {
@@ -536,7 +556,7 @@ mod tests {
                         portal_url: None,
                         new_address: false,
                     }],
-                    trusted_proxies: Some(ProxyStepView { state: "needed", message: None }),
+                    trusted_proxies: Some(ProxyStepView { state: "needed", message: None, setup: true }),
                     can_forget: true,
                     why_not: None,
                     error: None,
@@ -561,6 +581,10 @@ mod tests {
             *self.allows.lock().unwrap() += 1;
             Box::pin(async { Ok(()) })
         }
+        fn skip_proxies(&self) -> BoxFuture<'_, Result<(), ActionError>> {
+            *self.skips.lock().unwrap() += 1;
+            Box::pin(async { Ok(()) })
+        }
     }
 
     fn setup_backend() -> Backend {
@@ -571,7 +595,12 @@ mod tests {
     }
 
     fn paired_backend() -> (Backend, Arc<FakePaired>) {
-        let fake = Arc::new(FakePaired { forgets: Default::default(), removes: Default::default(), allows: Default::default() });
+        let fake = Arc::new(FakePaired {
+            forgets: Default::default(),
+            removes: Default::default(),
+            allows: Default::default(),
+            skips: Default::default(),
+        });
         (Backend::Paired(fake.clone()), fake)
     }
 
@@ -796,15 +825,17 @@ mod tests {
         assert_eq!(*fake.forgets.lock().unwrap(), [false, true]);
     }
 
-    /// Remove and Allow change things in Datum and in Home Assistant, so
-    /// they get the same gate as every other POST: only the Supervisor, and
-    /// only with the page's token and a same-origin request.
+    /// Remove, Allow and Skip change things in Datum, in Home Assistant or
+    /// in what setup offers, so they get the same gate as every other POST:
+    /// only the Supervisor, and only with the page's token and a
+    /// same-origin request.
     #[tokio::test]
-    async fn remove_and_allow_need_the_supervisor_and_the_page_token() {
+    async fn remove_allow_and_skip_need_the_supervisor_and_the_page_token() {
         let (backend, fake) = paired_backend();
         let app = app(backend);
         let (_, token) = page(&app).await;
-        let bodies = [("/api/remove-tunnel", r#"{"id":"t0"}"#), ("/api/allow-proxies", "{}")];
+        let bodies =
+            [("/api/remove-tunnel", r#"{"id":"t0"}"#), ("/api/allow-proxies", "{}"), ("/api/skip-proxies", "{}")];
 
         for (path, body) in bodies {
             for from in ["172.30.33.5", "192.168.1.20", "127.0.0.1"] {
@@ -830,6 +861,7 @@ mod tests {
         }
         assert!(fake.removes.lock().unwrap().is_empty(), "refused before acting");
         assert_eq!(*fake.allows.lock().unwrap(), 0, "refused before acting");
+        assert_eq!(*fake.skips.lock().unwrap(), 0, "refused before acting");
 
         let ok = post_json("/api/remove-tunnel", Some(&token)).header(header::ORIGIN, "http://homeassistant.local:8123");
         let (status, _, reply) = send(&app, ok.body(Body::from(r#"{"id":"t0"}"#)).unwrap()).await;
@@ -850,6 +882,11 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{reply}");
         assert_eq!(serde_json::from_str::<serde_json::Value>(&reply).unwrap()["mode"], "paired");
         assert_eq!(*fake.allows.lock().unwrap(), 1);
+
+        let (status, _, reply) = send(&app, post_json("/api/skip-proxies", Some(&token)).body(Body::from("{}")).unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&reply).unwrap()["mode"], "paired");
+        assert_eq!(*fake.skips.lock().unwrap(), 1);
 
         // Not setup actions.
         let app = self::app(setup_backend());
@@ -872,6 +909,7 @@ mod tests {
         assert_eq!(v["paired"]["older"][0]["id"], "t0");
         assert_eq!(v["paired"]["tunnels"][0]["new_address"], false);
         assert_eq!(v["paired"]["trusted_proxies"]["state"], "needed");
+        assert_eq!(v["paired"]["trusted_proxies"]["setup"], true);
         for secret in ["token", "SUPERVISOR", "private_key", "Bearer"] {
             assert!(!body.contains(secret), "{secret} in {body}");
         }

@@ -3,7 +3,8 @@
 // One page, two servers: while the add-on has no key, `datum-connect-daemon
 // setup` serves it and runs pairing; once paired, the daemon serves it and
 // shows the tunnel, older tunnels from this Home Assistant (with Remove),
-// and Home Assistant's trusted-proxy step (with Allow). When one hands over
+// and Home Assistant's trusted-proxy step (with Allow): first as the last
+// step of setup (with Skip), then as a row of the status. When one hands over
 // to the other, this page notices the
 // mode change and reloads, which also picks up the new server's CSRF token.
 //
@@ -23,6 +24,12 @@
     "A new address can take 10–20 minutes before it works in every browser.";
   var PROXY_STEP =
     "Let Home Assistant accept connections through Datum: turns on X-Forwarded-For and adds 127.0.0.1 and ::1 as trusted proxies. Home Assistant will restart.";
+  var LAST_STEP =
+    "Last step: let Home Assistant accept connections through Datum. This turns on “Trust X-Forwarded-For” and adds 127.0.0.1 and ::1 as trusted proxies, so Home Assistant still sees each visitor's real address. Home Assistant will restart.";
+  var REVERTS_NOTE =
+    "If Home Assistant took the new setting, it goes back to the previous one by itself within 5 minutes; nothing else was changed.";
+  var RESTART_NOTE =
+    "Home Assistant restarts, so this page may go blank or say Home Assistant is restarting for a minute or two. It comes back by itself, and the add-on carries on meanwhile.";
 
   // What the person picked in the project list, kept across re-renders.
   var picked = null;
@@ -90,7 +97,11 @@
         last = state;
         syncDeadline(state);
         if (renderKey(state) !== rendered) render(state);
-        schedule(state.mode === "paired" ? 10000 : 1000);
+        // While Home Assistant restarts for Allow, often enough to show
+        // each step and to notice it back.
+        var working = state.mode === "paired" && state.paired && state.paired.trusted_proxies &&
+          state.paired.trusted_proxies.state === "working";
+        schedule(state.mode === "paired" ? (working ? 3000 : 10000) : 1000);
       })
       .catch(function () {
         renderAway();
@@ -227,9 +238,9 @@
           steps(s)));
       case "done":
         return show(card(
-          el("h2", { class: "ok", text: "Done. Starting the tunnel…" }),
+          el("h2", { class: "ok", text: "Key saved. Starting the tunnel…" }),
           steps(s),
-          el("p", { class: "muted", text: "This page switches to the tunnel's status by itself once it is up." })));
+          el("p", { class: "muted", text: "This page moves on by itself in a moment." })));
       case "failed":
         return renderFailed(s);
       default:
@@ -314,8 +325,11 @@
     if (notice) parts.push(card(el("p", { class: notice.ok ? "ok" : "error", text: notice.text })));
     if (p.error) parts.push(card(el("p", { class: "warn", text: p.error })));
     if (!tunnels.length && !p.error) parts.push(card(el("p", { class: "muted", text: "No tunnel yet. The add-on creates it as it starts; this page updates by itself." })));
+    var proxies = p.trusted_proxies;
+    // Setup's last step comes first, as the end of setting up.
+    if (proxies && proxies.setup) parts.push(lastStepCard(proxies));
     tunnels.forEach(function (t) { parts.push(tunnelCard(t)); });
-    parts.push(proxyCard(p.trusted_proxies));
+    if (!(proxies && proxies.setup)) parts.push(proxyCard(proxies));
     if (older.length) parts.push(olderCard(older));
     parts.push(card(
       el("dl", { class: "facts" },
@@ -348,20 +362,80 @@
         t.portal_url ? el("dd", null, el("a", { href: t.portal_url, target: "_blank", rel: "noopener noreferrer", text: "Open in the Datum portal" })) : null));
   }
 
-  // Home Assistant's trusted proxies: without them, every request through
-  // Datum gets 400: Bad Request.
+  // Home Assistant's trusted proxies as the last step of setup, between
+  // the saved key and Done: Allow, or Skip to set it up by hand.
+  function lastStepCard(s) {
+    var allow = function (label) {
+      return el("button", { disabled: busy, onclick: function () { allowProxies(); } }, label);
+    };
+    var skip = el("button", { class: "secondary", disabled: busy, onclick: function () { skipProxies(); } },
+      "Skip: I'll set it up myself in Settings → System → Network");
+    var list = function (done) {
+      return el("ol", { class: "steps" },
+        el("li", { class: "done", text: "Creating a service account" }),
+        el("li", { class: "done", text: "Granting it access to the project" }),
+        el("li", { class: "done", text: "Saving the key" }),
+        el("li", { class: done ? "done" : "now", text: "Letting Home Assistant accept connections through Datum" }));
+    };
+    switch (s.state) {
+      case "ok":
+        return card(
+          el("h2", { class: "ok", text: "Done ✓" }),
+          list(true),
+          el("p", { class: "ok", text: s.message || "Home Assistant accepts connections through Datum ✓" }));
+      case "working":
+        return card(
+          el("h2", { text: "Letting Home Assistant accept connections through Datum" }),
+          list(false),
+          el("p", { class: "muted", text: s.message || "Working…" }),
+          el("p", { class: "muted small", text: RESTART_NOTE }));
+      case "failed":
+        var why = s.message || "That did not work.";
+        return card(
+          el("h2", { text: "Almost done" }),
+          list(false),
+          el("p", { class: "error", text: why }),
+          why.indexOf("goes back") < 0 ? el("p", { class: "muted small", text: REVERTS_NOTE }) : null,
+          el("p", { text: LAST_STEP }),
+          allow("Retry"), skip);
+      case "pending":
+        return card(
+          el("h2", { text: "Almost done" }),
+          list(false),
+          el("p", { class: "warn", text: s.message || "" }),
+          skip);
+      default:
+        // needed, or Home Assistant could not be asked (Allow then says why).
+        return card(
+          el("h2", { text: "Almost done" }),
+          list(false),
+          el("p", { text: LAST_STEP }),
+          s.state === "unknown" ? el("p", { class: "muted small", text: s.message || "Could not ask Home Assistant about its network settings." }) : null,
+          allow("Allow"), skip);
+    }
+  }
+
+  // Home Assistant's trusted proxies once setup is over: without them,
+  // every request through Datum gets 400: Bad Request.
   function proxyCard(s) {
     if (!s) return null;
     var allow = function (label) {
       return el("button", { disabled: busy, onclick: function () { allowProxies(); } }, label);
     };
+    var row = function (text, cls) {
+      return el("dl", { class: "facts" },
+        el("dt", { text: "Home Assistant proxy settings" }), el("dd", { class: cls || null, text: text }));
+    };
     switch (s.state) {
       case "ok":
-        return card(el("p", { class: "ok", text: "Home Assistant accepts connections through Datum ✓" }));
+        return card(row("Home Assistant trusts Datum's connection (real visitor addresses) ✓", "ok"));
       case "needed":
-        return card(el("p", { text: PROXY_STEP }), allow("Allow"));
+        return el("section", { class: "card warning" },
+          row("Not set up: your public address returns 400 Bad Request until this is done", "warn"),
+          el("p", { text: PROXY_STEP }), allow("Allow"));
       case "failed":
-        return card(
+        return el("section", { class: "card warning" },
+          row("Not set up: your public address returns 400 Bad Request until this is done", "warn"),
           el("p", { class: "error", text: s.message || "That did not work." }),
           el("p", { text: PROXY_STEP }),
           allow("Try again"));
@@ -369,12 +443,23 @@
         return card(
           el("h2", { text: "Letting Home Assistant accept connections through Datum" }),
           el("p", { class: "muted", text: s.message || "Working…" }),
-          el("p", { class: "muted small", text: "Home Assistant restarts, so this page may go blank for a minute or two. It comes back by itself, and the add-on carries on meanwhile." }));
+          el("p", { class: "muted small", text: RESTART_NOTE }));
       case "pending":
-        return card(el("p", { class: "warn", text: s.message || "" }));
+        return card(row("Waiting for a change in Home Assistant", "warn"), el("p", { class: "warn", text: s.message || "" }));
       default:
-        return card(el("p", { class: "muted small", text: s.message || "Could not ask Home Assistant about its network settings." }));
+        return card(row("Could not be checked", "muted"),
+          el("p", { class: "muted small", text: s.message || "Could not ask Home Assistant about its network settings." }));
     }
+  }
+
+  function skipProxies() {
+    post("api/skip-proxies").then(function (s) {
+      if (s) { last = s; render(s); }
+      schedule(1000);
+    }).catch(function (e) {
+      if (last) render(last);
+      root.appendChild(errorLine(e));
+    });
   }
 
   function allowProxies() {

@@ -160,6 +160,8 @@ dl.facts dd { margin: 0; overflow-wrap: anywhere; }
 
 /* The add-on's tunnel: its address is what the page is for. */
 .card.hero { border-color: var(--accent); }
+/* Home Assistant's proxy settings missing: the public address answers 400. */
+.card.warning { border-color: var(--warn); }
 a.address {
   display: inline-block;
   font-size: 1.25rem;

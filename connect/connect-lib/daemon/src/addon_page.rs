@@ -1,7 +1,15 @@
 //! What the add-on's page shows once paired, and its actions (Re-pair,
-//! Unpair, Remove for an older tunnel, Allow for Home Assistant's trusted
-//! proxies), from the running daemon. The page and its server are in
-//! `ingress.rs`.
+//! Unpair, Remove for an older tunnel, Allow and Skip for Home Assistant's
+//! trusted proxies), from the running daemon. The page and its server are
+//! in `ingress.rs`.
+//!
+//! Home Assistant's trusted proxies are the last step of setting up the
+//! add-on. `setup` ends once the key is saved and the daemon takes over, so
+//! the daemon's page carries that step on: shown as setup's last step until
+//! it is finished (allowed, skipped, or found already set up), and as a
+//! row of the tunnel's status after that. It runs in the daemon, not in
+//! `setup`, so that the tunnel starts whether or not anyone is looking at
+//! the page, and so that the step survives an add-on restart.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -29,6 +37,9 @@ const EDGE_TTL: Duration = Duration::from_secs(60);
 /// Home Assistant's HTTP settings change rarely, and each read is a
 /// websocket connection of its own.
 const PROXY_TTL: Duration = Duration::from_secs(30);
+/// Written under the connect dir once the trusted-proxy step of setup is
+/// finished, so that it is offered as setup's last step only once.
+const PROXY_STEP_MARKER: &str = "addon_proxy_step_finished";
 /// Long enough for the page's reply to go out before the restart begins.
 const RESTART_DELAY: Duration = Duration::from_millis(500);
 /// A tunnel younger than this gets the "a new address can take 10-20
@@ -52,6 +63,9 @@ struct ProxyJob {
     running: Option<AllowStep>,
     /// The last Allow's outcome: whether it ended well, and what to say.
     last: Option<(bool, String)>,
+    /// The setup step is finished (see [`PROXY_STEP_MARKER`]). Read from
+    /// disk once, then kept here.
+    finished: Option<bool>,
     /// `http/config`, read at most every [`PROXY_TTL`]; `None` inside is
     /// "could not be asked".
     cached: Option<(Instant, Option<ProxySetup>)>,
@@ -166,6 +180,11 @@ impl DaemonPaired {
         status
     }
 
+    fn marker(&self) -> PathBuf {
+        self.app.connect_dir.join(PROXY_STEP_MARKER)
+    }
+
+
     /// Home Assistant's trusted-proxy step, if there is a Supervisor to ask.
     async fn proxy_step(&self) -> Option<ProxyStepView> {
         let sup = self.supervisor.as_ref()?;
@@ -174,8 +193,9 @@ impl DaemonPaired {
             let fresh = job.cached.as_ref().filter(|(at, _)| at.elapsed() < PROXY_TTL).map(|(_, s)| s.clone());
             (job.running, job.last.clone(), fresh)
         };
+        let finished = step_finished(&self.marker(), &self.proxy_job);
         if let Some(step) = running {
-            return Some(ProxyStepView { state: "working", message: Some(step.describe().into()) });
+            return Some(ProxyStepView { state: "working", message: Some(step.describe().into()), setup: !finished });
         }
         let setup = match cached {
             Some(s) => s,
@@ -196,21 +216,28 @@ impl DaemonPaired {
                 setup
             }
         };
-        Some(proxy_step_view(setup.as_ref(), last.as_ref()))
+        Some(settled_view(&self.marker(), &self.proxy_job, setup.as_ref(), last.as_ref()))
     }
 
-    /// Where the add-on's tunnel's local hop listens: what the verify step
-    /// sends its request through, the way edge traffic arrives.
-    async fn active_inspector(&self) -> Result<SocketAddr, ActionError> {
+    /// Where the add-on's tunnel's local hop forwards to: Home Assistant,
+    /// which the verify step sends its request to directly. The hop
+    /// connects from 127.0.0.1 too, and the connecting address is what Home
+    /// Assistant checks, so the answer is the one tunnel traffic gets,
+    /// without depending on how the hop treats the request on its way.
+    async fn active_target(&self) -> Result<SocketAddr, ActionError> {
         let tunnels = self.app.control.list_active().await.map_err(|e| ActionError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: format!("Could not ask Datum about the tunnel, so nothing was changed: {e}"),
         })?;
         let (mine, _) = self.split(tunnels);
         let inspectors = self.app.inspectors.lock().await;
-        mine.iter().find_map(|t| inspectors.get(&t.id).map(|h| h.local_addr)).ok_or(ActionError {
+        let target = mine.iter().find_map(|t| inspectors.get(&t.id).map(|h| h.real_target().clone())).ok_or(ActionError {
             status: StatusCode::CONFLICT,
-            message: "The tunnel isn't running yet, so a request through it can't be checked. Try again once it is online.".into(),
+            message: "The tunnel isn't running yet, so a request through it can't be checked. Try again in a moment.".into(),
+        })?;
+        target_addr(&target).ok_or(ActionError {
+            status: StatusCode::CONFLICT,
+            message: format!("The tunnel forwards to {target}, which is not an address a request can be checked against."),
         })
     }
 
@@ -221,7 +248,7 @@ impl DaemonPaired {
                 message: "This needs the Home Assistant Supervisor, which is not available here.".into(),
             });
         };
-        let inspector = self.active_inspector().await?;
+        let target = self.active_target().await?;
         {
             let mut job = self.proxy_job.lock().unwrap_or_else(|e| e.into_inner());
             if job.running.is_some() {
@@ -233,6 +260,7 @@ impl DaemonPaired {
         }
         tracing::info!("Letting Home Assistant accept connections through Datum (from the Datum Connect page); Home Assistant restarts");
         let job = self.proxy_job.clone();
+        let marker = self.marker();
         tokio::spawn(async move {
             let progress = job.clone();
             let outcome = ha_core::allow_forwarded_requests(
@@ -243,12 +271,13 @@ impl DaemonPaired {
                     j.running = Some(step);
                     j.version += 1;
                 },
-                move || verify_forwarded(inspector),
+                move || verify_forwarded(target),
             )
             .await;
             let (ok, message) = outcome_message(&outcome);
             if ok {
                 tracing::info!("{message}");
+                finish_step(&marker, &job);
             } else {
                 tracing::warn!("Home Assistant does not accept connections through Datum yet: {message}");
             }
@@ -259,6 +288,16 @@ impl DaemonPaired {
             j.version += 1;
         });
         Ok(())
+    }
+
+    fn skip_inner(&self) -> Result<(), ActionError> {
+        if self.supervisor.is_none() {
+            return Err(ActionError {
+                status: StatusCode::CONFLICT,
+                message: "This needs the Home Assistant Supervisor, which is not available here.".into(),
+            });
+        }
+        skip_step(&self.marker(), &self.proxy_job)
     }
 
     async fn remove_inner(&self, id: &str) -> Result<RemoveOutcome, ActionError> {
@@ -403,6 +442,74 @@ impl PairedView for DaemonPaired {
             result
         })
     }
+
+    fn skip_proxies(&self) -> BoxFuture<'_, Result<(), ActionError>> {
+        Box::pin(async move {
+            let result = self.skip_inner();
+            *self.cache.lock().await = None;
+            result
+        })
+    }
+}
+
+/// Whether setup's last step is finished, read from disk the first time.
+fn step_finished(marker: &Path, job: &StdMutex<ProxyJob>) -> bool {
+    let mut j = job.lock().unwrap_or_else(|e| e.into_inner());
+    *j.finished.get_or_insert_with(|| marker.exists())
+}
+
+/// The step's view once Home Assistant has been asked (`setup`, `None` if
+/// it could not be). Found already set up (by hand, or by an earlier
+/// Allow), the step is finished silently: there is nothing to ask.
+fn settled_view(
+    marker: &Path,
+    job: &StdMutex<ProxyJob>,
+    setup: Option<&ProxySetup>,
+    last: Option<&(bool, String)>,
+) -> ProxyStepView {
+    let mut finished = step_finished(marker, job);
+    if !finished && setup == Some(&ProxySetup::Ready) {
+        finish_step(marker, job);
+        finished = true;
+    }
+    proxy_step_view(setup, last, finished)
+}
+
+/// Skip: the step ends without changing Home Assistant. Not while Allow
+/// runs, whose outcome would otherwise be lost from view.
+fn skip_step(marker: &Path, job: &StdMutex<ProxyJob>) -> Result<(), ActionError> {
+    {
+        let mut j = job.lock().unwrap_or_else(|e| e.into_inner());
+        if j.running.is_some() {
+            return Err(ActionError { status: StatusCode::CONFLICT, message: "Allow is in progress; wait for it to finish.".into() });
+        }
+        // A failure from an earlier Allow is no longer the step's to show.
+        j.last = None;
+    }
+    tracing::info!(
+        "Trusted proxies skipped on the Datum Connect page: until they are set up (Settings → System → Network, or Allow on the page), the public address returns 400: Bad Request"
+    );
+    finish_step(marker, job);
+    Ok(())
+}
+
+/// Marks setup's last step finished, on disk and in `job`. Best-effort: if
+/// the file cannot be written, the step is offered again after a restart,
+/// which is harmless.
+fn finish_step(marker: &Path, job: &StdMutex<ProxyJob>) {
+    if let Err(e) = std::fs::write(marker, b"") {
+        tracing::debug!("could not record the finished trusted-proxy step at {}: {e}", marker.display());
+    }
+    let mut j = job.lock().unwrap_or_else(|e| e.into_inner());
+    j.finished = Some(true);
+    j.version += 1;
+}
+
+/// `host:port` of an `http://` target, numeric only.
+fn target_addr(target: &axum::http::Uri) -> Option<SocketAddr> {
+    let host = target.host()?.trim_start_matches('[').trim_end_matches(']');
+    let ip: std::net::IpAddr = host.parse().ok()?;
+    Some(SocketAddr::new(ip, target.port_u16().unwrap_or(80)))
 }
 
 /// The older tunnel `id`, if it is one. Never the add-on's own tunnel, and
@@ -411,9 +518,13 @@ fn removable<'a>(older: &'a [connect_lib::TunnelSummary], id: &str) -> Option<&'
     older.iter().find(|t| t.id == id)
 }
 
-/// What the page says about the trusted-proxy step.
-fn proxy_step_view(setup: Option<&ProxySetup>, last: Option<&(bool, String)>) -> ProxyStepView {
-    let view = |state, message: Option<&str>| ProxyStepView { state, message: message.map(str::to_string) };
+/// What the page says about the trusted-proxy step. `finished`: setup's
+/// last step is behind us, so this is a row of the status, not the step.
+/// An Allow that just worked still shows as the step, with its ✓ and Done.
+fn proxy_step_view(setup: Option<&ProxySetup>, last: Option<&(bool, String)>, finished: bool) -> ProxyStepView {
+    let just_allowed = matches!(last, Some((true, _)));
+    let as_step = !finished || just_allowed;
+    let view = |state, message: Option<&str>| ProxyStepView { state, message: message.map(str::to_string), setup: as_step };
     match (setup, last) {
         (Some(ProxySetup::Ready), _) => view("ok", None),
         // The last Allow failed: say why, whatever Home Assistant shows
@@ -434,15 +545,16 @@ fn outcome_message(outcome: &AllowOutcome) -> (bool, String) {
     }
 }
 
-/// One request through the tunnel's local hop to Home Assistant, carrying
-/// `X-Forwarded-For` and `X-Forwarded-Proto` as Datum's edge does: Home
-/// Assistant answers it 400 unless it trusts the hop. Returns the status.
-pub(crate) async fn verify_forwarded(inspector: SocketAddr) -> Result<u16, String> {
+/// One request to Home Assistant from the address the tunnel's local hop
+/// connects from, carrying `X-Forwarded-For` and `X-Forwarded-Proto` as
+/// Datum's edge does: Home Assistant answers it 400 unless it trusts that
+/// address as a proxy. Returns the status.
+pub(crate) async fn verify_forwarded(target: SocketAddr) -> Result<u16, String> {
     use http_body_util::Empty;
     use hyper_util::client::legacy::Client;
     use hyper_util::rt::TokioExecutor;
     let client: Client<_, Empty<bytes::Bytes>> = Client::builder(TokioExecutor::new()).build_http();
-    let req = axum::http::Request::get(format!("http://{inspector}/"))
+    let req = axum::http::Request::get(format!("http://{target}/"))
         .header("x-forwarded-for", VERIFY_FORWARDED_FOR)
         .header("x-forwarded-proto", "https")
         .body(Empty::new())
@@ -574,28 +686,121 @@ mod tests {
     #[test]
     fn the_proxy_step_reads_as_a_person_would_say_it() {
         let needed = ProxySetup::Needed { config: serde_json::json!({}) };
-        assert_eq!(proxy_step_view(Some(&ProxySetup::Ready), None).state, "ok");
-        assert_eq!(proxy_step_view(Some(&needed), None).state, "needed");
-        let pending = proxy_step_view(Some(&ProxySetup::Pending), None);
-        assert_eq!(pending.state, "pending");
-        assert!(pending.message.unwrap().contains("Settings → System → Network"));
-        assert_eq!(proxy_step_view(None, None).state, "unknown");
-        let failed = (false, "A request ... still got 400".to_string());
-        // Failed wins while Home Assistant reverts its trial of our change.
-        assert_eq!(proxy_step_view(Some(&ProxySetup::Pending), Some(&failed)).state, "failed");
-        assert_eq!(proxy_step_view(Some(&needed), Some(&failed)).message.as_deref(), Some(failed.1.as_str()));
-        // Once it reads as on, that is what counts.
-        assert_eq!(proxy_step_view(Some(&ProxySetup::Ready), Some(&failed)).state, "ok");
+        for finished in [false, true] {
+            assert_eq!(proxy_step_view(Some(&ProxySetup::Ready), None, finished).state, "ok");
+            assert_eq!(proxy_step_view(Some(&needed), None, finished).state, "needed");
+            let pending = proxy_step_view(Some(&ProxySetup::Pending), None, finished);
+            assert_eq!(pending.state, "pending");
+            assert!(pending.message.unwrap().contains("Settings → System → Network"));
+            assert_eq!(proxy_step_view(None, None, finished).state, "unknown");
+            let failed = (false, "A request ... still got 400".to_string());
+            // Failed wins while Home Assistant reverts its trial of our change.
+            assert_eq!(proxy_step_view(Some(&ProxySetup::Pending), Some(&failed), finished).state, "failed");
+            assert_eq!(proxy_step_view(Some(&needed), Some(&failed), finished).message.as_deref(), Some(failed.1.as_str()));
+            // Once it reads as on, that is what counts.
+            assert_eq!(proxy_step_view(Some(&ProxySetup::Ready), Some(&failed), finished).state, "ok");
+            // The setup step until finished; a row after.
+            assert_eq!(proxy_step_view(Some(&needed), None, finished).setup, !finished);
+        }
+        // Right after an Allow that worked, still the step, for its ✓ Done.
+        let allowed = (true, ALLOWED_MESSAGE.to_string());
+        let v = proxy_step_view(Some(&ProxySetup::Ready), Some(&allowed), true);
+        assert_eq!((v.state, v.setup), ("ok", true));
         assert_eq!(outcome_message(&AllowOutcome::Allowed), (true, ALLOWED_MESSAGE.to_string()));
         assert!(!outcome_message(&AllowOutcome::PendingByOther).0);
         assert_eq!(outcome_message(&AllowOutcome::Failed("x".into())), (false, "x".to_string()));
     }
 
-    /// The verify step's request goes through the inspector, as edge
-    /// traffic does, with `X-Forwarded-For`: a Home Assistant that does not
-    /// trust the hop answers 400, one that does answers as usual.
+    fn step_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("addon-step-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Setup's last step, as the page goes through it, with Home
+    /// Assistant's answers given (the Allow flow itself, configure → wait →
+    /// verify → promote, is tested in `ha_core`).
+    #[test]
+    fn the_setup_step_from_start_to_done() {
+        let needed = ProxySetup::Needed { config: serde_json::json!({}) };
+
+        // Already set up: finished silently, never offered.
+        let dir = step_dir("ready");
+        let marker = dir.join(PROXY_STEP_MARKER);
+        let job = StdMutex::new(ProxyJob::default());
+        let v = settled_view(&marker, &job, Some(&ProxySetup::Ready), None);
+        assert_eq!((v.state, v.setup), ("ok", false));
+        assert!(marker.exists(), "remembered across restarts");
+
+        // Not set up: offered as the last step, and still after a failed
+        // Allow (Retry or Skip), which never finishes it.
+        let dir = step_dir("allow");
+        let marker = dir.join(PROXY_STEP_MARKER);
+        let job = StdMutex::new(ProxyJob::default());
+        let v = settled_view(&marker, &job, Some(&needed), None);
+        assert_eq!((v.state, v.setup), ("needed", true));
+        let failed = (false, "still got 400. Home Assistant goes back to the previous setting by itself within 5 minutes.".to_string());
+        let v = settled_view(&marker, &job, Some(&needed), Some(&failed));
+        assert_eq!((v.state, v.setup), ("failed", true));
+        assert!(v.message.unwrap().contains("goes back"));
+        assert!(!marker.exists());
+        // Allow worked: finished, and shown with its ✓ until the page moves on.
+        finish_step(&marker, &job);
+        let allowed = (true, ALLOWED_MESSAGE.to_string());
+        let v = settled_view(&marker, &job, Some(&ProxySetup::Ready), Some(&allowed));
+        assert_eq!((v.state, v.setup), ("ok", true));
+        assert!(marker.exists());
+        // After a restart: a ✓ row.
+        let job = StdMutex::new(ProxyJob::default());
+        let v = settled_view(&marker, &job, Some(&ProxySetup::Ready), None);
+        assert_eq!((v.state, v.setup), ("ok", false));
+
+        // Skip: finished without touching Home Assistant; the row then
+        // warns, with Allow. A failure shown before is dropped.
+        let dir = step_dir("skip");
+        let marker = dir.join(PROXY_STEP_MARKER);
+        let job = StdMutex::new(ProxyJob { last: Some(failed.clone()), ..Default::default() });
+        job.lock().unwrap().running = Some(AllowStep::Restarting);
+        assert_eq!(skip_step(&marker, &job).unwrap_err().status, StatusCode::CONFLICT, "not while Allow runs");
+        assert!(!marker.exists());
+        job.lock().unwrap().running = None;
+        skip_step(&marker, &job).unwrap();
+        assert!(marker.exists());
+        let last = job.lock().unwrap().last.clone();
+        assert_eq!(last, None);
+        let v = settled_view(&marker, &job, Some(&needed), None);
+        assert_eq!((v.state, v.setup), ("needed", false));
+        // Remembered across restarts.
+        let job = StdMutex::new(ProxyJob::default());
+        assert!(!settled_view(&marker, &job, Some(&needed), None).setup);
+
+        // Home Assistant could not be asked: offered, and Skip still works.
+        let dir = step_dir("unknown");
+        let marker = dir.join(PROXY_STEP_MARKER);
+        let job = StdMutex::new(ProxyJob::default());
+        let v = settled_view(&marker, &job, None, None);
+        assert_eq!((v.state, v.setup), ("unknown", true));
+        for d in ["ready", "allow", "skip", "unknown"] {
+            let _ = std::fs::remove_dir_all(step_dir(d));
+        }
+    }
+
+    #[test]
+    fn the_verify_target_is_the_hops_numeric_target() {
+        let a = |s: &str| target_addr(&s.parse().unwrap());
+        assert_eq!(a("http://127.0.0.1:8123"), Some("127.0.0.1:8123".parse().unwrap()));
+        assert_eq!(a("http://127.0.0.1"), Some("127.0.0.1:80".parse().unwrap()));
+        assert_eq!(a("http://[::1]:8123/"), Some("[::1]:8123".parse().unwrap()));
+        assert_eq!(a("http://homeassistant.local:8123"), None);
+    }
+
+    /// The verify step's request carries `X-Forwarded-For` and goes to Home
+    /// Assistant directly, from 127.0.0.1 like the tunnel's local hop: a
+    /// Home Assistant that does not trust that address answers 400, one
+    /// that does answers as usual.
     #[tokio::test]
-    async fn verify_sends_a_forwarded_request_through_the_inspector() {
+    async fn verify_sends_a_forwarded_request_from_the_hops_address() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let trusted = Arc::new(AtomicBool::new(false));
@@ -619,11 +824,14 @@ mod tests {
                 }
             });
         }
+        // The address the check uses is the tunnel's hop's real target.
         let target = crate::parse_real_target(&format!("http://{ha}")).unwrap();
         let (handle, _) = crate::spawn_inspector(&target).await.unwrap();
-        assert_eq!(verify_forwarded(handle.local_addr).await, Ok(400));
+        let target = target_addr(handle.real_target()).unwrap();
+        assert_eq!(target, ha);
+        assert_eq!(verify_forwarded(target).await, Ok(400));
         trusted.store(true, Ordering::SeqCst);
-        assert_eq!(verify_forwarded(handle.local_addr).await, Ok(200));
+        assert_eq!(verify_forwarded(target).await, Ok(200));
         {
             let seen = seen.lock().unwrap();
             assert!(seen.iter().all(|h| h.contains("x-forwarded-proto: https")), "{seen:?}");
@@ -664,7 +872,7 @@ mod tests {
             project: "p-1".into(),
             service_account: key_facts(Some(&paired), Some(&paired), true).email,
             key_source: "paired",
-            trusted_proxies: Some(proxy_step_view(None, Some(&(false, "boom".into())))),
+            trusted_proxies: Some(proxy_step_view(None, Some(&(false, "boom".into())), false)),
             older: vec![tunnel_view(&summary(false, false, &["old.datumproxy.net"]), false, None, "p-1", SystemTime::now())],
             ..Default::default()
         };
