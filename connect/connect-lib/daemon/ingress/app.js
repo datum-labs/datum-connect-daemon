@@ -204,7 +204,7 @@
               disabled: busy,
               onclick: function () { act("api/new-code"); },
             }, "Get a new code")),
-          el("p", { class: "note small", text: "If Datum's page says “Something went wrong”, click Get a new code and approve again right away." }),
+          el("p", { class: "note small", text: "If Datum's page says “Something went wrong”, open the link in a private window or another browser and sign in to Datum there. A stale Datum sign-in in this browser is the usual cause. Get a new code if this one has expired." }),
           el("p", { class: "muted small", text: "A new code also appears here by itself when this one expires. The approval page says “datumctl”: that is expected." })));
       case "approved":
         return show(card(
