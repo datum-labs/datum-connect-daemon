@@ -17,21 +17,10 @@ Home Assistant OS does not allow that — and nothing is built on the device.
    `https://github.com/datum-labs/datum-connect-daemon`.
 2. **Install.** Find **Datum Connect** in the store and click **Install**.
    This downloads a prebuilt image.
-3. **Let Home Assistant accept proxied requests.** Home Assistant rejects
-   requests that arrive through a proxy it does not trust, and every request
-   through the tunnel does. Without this step the public address returns
-   `400: Bad Request`. Go to **Settings → System → Network**, turn on
-   **Use X-Forwarded-For**, and add `127.0.0.1` and `::1` as trusted proxies.
-   If Home Assistant asks you to confirm the change, confirm it, or it reverts
-   after a few minutes.
-
-   Don't use an `http:` block in `configuration.yaml` for this. Current Home
-   Assistant ignores it once the setting has moved into its own storage, and
-   warns that it stops working altogether in 2027.2.
-4. **Start, then open Datum Connect.** Start the add-on, then open
+3. **Start, then open Datum Connect.** Start the add-on, then open
    **Datum Connect** in the sidebar. If it isn't there, turn on **Show in
    sidebar** on the add-on's Info tab, or click **Open Web UI** there.
-5. **Connect, approve, and pick a project.** Click **Connect to Datum**. The
+4. **Connect, approve, and pick a project.** Click **Connect to Datum**. The
    page shows a link and a code: open the link (it opens in a new tab), sign
    in to Datum as usual, check that the code there matches the one on the
    page, and approve. Back in Home Assistant, the page says who signed in
@@ -53,6 +42,33 @@ Home Assistant OS does not allow that — and nothing is built on the device.
 
    If you set `project` on the Configuration tab before starting, that
    project is preselected; you still click **Continue**.
+5. **Let Home Assistant accept connections through Datum.** Home Assistant
+   rejects requests that arrive through a proxy it does not trust, and every
+   request through the tunnel does: without this step the public address
+   returns `400: Bad Request`. Once connected, the Datum Connect page shows
+   the step: "Let Home Assistant accept connections through Datum: turns on
+   X-Forwarded-For and adds 127.0.0.1 and ::1 as trusted proxies. Home
+   Assistant will restart." Click **Allow**. The add-on changes only those
+   two settings and keeps every other network setting as it is. Home
+   Assistant restarts (the page goes blank for a minute or two and comes
+   back by itself); the add-on then sends a request the way Datum does, and
+   only confirms the change once Home Assistant accepts it. If that check
+   fails, the change is not confirmed and Home Assistant goes back to the
+   previous setting by itself within 5 minutes. The page then says
+   `Home Assistant accepts connections through Datum ✓`.
+
+   If someone has a change to these settings waiting for confirmation, the
+   page leaves it alone and asks you to finish it in **Settings → System →
+   Network** first.
+
+   **Or by hand:** go to **Settings → System → Network**, turn on **Use
+   X-Forwarded-For**, and add `127.0.0.1` and `::1` as trusted proxies. If
+   Home Assistant asks you to confirm the change, confirm it, or it reverts
+   after a few minutes.
+
+   Don't use an `http:` block in `configuration.yaml` for this. Current Home
+   Assistant ignores it once the setting has moved into its own storage, and
+   warns that it stops working altogether in 2027.2.
 
 The page is the easiest way, but not the only one:
 
@@ -140,7 +156,7 @@ Delete the old one in the portal.
 |---|---|
 | `project` | The Datum project the tunnel is created in, by id. Optional. When pairing, the Datum Connect page lists your projects and preselects this one, if set; without the page, set it after approving and click Save. With your own key, leave it empty to use the project the key belongs to. |
 | `target` | What the tunnel points at. Leave empty for this Home Assistant: the add-on asks Home Assistant which port it uses. Must be plain HTTP. Changing it repoints the existing tunnel on the next start; its address stays the same. |
-| `tunnel_label` | A name for the tunnel, to recognise it in the dashboard. The tunnel is found again by this name on every start, including after the add-on is reinstalled, so changing it creates a new tunnel with a new address. |
+| `tunnel_label` | A name for the tunnel, to recognise it in the dashboard. The tunnel is found again by this name on every start, including after the add-on is reinstalled, so changing it creates a new tunnel with a new address. The add-on runs one tunnel: the old one is stopped, stays stopped, and is listed on the Datum Connect page under "Older tunnels from this Home Assistant", where **Remove** deletes it. |
 | `repair` | Forget the paired key and pair again on the next start, for when the page's Re-pair can't be used. See "What pairing creates". Leave off. |
 | `service_account_key` | Your own service account key JSON, pasted whole, instead of pairing. See "Advanced: use your own service account key". |
 | `service_account_key_file` | Where to read your own key from if `service_account_key` is empty. Defaults to `/share/datum-service-account.json`, for installs that already placed a file there. |
@@ -197,9 +213,26 @@ A paired one has it, through `editor`.
 
 ## The Datum Connect page
 
-Once connected, the page shows the tunnel: its public address, whether it is
-online, its edge protection and request timeout (below), the project, and the
-service account the add-on runs on. It refreshes by itself.
+Once connected, the page shows the tunnel at the top: its public address,
+whether it is online, its edge protection and request timeout (below). Below
+it are Home Assistant's trusted-proxy step (step 5 of "Installing"), older
+tunnels, the project, and the service account the add-on runs on. It
+refreshes by itself. The note that a new address can take 10-20 minutes is
+only shown for a tunnel created less than half an hour ago.
+
+**Older tunnels.** The add-on runs exactly one tunnel, the one
+`tunnel_label` names. Changing the label creates a new tunnel; any other
+tunnel this Home Assistant made (one it still has local state for) is
+stopped when the add-on starts, is never resumed, and is listed under
+**Older tunnels from this Home Assistant**. The log says
+`Stopped older tunnel '<label>' (<id>, <address>); remove it from the Datum
+Connect page.` **Remove** asks for confirmation, then deletes that tunnel in
+Datum: its public address (HTTPProxy), its ConnectorAdvertisement, its
+connector (unless another tunnel still uses it), its `<id>-timeout` request
+timeout policy, and its `<id>-waf` WAF policy if the add-on created it (one
+without the add-on's `connect.datum.net/managed-by` annotation is kept), and
+then the add-on's local state for it. Tunnels from other machines in the same
+project are never listed, stopped or removed.
 
 The page is served by the add-on through Home Assistant's ingress, so it
 needs your Home Assistant login, and only administrators see it. The add-on
@@ -334,8 +367,9 @@ later).
 page was opened. Reload the page.
 
 **The public address doesn't load yet.** If it is new, wait: a new address
-can take 10-20 minutes before it works in every browser (see step 5 of
-"Installing").
+can take 10-20 minutes before it works in every browser (see step 4 of
+"Installing"). The page shows that note only while the tunnel is less than
+half an hour old.
 
 **No notification appears.** Open the page instead, or use the link and code
 in the add-on's log. A log line starting `Could not show the pairing link as
@@ -377,25 +411,45 @@ your network shows it: no port in the address means port 80. After changing
 pointed at.
 
 **The public address returns `400: Bad Request`.** Home Assistant doesn't
-trust the proxy yet. See step 3 of "Installing".
+trust the proxy yet. Click **Allow** on the Datum Connect page, or see step 5
+of "Installing". The log says so at every start while it is missing:
+`Home Assistant does not accept connections through Datum yet`.
 
-**The log warns "Re-using tunnel ... its connector had to be replaced", and
-the public address shows "Service offline".** The add-on found a tunnel from
-an earlier install by its label, but the key that tunnel's connector was
-registered under was deleted with `/data` when the add-on was uninstalled, so
-the tunnel got a new connector. Such a tunnel has been seen to stay offline
-even though everything on Datum's side reports ready. Set a new
-`tunnel_label` on the Configuration tab and restart the add-on to get a fresh
-tunnel, with a new public address. The old tunnel stays in the portal until
-you delete it there.
+**Allow says "still got 400: Bad Request" or "did not come back with the new
+setting".** The change was not confirmed, and Home Assistant goes back to
+the previous setting by itself within 5 minutes; nothing else changed. Click
+**Try again** once Home Assistant is back, or set it by hand (step 5 of
+"Installing"). If the page says a change is waiting for confirmation, finish
+or discard it in **Settings → System → Network** first.
+
+**The log says "Re-using tunnel ... from an earlier install: its connector was
+replaced".** The add-on found a tunnel from an earlier install by its label,
+but the key that tunnel's connector was registered under was deleted with
+`/data` when the add-on was uninstalled, so the tunnel got a new connector.
+Its public address may show "Service offline" for a few minutes; on a real
+device it came back within about 4 minutes. If it's still offline after 20
+minutes, restart the add-on; if that doesn't help, set a new `tunnel_label`
+on the Configuration tab and restart, to get a fresh tunnel with a new public
+address. The old tunnel stays in the portal until you delete it there (the
+Datum Connect page cannot remove it: this install has no local state for
+it).
+
+**Two tunnels after changing `tunnel_label`.** Since 0.3.3 the old one is
+stopped at every start and listed under "Older tunnels from this Home
+Assistant" on the Datum Connect page; click **Remove** to delete it. Before
+0.3.3 both stayed online.
+
+**A pairing notification stays after connecting.** The add-on dismisses it
+when pairing succeeds and again every time it starts, so restarting the
+add-on clears it. Otherwise, dismiss it by hand.
 
 **Every request fails with "not set-up for reverse proxies", or Home Assistant
 warns "HTTP YAML configuration is ignored after migration".** Home Assistant
 2026.x stops reading the `http:` block in `configuration.yaml` once it has
 moved that setting into its own storage, which it does on first boot. After
 that, editing the YAML changes nothing, even though the config check still
-passes. Remove the `http:` block and set the trusted proxy under **Settings →
-System → Network**.
+passes. Remove the `http:` block and click **Allow** on the Datum Connect
+page, or set the trusted proxy under **Settings → System → Network**.
 
 ## Known limits
 
