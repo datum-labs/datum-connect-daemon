@@ -21,6 +21,12 @@
 //!   own state (`save_persist`). `/data/options.json` is written by
 //!   `write_options()`, which only `start()` calls, so the file does not
 //!   change until the next start.
+//! - The Supervisor does not restart an add-on whose options are saved, but
+//!   the frontend does offer to: after a save on a started add-on,
+//!   `supervisor-app-config.ts` calls `suggestSupervisorAppRestart`, a
+//!   "Restart <name>? The app needs to be restarted for the changes to take
+//!   effect." dialog (home-assistant/frontend, 2026-10). Pairing therefore
+//!   has to survive that restart: see `pairing`'s session file.
 //! - `GET /addons/self/options/config` returns the saved options validated
 //!   against the add-on's schema, i.e. what `/data/options.json` will hold
 //!   on the next start, and only to the add-on itself. It is on the
@@ -36,7 +42,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 
 pub use super::pairing::duration_words;
-use super::pairing::{PairingError, PairingEvent, ProjectChoice, ProjectSource};
+use super::pairing::{PairingError, PairingEvent, ProjectChoice, ProjectSource, normalize_project};
 
 /// Set by the Supervisor in every add-on's environment (the s6
 /// `with-contenv` environment passes it through to run.sh).
@@ -176,14 +182,9 @@ impl Supervisor {
     }
 }
 
-/// `options.project`, with empty meaning unset.
+/// `options.project`, normalised, with empty meaning unset.
 fn project_option(options: &Value) -> Option<String> {
-    options
-        .get("project")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
+    options.get("project").and_then(Value::as_str).and_then(normalize_project)
 }
 
 type SourceFuture<'a> = Pin<Box<dyn std::future::Future<Output = Result<Option<String>, String>> + Send + 'a>>;
@@ -273,6 +274,13 @@ impl PairingNotifier {
         let _ = self.tx.send(Note::Dismiss);
     }
 
+    /// The add-on stopped while pairing waited for a project, with the
+    /// login saved: say it carries on, rather than leave a list that reads
+    /// as if it were still waiting, or remove it with no word.
+    pub fn paused(&self) {
+        let _ = self.tx.send(Note::Show(PAUSED_MESSAGE.to_string()));
+    }
+
     /// The end of pairing: the notification goes on success, and says why
     /// on failure.
     pub fn outcome<T>(&self, result: &Result<T, PairingError>) {
@@ -293,6 +301,10 @@ impl PairingNotifier {
     }
 }
 
+/// What [`PairingNotifier::paused`] shows.
+pub const PAUSED_MESSAGE: &str =
+    "Pairing paused while the add-on restarts. It continues without a new login when the add-on starts again.";
+
 /// The code notification. `url` already carries the code.
 pub fn code_message(url: &str, user_code: &str, expires_in: Duration) -> String {
     format!(
@@ -310,7 +322,7 @@ pub fn choose_project_message(projects: &[ProjectChoice], rejected: Option<&str>
         out.push_str(&format!("'{}' isn't one of your projects.\n\n", escape(r)));
     }
     out.push_str(&format!(
-        "Your Datum login can see {} projects. Set **project** on the add-on's Configuration tab to one of these ids and click Save. No restart needed; pairing continues automatically.\n\n",
+        "Your Datum login can see {} projects. Set **project** on the add-on's Configuration tab to one of these ids and click Save. Home Assistant offers to restart the add-on when you save; either way, pairing continues without a new login.\n\n",
         projects.len()
     ));
     for p in projects {
@@ -408,7 +420,8 @@ mod tests {
         ];
         let m = choose_project_message(&projects, Some("*nope*"), Duration::from_secs(1800));
         assert!(m.starts_with("'\\*nope\\*' isn't one of your projects.\n\n"), "{m}");
-        assert!(m.contains("Set **project** on the add-on's Configuration tab to one of these ids and click Save. No restart needed; pairing continues automatically."), "{m}");
+        assert!(m.contains("Set **project** on the add-on's Configuration tab to one of these ids and click Save. Home Assistant offers to restart the add-on when you save; either way, pairing continues without a new login."), "{m}");
+        assert!(!m.contains("No restart needed"), "{m}");
         assert!(m.contains("- `p-1`: Home \\[x\\]\\(javascript:alert\\(1\\)\\) (organization o-1)"), "{m}");
         assert!(m.contains("- weird\\`id: W (organization o\\_2)"), "{m}");
         assert!(m.contains("within 30 minutes"), "{m}");
@@ -453,6 +466,8 @@ mod tests {
         assert_eq!(src.project().await.unwrap(), None);
         std::fs::write(&path, r#"{"project": " p-1 "}"#).unwrap();
         assert_eq!(src.project().await.unwrap().as_deref(), Some("p-1"));
+        std::fs::write(&path, r#"{"project": "\"P-1\""}"#).unwrap();
+        assert_eq!(src.project().await.unwrap().as_deref(), Some("p-1"), "normalised like every other project id");
         let _ = std::fs::remove_file(&path);
     }
 }

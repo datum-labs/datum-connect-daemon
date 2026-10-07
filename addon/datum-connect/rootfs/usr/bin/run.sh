@@ -18,9 +18,30 @@ TARGET="$(bashio::config 'target')"
 LABEL="$(bashio::config 'tunnel_label')"
 LOG_LEVEL="$(bashio::config 'log_level')"
 
+# A project id as typed or pasted, in the one form it is compared and passed
+# on in: surrounding whitespace and one pair of surrounding quotes removed,
+# and lowercased (Datum project ids are DNS-1123 names). Mirrors
+# normalize_project in the daemon's pairing.rs, so that what pairing accepts
+# and what the key's project is compared against below always agree.
+normalize_project() {
+    local p=$1 q
+    p="${p#"${p%%[![:space:]]*}"}"
+    p="${p%"${p##*[![:space:]]}"}"
+    for q in '"' "'" '`'; do
+        if [ "${#p}" -ge 2 ] && [ "${p:0:1}" = "${q}" ] && [ "${p: -1}" = "${q}" ]; then
+            p="${p:1:${#p}-2}"
+            p="${p#"${p%%[![:space:]]*}"}"
+            p="${p%"${p##*[![:space:]]}"}"
+            break
+        fi
+    done
+    printf '%s' "${p}" | LC_ALL=C tr '[:upper:]' '[:lower:]'
+}
+
 if bashio::var.is_empty "${PROJECT}" || [ "${PROJECT}" = "null" ]; then
     PROJECT=""
 fi
+PROJECT=$(normalize_project "${PROJECT}")
 
 # Where each kind of key lives in the add-on's private /data, readable by
 # this add-on only. Kept apart so that clearing a pasted key falls back to
@@ -30,6 +51,13 @@ PAIRED_KEY_FILE=/data/service-account.json
 # Left by a pairing that stopped at the access grant, so that the next one
 # reuses its service account instead of making another. Names only.
 PAIRING_PROGRESS="${PAIRED_KEY_FILE}.pending"
+# The approving person's login, kept by pairing while it waits for a project
+# so that a restart then (Home Assistant offers one on every save of the
+# options) needs no new approval. Pairing deletes it when it ends.
+PAIRING_SESSION=/data/pairing-session.json
+# What `pair` exits with when it was stopped while waiting, with the login
+# kept for the next start: a pause, not a failure.
+PAIR_PAUSED=75
 
 # Which key, in order: a pasted key, a key file placed by hand, the key an
 # earlier pairing saved, and otherwise pair now.
@@ -81,13 +109,20 @@ else
             # --options-source supervisor: with several projects and none set,
             # pairing waits for 'project' to be saved on the Configuration
             # tab, reading it from the Supervisor, since /data/options.json
-            # only changes on a restart, and a restart would mean a second
-            # approval.
-            PAIR_ARGS=(pair --key-out "${PAIRED_KEY_FILE}" --hold-port "${PORT}" --options-source supervisor)
+            # only changes on a restart.
+            # --session-file: saving the options makes Home Assistant offer
+            # a restart, which would otherwise mean a second approval.
+            PAIR_ARGS=(pair --key-out "${PAIRED_KEY_FILE}" --hold-port "${PORT}" --options-source supervisor --session-file "${PAIRING_SESSION}")
             if [ -n "${PROJECT}" ]; then
                 PAIR_ARGS+=(--project "${PROJECT}")
             fi
-            if ! /usr/bin/datum-connect-daemon "${PAIR_ARGS[@]}"; then
+            PAIR_STATUS=0
+            /usr/bin/datum-connect-daemon "${PAIR_ARGS[@]}" || PAIR_STATUS=$?
+            if [ "${PAIR_STATUS}" -eq "${PAIR_PAUSED}" ]; then
+                # Stopped while waiting for a project; pair has said it
+                # continues after the restart.
+                exit 0
+            elif [ "${PAIR_STATUS}" -ne 0 ]; then
                 bashio::exit.nok "Pairing with Datum did not finish; the reason is above. Restart the add-on to try again, or use your own service account key (see the Documentation tab)."
             fi
             # The project may have been chosen while pairing waited, after
@@ -100,6 +135,9 @@ else
     fi
 fi
 unset PASTED_KEY
+# Not pairing now, or pairing is done: a login left from a pairing that was
+# stopped and never resumed has no further use, so it does not stay on disk.
+rm -f "${PAIRING_SESSION}"
 
 # Checked here rather than left for the daemon to fail on later: a wrong file
 # in the right place is a confusing failure, and this is cheap.

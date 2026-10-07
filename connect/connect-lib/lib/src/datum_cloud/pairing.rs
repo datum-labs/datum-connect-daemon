@@ -22,11 +22,27 @@
 //! 5. Create a key for it. The server generates the key pair and returns the
 //!    whole key file, the one the portal downloads, once, in the create
 //!    response. It is written to disk atomically, 0600.
-//! 6. Drop the person's token. It is held in memory only, never written or
-//!    logged, and scrubbed from every error message.
+//! 6. Drop the person's token. It is held in memory, never logged, and
+//!    scrubbed from every error message. It is written to disk in one case
+//!    only: see below.
 //!
 //! The person's token is a [`SecretString`], so no `Debug` prints it. A
 //! refresh token, if the IdP sends one, is never even deserialized.
+//!
+//! **Surviving a restart.** Saving the add-on's options in Home Assistant
+//! asks to restart the add-on, and a person who has just been told to save
+//! will say yes. A restart kills the process, and with it the token held in
+//! memory, so the next start would need a second approval. With
+//! [`PairingConfig::session_file`] set, pairing writes the token, who it
+//! belongs to and the projects it can see to that file (0600, atomically)
+//! when it starts waiting for a project, valid for at most
+//! [`SESSION_MAX_TICKS`] and never closer than two minutes to the token's
+//! own expiry. The next run picks it up instead of starting a new device
+//! flow. The file is deleted as soon as pairing ends, whichever way it
+//! ends; only a run that is cancelled (the add-on stopping) leaves it, and
+//! that is the point. An expired or unreadable file is deleted unused, and
+//! a token the API refuses (HTTP 401) is deleted and replaced by a new
+//! approval.
 
 use std::io::Write;
 use std::future::Future;
@@ -88,6 +104,11 @@ const SA_NAME_PREFIX: &str = "home-assistant-";
 /// project, in ticks: enough to create the service account, binding and
 /// key with the token still valid.
 const TOKEN_MARGIN_TICKS: u64 = 120;
+/// The longest a saved pairing session is good for, in ticks: long enough
+/// to cover a restart of the add-on, short enough that a forgotten one does
+/// not leave a usable login on disk for long.
+pub const SESSION_MAX_TICKS: u64 = 15 * 60;
+const SESSION_VERSION: u32 = 1;
 
 const RM: &str = "resourcemanager.miloapis.com/v1alpha1";
 const IAM: &str = "iam.miloapis.com/v1alpha1";
@@ -150,6 +171,9 @@ pub struct PairingConfig {
     pub project_wait: Option<ProjectWait>,
     /// Where the key file goes.
     pub key_out: PathBuf,
+    /// Where to keep the person's login across a restart while waiting for
+    /// a project (see the module docs). `None` keeps it in memory only.
+    pub session_file: Option<PathBuf>,
     /// Recorded on the service account, to tell which device it is for.
     pub device_name: Option<String>,
     pub max_wait: Duration,
@@ -174,9 +198,10 @@ impl PairingConfig {
             client_id,
             scope: var(SCOPE_ENV).unwrap_or_else(|| DEFAULT_SCOPE.to_string()),
             issuer,
-            project: project.filter(|p| !p.trim().is_empty()),
+            project: project.as_deref().and_then(normalize_project),
             project_wait: None,
             key_out,
+            session_file: None,
             device_name: Some(crate::friendly_device_name()).filter(|n| !n.is_empty()),
             max_wait: DEFAULT_MAX_WAIT,
             tick: Duration::from_secs(1),
@@ -209,6 +234,13 @@ pub enum PairingEvent {
     /// The last code expired unapproved; a [`PairingEvent::Code`] follows.
     CodeExpired,
     Approved { email: String },
+    /// A login saved by an earlier run (see [`PairingConfig::session_file`])
+    /// is used instead of a new approval.
+    Resumed { email: String },
+    /// A saved login could not be used, so a new approval follows. `reason`
+    /// is a plain clause ("its saved login expired"), never the file's
+    /// contents.
+    SessionDropped { reason: String },
     /// Several projects and none chosen, or not the one configured: pairing
     /// waits up to `wait` for one of `projects` to be set. Comes again, with
     /// `rejected`, each time one is set that is not listed.
@@ -259,6 +291,11 @@ pub enum PairingError {
     Project(String),
     #[error("{0}")]
     Failed(String),
+    /// A login reused from [`PairingConfig::session_file`] was refused
+    /// (HTTP 401). [`pair`] answers it with a new approval, so a caller
+    /// never sees it.
+    #[error("Datum no longer accepts the saved login. Restart to try again.")]
+    SavedLoginRejected,
 }
 
 /// The outcome of a successful pairing.
@@ -275,12 +312,27 @@ pub async fn pair(
     cfg: &PairingConfig,
     on_event: &mut (dyn FnMut(PairingEvent) + Send),
 ) -> Result<PairedKey, PairingError> {
+    let result = pair_inner(cfg, on_event).await;
+    // Reached whichever way pairing ends; only a cancelled run (the add-on
+    // stopping) skips this, which is what keeps the saved login for the
+    // next start.
+    if let Some(path) = &cfg.session_file {
+        remove_session(path);
+    }
+    result
+}
+
+async fn pair_inner(
+    cfg: &PairingConfig,
+    on_event: &mut (dyn FnMut(PairingEvent) + Send),
+) -> Result<PairedKey, PairingError> {
     if cfg.key_out.exists() {
         return Err(PairingError::KeyExists(cfg.key_out.clone()));
     }
+    let wanted = cfg.project.as_deref().and_then(normalize_project);
     // With a wait, a malformed project is waited past like any other
     // project that is not there. It is only ever compared, never sent.
-    if let Some(p) = &cfg.project
+    if let Some(p) = &wanted
         && cfg.project_wait.is_none()
     {
         check_name("project", p)?;
@@ -290,6 +342,41 @@ pub async fn pair(
         .timeout(HTTP_TIMEOUT)
         .build()
         .map_err(|e| PairingError::Failed(format!("cannot build HTTP client: {e}")))?;
+
+    if let Some(path) = &cfg.session_file {
+        match load_session(path) {
+            SessionLoad::Missing => {}
+            SessionLoad::Unusable(reason) => {
+                remove_session(path);
+                on_event(PairingEvent::SessionDropped { reason: reason.into() });
+            }
+            SessionLoad::Ready(saved) => {
+                on_event(PairingEvent::Resumed {
+                    email: saved.login.email.clone().unwrap_or_else(|| saved.login.sub.clone()),
+                });
+                let SavedLogin { login, projects } = saved;
+                let result = {
+                    let api = Api {
+                        http: &http,
+                        base: cfg.api_url.trim_end_matches('/').to_string(),
+                        token: &login.token,
+                        reused: true,
+                    };
+                    provision(cfg, &api, &login, wanted.as_deref(), Some(projects), on_event).await
+                };
+                drop(login);
+                match result {
+                    Err(PairingError::SavedLoginRejected) => {
+                        remove_session(path);
+                        on_event(PairingEvent::SessionDropped {
+                            reason: "Datum no longer accepts its saved login (HTTP 401)".into(),
+                        });
+                    }
+                    other => return other,
+                }
+            }
+        }
+    }
 
     let login = device_login(cfg, &http, on_event).await?;
     on_event(PairingEvent::Approved {
@@ -301,27 +388,41 @@ pub async fn pair(
             http: &http,
             base: cfg.api_url.trim_end_matches('/').to_string(),
             token: &login.token,
+            reused: false,
         };
-        provision(cfg, &api, &login.sub, login.expires_at, on_event).await
+        provision(cfg, &api, &login, wanted.as_deref(), None, on_event).await
     };
     // The person's token goes here, on every path.
     drop(login);
     result
 }
 
+/// `known_projects` is the list saved with a resumed login. That login is
+/// already in the session file, so it is not saved again.
 async fn provision(
     cfg: &PairingConfig,
     api: &Api<'_>,
-    sub: &str,
-    token_expires_at: Option<Instant>,
+    login: &Login,
+    wanted: Option<&str>,
+    known_projects: Option<Vec<ProjectRef>>,
     on_event: &mut (dyn FnMut(PairingEvent) + Send),
 ) -> Result<PairedKey, PairingError> {
-    let projects = list_projects(api, sub).await?;
-    let project = match choose_project(&projects, cfg.project.as_deref()) {
+    let resumed = known_projects.is_some();
+    let projects = match known_projects {
+        Some(p) => p,
+        None => list_projects(api, &login.sub).await?,
+    };
+    let project = match choose_project(&projects, wanted) {
         Ok(p) => p,
         Err(e) => match &cfg.project_wait {
             Some(wait) if !projects.is_empty() => {
-                wait_for_project(cfg, wait, &projects, token_expires_at, on_event).await?
+                // Choosing means saving the options, and Home Assistant
+                // asks to restart the add-on on a save: keep the login for
+                // the next start.
+                if !resumed && let Some(path) = &cfg.session_file {
+                    save_session(path, cfg, login, &projects);
+                }
+                wait_for_project(cfg, wait, &projects, wanted, login.expires_at, on_event).await?
             }
             _ => return Err(e),
         },
@@ -650,6 +751,9 @@ struct Api<'a> {
     http: &'a reqwest::Client,
     base: String,
     token: &'a SecretString,
+    /// The token came from the session file: a 401 means it is no good any
+    /// more, which [`pair`] answers with a new approval.
+    reused: bool,
 }
 
 struct Reply {
@@ -672,6 +776,9 @@ impl Api<'_> {
             .await
             .map_err(|e| PairingError::Failed(redact(format!("{what} failed: {e}"), self.token)))?;
         let status = response.status();
+        if self.reused && status == StatusCode::UNAUTHORIZED {
+            return Err(PairingError::SavedLoginRejected);
+        }
         let text = response
             .text()
             .await
@@ -776,6 +883,8 @@ async fn list_projects(api: &Api<'_>, sub: &str) -> Result<Vec<ProjectRef>, Pair
 /// The project to use, or why there is none: none, several, or not the one
 /// configured. The error lists what the person can see.
 fn choose_project(projects: &[ProjectRef], wanted: Option<&str>) -> Result<ProjectRef, PairingError> {
+    let wanted = wanted.and_then(normalize_project);
+    let wanted = wanted.as_deref();
     let listing = || {
         projects
             .iter()
@@ -784,7 +893,7 @@ fn choose_project(projects: &[ProjectRef], wanted: Option<&str>) -> Result<Proje
             .join("\n")
     };
     match wanted {
-        Some(wanted) => match projects.iter().find(|p| p.name == wanted) {
+        Some(wanted) => match projects.iter().find(|p| p.name.eq_ignore_ascii_case(wanted)) {
             Some(p) => Ok(p.clone()),
             None if projects.is_empty() => Err(PairingError::Project(format!(
                 "Project {wanted} was not found: your Datum login can't see any projects. Check that you approved with the right account."
@@ -814,6 +923,7 @@ async fn wait_for_project(
     cfg: &PairingConfig,
     wait: &ProjectWait,
     projects: &[ProjectRef],
+    configured: Option<&str>,
     token_expires_at: Option<Instant>,
     on_event: &mut (dyn FnMut(PairingEvent) + Send),
 ) -> Result<ProjectRef, PairingError> {
@@ -832,9 +942,9 @@ async fn wait_for_project(
             organization: p.org.clone(),
         })
         .collect();
-    let normalize = |v: Option<&str>| v.map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
+    let normalize = |v: Option<&str>| v.and_then(normalize_project);
     // The value already judged: polls only act on a change from it.
-    let mut seen = normalize(cfg.project.as_deref());
+    let mut seen = normalize(configured);
     on_event(PairingEvent::ChooseProject {
         projects: choices.clone(),
         rejected: seen.clone(),
@@ -861,7 +971,7 @@ async fn wait_for_project(
         }
         seen = current.clone();
         if let Some(id) = &current
-            && let Some(p) = projects.iter().find(|p| &p.name == id)
+            && let Some(p) = projects.iter().find(|p| p.name.eq_ignore_ascii_case(id))
         {
             return Ok(p.clone());
         }
@@ -1194,7 +1304,183 @@ impl Pending {
     }
 }
 
+// ---- Keeping the login across a restart ----
+
+/// The session file's shape. Holds the token in plain text, so it is only
+/// ever built right before writing and right after reading, and has no
+/// `Debug`.
+#[derive(Serialize, Deserialize)]
+struct SessionFile {
+    version: u32,
+    /// RFC 3339. After this the file is deleted unused.
+    expires_at: String,
+    access_token: String,
+    /// RFC 3339, when the IdP said.
+    #[serde(default)]
+    token_expires_at: Option<String>,
+    sub: String,
+    #[serde(default)]
+    email: Option<String>,
+    projects: Vec<SessionProject>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SessionProject {
+    id: String,
+    uid: String,
+    organization: String,
+    display_name: String,
+}
+
+/// A login read back from the session file. No `Debug`, like [`Login`].
+struct SavedLogin {
+    login: Login,
+    projects: Vec<ProjectRef>,
+}
+
+enum SessionLoad {
+    Missing,
+    /// Why, as a clause for "Could not continue the earlier pairing: ...".
+    Unusable(&'static str),
+    Ready(SavedLogin),
+}
+
+/// Saves the login for the next start. Best effort: without it, a restart
+/// costs a second approval, as it did before this existed.
+fn save_session(path: &Path, cfg: &PairingConfig, login: &Login, projects: &[ProjectRef]) {
+    let now = Instant::now();
+    let wall = chrono::Utc::now();
+    let mut life = ticks(cfg, SESSION_MAX_TICKS);
+    if let Some(expires) = login.expires_at {
+        life = life.min(
+            expires
+                .saturating_duration_since(now)
+                .saturating_sub(ticks(cfg, TOKEN_MARGIN_TICKS)),
+        );
+    }
+    if life.is_zero() {
+        return;
+    }
+    let at = |d: Duration| {
+        (wall + chrono::Duration::from_std(d).unwrap_or_default())
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    };
+    let file = SessionFile {
+        version: SESSION_VERSION,
+        expires_at: at(life),
+        access_token: login.token.expose_secret().to_string(),
+        token_expires_at: login.expires_at.map(|e| at(e.saturating_duration_since(now))),
+        sub: login.sub.clone(),
+        email: login.email.clone(),
+        projects: projects
+            .iter()
+            .map(|p| SessionProject {
+                id: p.name.clone(),
+                uid: p.uid.clone(),
+                organization: p.org.clone(),
+                display_name: p.display_name.clone(),
+            })
+            .collect(),
+    };
+    let raw = serde_json::to_string(&file).expect("plain struct serializes");
+    drop(file);
+    if let Err(e) = write_private_file(path, &raw) {
+        // The error is about the file system; it never quotes `raw`.
+        tracing::warn!(
+            "pairing: cannot save the login to {}, so a restart now will need a new approval: {e}",
+            path.display()
+        );
+    }
+}
+
+fn load_session(path: &Path) -> SessionLoad {
+    const UNREADABLE: &str = "its saved login could not be read";
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SessionLoad::Missing,
+        Err(_) => return SessionLoad::Unusable(UNREADABLE),
+    };
+    // A serde error can quote the input, so it is never shown.
+    let Ok(file) = serde_json::from_str::<SessionFile>(&raw) else {
+        return SessionLoad::Unusable(UNREADABLE);
+    };
+    drop(raw);
+    let now = chrono::Utc::now();
+    let parse = |t: &str| {
+        chrono::DateTime::parse_from_rfc3339(t)
+            .ok()
+            .map(|t| t.with_timezone(&chrono::Utc))
+    };
+    if file.version != SESSION_VERSION {
+        return SessionLoad::Unusable(UNREADABLE);
+    }
+    let Some(expires_at) = parse(&file.expires_at) else {
+        return SessionLoad::Unusable(UNREADABLE);
+    };
+    if expires_at <= now {
+        return SessionLoad::Unusable("its saved login expired");
+    }
+    let token_expires_at = match file.token_expires_at.as_deref().map(parse) {
+        None => None,
+        Some(Some(t)) => Some(t),
+        Some(None) => return SessionLoad::Unusable(UNREADABLE),
+    };
+    let bad_project = |p: &SessionProject| {
+        check_name("project", &p.id).is_err() || check_name("organization", &p.organization).is_err() || p.uid.is_empty()
+    };
+    if file.access_token.is_empty()
+        || check_name("user id", &file.sub).is_err()
+        || file.projects.is_empty()
+        || file.projects.iter().any(bad_project)
+    {
+        return SessionLoad::Unusable(UNREADABLE);
+    }
+    let instant = |t: chrono::DateTime<chrono::Utc>| Instant::now() + (t - now).to_std().unwrap_or_default();
+    SessionLoad::Ready(SavedLogin {
+        login: Login {
+            token: SecretString::from(file.access_token),
+            expires_at: token_expires_at.map(instant),
+            sub: file.sub,
+            email: file.email.filter(|e| !e.is_empty()),
+        },
+        projects: file
+            .projects
+            .into_iter()
+            .map(|p| ProjectRef {
+                name: p.id,
+                uid: p.uid,
+                org: p.organization,
+                display_name: p.display_name,
+            })
+            .collect(),
+    })
+}
+
+fn remove_session(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!("pairing: cannot delete {}: {e}", path.display()),
+    }
+}
+
 // ---- Helpers ----
+
+/// A project id as configured, typed or pasted, in the one form it is
+/// compared and passed on in: surrounding whitespace and one pair of
+/// surrounding quotes (", ' or `) removed, and lowercased, since Datum
+/// project ids are DNS-1123 names and so always lowercase. `None` when
+/// nothing is left. The add-on's run.sh mirrors this in `normalize_project`.
+pub fn normalize_project(raw: &str) -> Option<String> {
+    let mut p = raw.trim();
+    for q in ['"', '\'', '`'] {
+        if p.len() >= 2 && p.starts_with(q) && p.ends_with(q) {
+            p = p[1..p.len() - 1].trim();
+            break;
+        }
+    }
+    if p.is_empty() { None } else { Some(p.to_ascii_lowercase()) }
+}
 
 /// "5 minutes", "1 minute", "45 seconds".
 pub fn duration_words(d: Duration) -> String {
@@ -1558,6 +1844,7 @@ mod tests {
             project: project.map(str::to_string),
             project_wait: None,
             key_out: dir.join("service-account.json"),
+            session_file: None,
             device_name: Some("homeassistant".into()),
             max_wait: Duration::from_secs(10),
             tick: Duration::from_millis(1),
@@ -2058,7 +2345,7 @@ mod tests {
             )
         );
         let list = notes[1].1["message"].as_str().unwrap();
-        assert!(list.contains("Set **project** on the add-on's Configuration tab to one of these ids and click Save. No restart needed; pairing continues automatically."), "{list}");
+        assert!(list.contains("Set **project** on the add-on's Configuration tab to one of these ids and click Save. Home Assistant offers to restart the add-on when you save; either way, pairing continues without a new login."), "{list}");
         assert!(list.contains("- `project-7r4rl`: Demo (organization datum-demos-iy50km)"), "{list}");
         assert!(list.contains("- `project-abc`: Garage (organization other-org)"), "{list}");
         assert!(!list.contains("isn't one of your projects"), "{list}");
@@ -2236,6 +2523,399 @@ mod tests {
         drop(fake);
         let wrong = Supervisor::new(base, SecretString::from("wrong")).unwrap();
         assert!(wrong.saved_project().await.unwrap_err().contains("HTTP 401"));
+    }
+
+    // ---- Project ids as typed or pasted ----
+
+    #[test]
+    fn project_ids_are_normalised() {
+        for raw in [" demos-md21mk ", "DEMOS-MD21MK", "\"demos-md21mk\"", "demos-md21mk\n", " ' Demos-MD21mk ' ", "`demos-md21mk`"] {
+            assert_eq!(normalize_project(raw).as_deref(), Some("demos-md21mk"), "{raw:?}");
+        }
+        for raw in ["", "   ", "\"\"", "\" \""] {
+            assert_eq!(normalize_project(raw), None, "{raw:?}");
+        }
+        // One pair of quotes, and only a matching pair.
+        assert_eq!(normalize_project("\"demos-md21mk").as_deref(), Some("\"demos-md21mk"));
+    }
+
+    #[test]
+    fn choose_project_matches_a_normalised_id() {
+        let projects = vec![ProjectRef {
+            name: "demos-md21mk".into(),
+            uid: "u".into(),
+            org: "datum-demos-iy50km".into(),
+            display_name: "demos-md21mk".into(),
+        }];
+        for raw in [" demos-md21mk ", "DEMOS-MD21MK", "\"demos-md21mk\""] {
+            assert_eq!(choose_project(&projects, Some(raw)).expect(raw).name, "demos-md21mk");
+        }
+        assert!(choose_project(&projects, Some("demos-other")).is_err());
+    }
+
+    /// The bug seen on the Green: a configured project with stray
+    /// whitespace was refused at start although it was listed.
+    #[tokio::test]
+    async fn a_configured_project_is_found_however_it_was_pasted() {
+        for raw in [format!(" {PROJECT} "), PROJECT.to_ascii_uppercase(), format!("\"{PROJECT}\"")] {
+            let run = run_with(Fake::new(), Some(&raw), |_| {}).await;
+            assert_eq!(run.result.as_ref().expect(&raw).project, PROJECT, "{raw:?}");
+            // With a wait too: chosen at once, nothing waited for.
+            let run = run_notified(two_projects(), Some(&raw), |_| {}).await;
+            assert_eq!(run.result.as_ref().expect(&raw).project, PROJECT, "{raw:?}");
+            assert!(chooses(&run.events).is_empty(), "{raw:?}: {:?}", run.events);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_project_saved_while_waiting_is_normalised() {
+        let mut fake = two_projects();
+        fake.options = VecDeque::from(["".into(), format!(" \"{}\" ", PROJECT.to_ascii_uppercase())]);
+        let run = run_notified(fake, None, |_| {}).await;
+        assert_eq!(run.result.as_ref().expect("pairs").project, PROJECT);
+        assert_eq!(chooses(&run.events), [None]);
+    }
+
+    #[test]
+    fn from_env_normalises_the_project() {
+        let _lock = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = PairingConfig::from_env(Some(" \"Demos-MD21MK\" ".into()), "k.json".into());
+        assert_eq!(cfg.project.as_deref(), Some("demos-md21mk"));
+        assert_eq!(cfg.session_file, None, "off unless asked for");
+    }
+
+    // ---- Keeping the login across a restart ----
+
+    const SESSION: &str = "pairing-session.json";
+
+    fn device_flow_requests(fake: &Fake) -> usize {
+        fake.requests.iter().filter(|r| r.path.starts_with("/oauth/")).count()
+    }
+
+    fn session_path(cfg: &PairingConfig) -> PathBuf {
+        cfg.session_file.clone().expect("session file set")
+    }
+
+    /// Nothing of the person's token in what is shown: events (what the
+    /// log prints) and the error.
+    fn assert_token_hidden(events: &[PairingEvent], err: Option<&PairingError>, tokens: &[&str]) {
+        let shown = format!("{events:?} {err:?} {:?}", err.map(|e| e.to_string()));
+        for t in tokens {
+            assert!(!shown.contains(t), "{t} in events or error: {shown}");
+        }
+    }
+
+    /// The add-on's first start: pairing reaches the project list, the
+    /// person saves, and Home Assistant restarts the add-on, which cancels
+    /// `pair` the way the SIGTERM handler in the daemon does.
+    struct Paused {
+        cfg: PairingConfig,
+        fake: Arc<Mutex<Fake>>,
+        dir: TempDir,
+        events: Vec<PairingEvent>,
+        /// Wall clock when the session was seen, for the expiry math.
+        seen_at: chrono::DateTime<chrono::Utc>,
+    }
+
+    async fn pair_until_waiting(mut fake: Fake, tweak: impl FnOnce(&mut PairingConfig)) -> Paused {
+        if fake.key_json.is_empty() {
+            fake.key_json = good_key();
+        }
+        let (base, fake) = serve(fake).await;
+        let dir = temp_dir();
+        let mut cfg = config(&base, &dir.0, None);
+        cfg.project_wait = Some(wait_on(&supervisor(&base)));
+        cfg.session_file = Some(dir.0.join(SESSION));
+        tweak(&mut cfg);
+        let (events, seen_at) = run_until_waiting(&cfg).await;
+        Paused { cfg, fake, dir, events, seen_at }
+    }
+
+    /// Runs `pair` until it lists the projects, then cancels it.
+    async fn run_until_waiting(cfg: &PairingConfig) -> (Vec<PairingEvent>, chrono::DateTime<chrono::Utc>) {
+        let events = Arc::new(Mutex::new(Vec::<PairingEvent>::new()));
+        let task = {
+            let cfg = cfg.clone();
+            let events = events.clone();
+            tokio::spawn(async move { pair(&cfg, &mut |e| events.lock().unwrap().push(e)).await })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if events.lock().unwrap().iter().any(|e| matches!(e, PairingEvent::ChooseProject { .. })) {
+                break;
+            }
+            assert!(!task.is_finished(), "pairing ended instead of waiting: {:?}", events.lock().unwrap());
+            assert!(Instant::now() < deadline, "never waited: {:?}", events.lock().unwrap());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let seen_at = chrono::Utc::now();
+        task.abort();
+        let _ = task.await;
+        let events = events.lock().unwrap().clone();
+        (events, seen_at)
+    }
+
+    fn read_session(path: &Path) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(path).expect("session file kept")).unwrap()
+    }
+
+    fn rfc3339(v: &Value) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(v.as_str().unwrap()).unwrap().with_timezone(&chrono::Utc)
+    }
+
+    /// A session file as an earlier run would have left it.
+    fn write_session(path: &Path, token: &str, expires_in: chrono::Duration) {
+        let at = |d: chrono::Duration| (chrono::Utc::now() + d).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let v = json!({
+            "version": 1,
+            "expires_at": at(expires_in),
+            "access_token": token,
+            "token_expires_at": at(chrono::Duration::hours(1)),
+            "sub": SUB,
+            "email": "person@example.com",
+            "projects": [
+                {"id": PROJECT, "uid": PROJECT_UID, "organization": ORG, "display_name": "Demo"},
+                {"id": "project-abc", "uid": "uid-abc", "organization": "other-org", "display_name": "Garage"},
+            ],
+        });
+        std::fs::write(path, v.to_string()).unwrap();
+    }
+
+    /// A start with a session file already there, as left by `write_session`.
+    async fn run_with_session(
+        fake: Fake,
+        project: Option<&str>,
+        session: impl FnOnce(&Path),
+    ) -> Run {
+        let mut fake = fake;
+        fake.key_json = good_key();
+        let (base, fake) = serve(fake).await;
+        let dir = temp_dir();
+        let mut cfg = config(&base, &dir.0, project);
+        cfg.project_wait = Some(wait_on(&supervisor(&base)));
+        cfg.session_file = Some(dir.0.join(SESSION));
+        session(&session_path(&cfg));
+        run_cfg(cfg, fake, dir).await
+    }
+
+    #[tokio::test]
+    async fn the_login_is_saved_when_pairing_starts_waiting() {
+        // 10ms ticks: the token is good for 43199 ticks (432s) and a session
+        // for at most 900 ticks (9s), so the session's own cap applies.
+        let p = pair_until_waiting(two_projects(), |c| c.tick = Duration::from_millis(10)).await;
+        let path = session_path(&p.cfg);
+        let v = read_session(&path);
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["access_token"], TOKEN);
+        assert_eq!(v["sub"], SUB);
+        assert_eq!(v["email"], "person@example.com");
+        assert_eq!(
+            v["projects"],
+            json!([
+                {"id": PROJECT, "uid": PROJECT_UID, "organization": ORG, "display_name": "Demo"},
+                {"id": "project-abc", "uid": "uid-abc", "organization": "other-org", "display_name": "Garage"},
+            ])
+        );
+        assert!(v.get("refresh_token").is_none() && !v.to_string().contains("refresh-SECRET"));
+        let expires = rfc3339(&v["expires_at"]);
+        let left = (expires - p.seen_at).num_milliseconds();
+        assert!((8_000..=9_000).contains(&left), "capped at 900 ticks: {left}ms");
+        let token_left = (rfc3339(&v["token_expires_at"]) - p.seen_at).num_milliseconds();
+        assert!((430_000..=432_000).contains(&token_left), "{token_left}ms");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // Written by rename: no temp file left beside it.
+        let names: Vec<_> = std::fs::read_dir(&p.dir.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, [SESSION]);
+        assert_token_hidden(&p.events, None, &[TOKEN]);
+        drop(p.fake);
+    }
+
+    #[tokio::test]
+    async fn a_saved_login_stops_two_minutes_before_the_token_does() {
+        let mut fake = two_projects();
+        fake.token_expires_in = 500; // 5s at 10ms ticks; 120 ticks less is 3.8s
+        let p = pair_until_waiting(fake, |c| c.tick = Duration::from_millis(10)).await;
+        let v = read_session(&session_path(&p.cfg));
+        let left = (rfc3339(&v["expires_at"]) - p.seen_at).num_milliseconds();
+        assert!((3_000..=3_800).contains(&left), "token exp - 120 ticks: {left}ms");
+    }
+
+    #[tokio::test]
+    async fn a_restart_with_a_saved_login_and_a_valid_project_needs_no_new_approval() {
+        let p = pair_until_waiting(two_projects(), |_| {}).await;
+        let before = p.fake.lock().unwrap().requests.len();
+        assert_eq!(device_flow_requests(&p.fake.lock().unwrap()), 2, "one code, one approval");
+        // The restart: run.sh passes the project just saved.
+        let mut cfg = p.cfg.clone();
+        cfg.project = Some(PROJECT.into());
+        let run = run_cfg(cfg, p.fake, p.dir).await;
+        let paired = run.result.as_ref().expect("pairs after the restart");
+        assert_eq!(paired.project, PROJECT);
+        assert_eq!(paired.organization, ORG);
+        assert!(run.cfg.key_out.exists());
+        let fake = run.fake.lock().unwrap();
+        let after = &fake.requests[before..];
+        assert!(!after.iter().any(|r| r.path.starts_with("/oauth/")), "no device flow at all");
+        assert!(!after.iter().any(|r| r.path.ends_with("/organizationmemberships")), "the saved list is used");
+        assert_eq!(fake.codes_issued, 1);
+        assert_eq!(fake.sas.len(), 1);
+        assert_eq!(run.events[0], PairingEvent::Resumed { email: "person@example.com".into() });
+        assert!(!run.events.iter().any(|e| matches!(e, PairingEvent::Approved { .. } | PairingEvent::Code { .. })));
+        assert!(!session_path(&run.cfg).exists(), "deleted once paired");
+        drop(fake);
+        assert_token_hidden(&run.events, run.result.as_ref().err(), &[TOKEN]);
+        assert_token_hidden(&p.events, run.result.as_ref().err(), &[TOKEN]);
+    }
+
+    #[tokio::test]
+    async fn a_restart_with_a_saved_login_and_an_invalid_project_waits_again() {
+        let p = pair_until_waiting(two_projects(), |_| {}).await;
+        let path = session_path(&p.cfg);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let before = p.fake.lock().unwrap().requests.len();
+        // The restart: the options saved, and so run.sh's --project, name a
+        // project the login cannot see.
+        p.fake.lock().unwrap().options = VecDeque::from(["project-nope".to_string()]);
+        let mut cfg = p.cfg.clone();
+        cfg.project = Some("project-nope".into());
+
+        // Stopped again while waiting: still saved, and as it was.
+        let (events, _) = run_until_waiting(&cfg).await;
+        assert_eq!(events[0], PairingEvent::Resumed { email: "person@example.com".into() });
+        assert_eq!(chooses(&events), [Some("project-nope".to_string())]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved, "kept, not extended");
+
+        // And again, this time with a project chosen while it waits.
+        p.fake.lock().unwrap().options = VecDeque::from(["project-nope".into(), PROJECT.into()]);
+        let run = run_cfg(cfg, p.fake, p.dir).await;
+        assert_eq!(run.result.as_ref().expect("pairs").project, PROJECT);
+        assert_eq!(chooses(&run.events), [Some("project-nope".to_string())]);
+        let fake = run.fake.lock().unwrap();
+        assert!(!fake.requests[before..].iter().any(|r| r.path.starts_with("/oauth/")), "no device flow at all");
+        drop(fake);
+        assert!(!path.exists());
+        assert_token_hidden(&run.events, run.result.as_ref().err(), &[TOKEN]);
+    }
+
+    #[tokio::test]
+    async fn an_expired_saved_login_is_deleted_and_a_new_one_asked_for() {
+        let run = run_with_session(Fake::new(), Some(PROJECT), |path| {
+            write_session(path, TOKEN, chrono::Duration::seconds(-1));
+        })
+        .await;
+        run.result.as_ref().expect("pairs with a new approval");
+        assert_eq!(run.fake.lock().unwrap().codes_issued, 1);
+        assert_eq!(run.events[0], PairingEvent::SessionDropped { reason: "its saved login expired".into() });
+        assert!(matches!(run.events[1], PairingEvent::Code { .. }));
+        assert!(!run.events.iter().any(|e| matches!(e, PairingEvent::Resumed { .. })));
+        assert!(!session_path(&run.cfg).exists());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_saved_login_is_deleted_and_never_quoted() {
+        let run = run_with_session(Fake::new(), Some(PROJECT), |path| {
+            std::fs::write(path, format!("{{\"access_token\": \"{TOKEN}\", \"version\": \"x\"")).unwrap();
+        })
+        .await;
+        run.result.as_ref().expect("pairs with a new approval");
+        assert_eq!(
+            run.events[0],
+            PairingEvent::SessionDropped { reason: "its saved login could not be read".into() }
+        );
+        assert_eq!(run.fake.lock().unwrap().codes_issued, 1);
+        assert!(!session_path(&run.cfg).exists());
+        assert_token_hidden(&run.events, run.result.as_ref().err(), &[TOKEN]);
+    }
+
+    #[tokio::test]
+    async fn a_saved_login_datum_refuses_is_deleted_and_a_new_one_asked_for() {
+        const STALE: &str = "stale-user-token-SECRET-555";
+        let run = run_with_session(Fake::new(), Some(PROJECT), |path| {
+            write_session(path, STALE, chrono::Duration::minutes(10));
+        })
+        .await;
+        let paired = run.result.as_ref().expect("pairs with a new approval");
+        assert_eq!(paired.project, PROJECT);
+        let kinds: Vec<&str> = run
+            .events
+            .iter()
+            .map(|e| match e {
+                PairingEvent::Resumed { .. } => "resumed",
+                PairingEvent::SessionDropped { .. } => "dropped",
+                PairingEvent::Code { .. } => "code",
+                PairingEvent::Approved { .. } => "approved",
+                _ => "other",
+            })
+            .filter(|k| *k != "other")
+            .take(4)
+            .collect();
+        assert_eq!(kinds, ["resumed", "dropped", "code", "approved"]);
+        assert!(run.events.contains(&PairingEvent::SessionDropped {
+            reason: "Datum no longer accepts its saved login (HTTP 401)".into()
+        }));
+        let fake = run.fake.lock().unwrap();
+        assert_eq!(fake.codes_issued, 1);
+        assert_eq!(fake.sas.len(), 1, "nothing made with the refused login");
+        assert!(
+            fake.requests.iter().any(|r| r.authorization.as_deref() == Some(&format!("Bearer {STALE}"))),
+            "the saved login was tried"
+        );
+        drop(fake);
+        assert!(!session_path(&run.cfg).exists());
+        assert_token_hidden(&run.events, run.result.as_ref().err(), &[TOKEN, STALE]);
+    }
+
+    #[tokio::test]
+    async fn the_saved_login_is_deleted_however_pairing_ends() {
+        // Success after waiting in the same run.
+        let mut fake = two_projects();
+        fake.options = VecDeque::from(["".into(), "".into(), PROJECT.into()]);
+        let run = run_notified(fake, None, |c| c.session_file = Some(c.key_out.with_file_name(SESSION))).await;
+        run.result.as_ref().expect("pairs");
+        assert!(!session_path(&run.cfg).exists());
+        assert_no_secrets(&run);
+
+        // A terminal failure: nothing chosen in time.
+        let run = run_notified(two_projects(), None, |c| {
+            c.session_file = Some(c.key_out.with_file_name(SESSION));
+            c.project_wait.as_mut().unwrap().max = Duration::from_millis(100);
+        })
+        .await;
+        assert!(matches!(run.result, Err(PairingError::ProjectNotChosen { .. })));
+        assert!(!session_path(&run.cfg).exists());
+        assert_no_secrets(&run);
+    }
+
+    #[tokio::test]
+    async fn a_saved_login_is_never_in_a_notification() {
+        let p = pair_until_waiting(two_projects(), |_| {}).await;
+        // Resume with the notifier on, as the add-on runs it, and an
+        // invalid project, so the list is shown again.
+        let fake = p.fake.clone();
+        fake.lock().unwrap().options = VecDeque::from(["".into(), PROJECT.into()]);
+        let base = p.cfg.issuer.clone();
+        let mut cfg = p.cfg.clone();
+        cfg.project = Some("project-nope".into());
+        let notifier = PairingNotifier::spawn(supervisor(&base));
+        let mut events = Vec::new();
+        let result = pair(&cfg, &mut |e| {
+            notifier.event(&e);
+            events.push(e);
+        })
+        .await;
+        notifier.outcome(&result);
+        notifier.finish().await;
+        let run = Run { result, events, fake, cfg, _dir: p.dir };
+        run.result.as_ref().expect("pairs");
+        assert_no_secrets(&run);
     }
 
     #[test]
