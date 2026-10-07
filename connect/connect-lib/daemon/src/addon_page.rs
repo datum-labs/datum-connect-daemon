@@ -1,17 +1,24 @@
-//! What the add-on's page shows once paired, and its Re-pair and Unpair,
-//! from the running daemon. The page and its server are in `ingress.rs`.
+//! What the add-on's page shows once paired, and its actions (Re-pair,
+//! Unpair, Remove for an older tunnel, Allow for Home Assistant's trusted
+//! proxies), from the running daemon. The page and its server are in
+//! `ingress.rs`.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use axum::http::StatusCode;
+use connect_lib::datum_cloud::ha_core::{self, AllowOutcome, AllowStep, AllowTiming, ProxySetup};
 use connect_lib::datum_cloud::ha_supervisor::Supervisor;
 use connect_lib::datum_cloud::pairing;
 use connect_lib::edge_policies::{self, EdgePolicyStatus};
 
-use crate::ingress::{ActionError, BoxFuture, ForgetOutcome, PairedStatus, PairedView, TunnelView};
+use crate::exclusive;
+use crate::ingress::{
+    ActionError, BoxFuture, ForgetOutcome, PairedStatus, PairedView, ProxyStepView, RemoveOutcome, TunnelView,
+};
 use crate::{AppState, StopReason};
 
 /// The page polls every 10s; Datum is asked about the tunnels at most this
@@ -19,9 +26,39 @@ use crate::{AppState, StopReason};
 const STATUS_TTL: Duration = Duration::from_secs(5);
 /// Edge policies change rarely, and only in the portal.
 const EDGE_TTL: Duration = Duration::from_secs(60);
+/// Home Assistant's HTTP settings change rarely, and each read is a
+/// websocket connection of its own.
+const PROXY_TTL: Duration = Duration::from_secs(30);
 /// Long enough for the page's reply to go out before the restart begins.
 const RESTART_DELAY: Duration = Duration::from_millis(500);
+/// A tunnel younger than this gets the "a new address can take 10-20
+/// minutes" note. Seen on a real install: 15-20 minutes before a new
+/// address worked in every browser.
+const NEW_ADDRESS_WINDOW: Duration = Duration::from_secs(30 * 60);
 const PORTAL: &str = "https://cloud.datum.net";
+
+/// The client address the verify step's request claims to forward for: a
+/// documentation address (RFC 5737), never a real one.
+const VERIFY_FORWARDED_FOR: &str = "203.0.113.10";
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(20);
+
+const ALLOWED_MESSAGE: &str = "Home Assistant now accepts connections through Datum.";
+const PENDING_MESSAGE: &str = "Home Assistant has a network settings change waiting for confirmation. Finish it in Settings → System → Network (confirm or discard it), then come back here.";
+
+/// Allow, as it runs in the background, and what Home Assistant last said.
+/// Shared with the task that runs Allow, which outlives the request.
+#[derive(Default)]
+struct ProxyJob {
+    running: Option<AllowStep>,
+    /// The last Allow's outcome: whether it ended well, and what to say.
+    last: Option<(bool, String)>,
+    /// `http/config`, read at most every [`PROXY_TTL`]; `None` inside is
+    /// "could not be asked".
+    cached: Option<(Instant, Option<ProxySetup>)>,
+    /// Bumped whenever the above changes, so a cached page status is not
+    /// served past it.
+    version: u64,
+}
 
 pub(crate) struct DaemonPaired {
     app: Arc<AppState>,
@@ -30,8 +67,9 @@ pub(crate) struct DaemonPaired {
     /// Where pairing saves its key. Only a key there may be forgotten.
     paired_key_file: Option<PathBuf>,
     supervisor: Option<Supervisor>,
-    cache: tokio::sync::Mutex<Option<(Instant, PairedStatus)>>,
+    cache: tokio::sync::Mutex<Option<(Instant, u64, PairedStatus)>>,
     edge: tokio::sync::Mutex<HashMap<String, (Instant, EdgePolicyStatus)>>,
+    proxy_job: Arc<StdMutex<ProxyJob>>,
 }
 
 impl DaemonPaired {
@@ -48,11 +86,16 @@ impl DaemonPaired {
             supervisor,
             cache: Default::default(),
             edge: Default::default(),
+            proxy_job: Default::default(),
         }
     }
 
     fn key(&self) -> KeyFacts {
         key_facts(self.key_file.as_deref(), self.paired_key_file.as_deref(), self.supervisor.is_some())
+    }
+
+    fn job_version(&self) -> u64 {
+        self.proxy_job.lock().unwrap_or_else(|e| e.into_inner()).version
     }
 
     async fn edge_status(&self, tunnel_id: &str) -> Option<EdgePolicyStatus> {
@@ -76,30 +119,193 @@ impl DaemonPaired {
         Some(status)
     }
 
+    /// The tunnels as the page splits them: the add-on's own (or, outside
+    /// the add-on, all of them) and the older ones.
+    fn split(&self, tunnels: Vec<connect_lib::TunnelSummary>) -> (Vec<connect_lib::TunnelSummary>, Vec<connect_lib::TunnelSummary>) {
+        match &self.app.exclusive_label {
+            Some(label) => {
+                let part = exclusive::partition(tunnels, label, |id| {
+                    exclusive::is_locally_known(&self.app.connect_dir, &self.app.project_id, id)
+                });
+                (part.active.into_iter().collect(), part.older)
+            }
+            None => (tunnels, Vec::new()),
+        }
+    }
+
     async fn fresh_status(&self) -> PairedStatus {
         let key = self.key();
         let mut status = PairedStatus {
             project: self.app.project_id.clone(),
             service_account: key.email,
             key_source: key.source,
-            tunnels: Vec::new(),
             can_forget: key.why_not.is_none(),
             why_not: key.why_not,
-            error: None,
+            ..Default::default()
         };
         match self.app.control.list_active().await {
             Ok(tunnels) => {
                 let running: Vec<String> = self.app.running.lock().await.keys().cloned().collect();
-                for t in tunnels {
+                let now = SystemTime::now();
+                let (mine, older) = self.split(tunnels);
+                for t in mine {
                     let edge = self.edge_status(&t.id).await;
                     status
                         .tunnels
-                        .push(tunnel_view(&t, running.contains(&t.id), edge, &self.app.project_id));
+                        .push(tunnel_view(&t, running.contains(&t.id), edge, &self.app.project_id, now));
+                }
+                for t in older {
+                    // Stopped and on their way out: their policies are not
+                    // worth a call each.
+                    status.older.push(tunnel_view(&t, running.contains(&t.id), None, &self.app.project_id, now));
                 }
             }
             Err(e) => status.error = Some(format!("Could not ask Datum about the tunnel: {e}")),
         }
+        status.trusted_proxies = self.proxy_step().await;
         status
+    }
+
+    /// Home Assistant's trusted-proxy step, if there is a Supervisor to ask.
+    async fn proxy_step(&self) -> Option<ProxyStepView> {
+        let sup = self.supervisor.as_ref()?;
+        let (running, last, cached) = {
+            let job = self.proxy_job.lock().unwrap_or_else(|e| e.into_inner());
+            let fresh = job.cached.as_ref().filter(|(at, _)| at.elapsed() < PROXY_TTL).map(|(_, s)| s.clone());
+            (job.running, job.last.clone(), fresh)
+        };
+        if let Some(step) = running {
+            return Some(ProxyStepView { state: "working", message: Some(step.describe().into()) });
+        }
+        let setup = match cached {
+            Some(s) => s,
+            None => {
+                let read = match ha_core::read_http_config(sup, Duration::from_secs(10)).await {
+                    Ok(c) => ha_core::assess(&c).map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                };
+                let setup = match read {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        tracing::debug!("page: could not read Home Assistant's HTTP settings: {e}");
+                        None
+                    }
+                };
+                let mut job = self.proxy_job.lock().unwrap_or_else(|e| e.into_inner());
+                job.cached = Some((Instant::now(), setup.clone()));
+                setup
+            }
+        };
+        Some(proxy_step_view(setup.as_ref(), last.as_ref()))
+    }
+
+    /// Where the add-on's tunnel's local hop listens: what the verify step
+    /// sends its request through, the way edge traffic arrives.
+    async fn active_inspector(&self) -> Result<SocketAddr, ActionError> {
+        let tunnels = self.app.control.list_active().await.map_err(|e| ActionError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: format!("Could not ask Datum about the tunnel, so nothing was changed: {e}"),
+        })?;
+        let (mine, _) = self.split(tunnels);
+        let inspectors = self.app.inspectors.lock().await;
+        mine.iter().find_map(|t| inspectors.get(&t.id).map(|h| h.local_addr)).ok_or(ActionError {
+            status: StatusCode::CONFLICT,
+            message: "The tunnel isn't running yet, so a request through it can't be checked. Try again once it is online.".into(),
+        })
+    }
+
+    async fn allow_inner(&self) -> Result<(), ActionError> {
+        let Some(sup) = self.supervisor.clone() else {
+            return Err(ActionError {
+                status: StatusCode::CONFLICT,
+                message: "This needs the Home Assistant Supervisor, which is not available here.".into(),
+            });
+        };
+        let inspector = self.active_inspector().await?;
+        {
+            let mut job = self.proxy_job.lock().unwrap_or_else(|e| e.into_inner());
+            if job.running.is_some() {
+                return Err(ActionError { status: StatusCode::CONFLICT, message: "Already in progress.".into() });
+            }
+            job.running = Some(AllowStep::Saving);
+            job.last = None;
+            job.version += 1;
+        }
+        tracing::info!("Letting Home Assistant accept connections through Datum (from the Datum Connect page); Home Assistant restarts");
+        let job = self.proxy_job.clone();
+        tokio::spawn(async move {
+            let progress = job.clone();
+            let outcome = ha_core::allow_forwarded_requests(
+                &sup,
+                &AllowTiming::default(),
+                move |step| {
+                    let mut j = progress.lock().unwrap_or_else(|e| e.into_inner());
+                    j.running = Some(step);
+                    j.version += 1;
+                },
+                move || verify_forwarded(inspector),
+            )
+            .await;
+            let (ok, message) = outcome_message(&outcome);
+            if ok {
+                tracing::info!("{message}");
+            } else {
+                tracing::warn!("Home Assistant does not accept connections through Datum yet: {message}");
+            }
+            let mut j = job.lock().unwrap_or_else(|e| e.into_inner());
+            j.running = None;
+            j.last = Some((ok, message));
+            j.cached = None;
+            j.version += 1;
+        });
+        Ok(())
+    }
+
+    async fn remove_inner(&self, id: &str) -> Result<RemoveOutcome, ActionError> {
+        if self.app.exclusive_label.is_none() {
+            return Err(ActionError {
+                status: StatusCode::CONFLICT,
+                message: "Removing older tunnels is only available in the Home Assistant add-on.".into(),
+            });
+        }
+        // Asked afresh, never from the page's cached view: only a tunnel
+        // that is older right now may go.
+        let tunnels = self.app.control.list_active().await.map_err(|e| ActionError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: format!("Could not ask Datum about the tunnels, so nothing was removed: {e}"),
+        })?;
+        let (_, older) = self.split(tunnels);
+        let Some(t) = removable(&older, id) else {
+            return Err(ActionError {
+                status: StatusCode::CONFLICT,
+                message: "That isn't an older tunnel from this Home Assistant, so it was not removed.".into(),
+            });
+        };
+        let t = t.clone();
+        if self.app.running.lock().await.contains_key(&t.id)
+            && let Err((code, body)) =
+                crate::stop_tunnel_internal(&self.app, &t.id, StopReason::Manual, "addon-page").await
+        {
+            tracing::warn!(tunnel = %t.id, %code, error = %body.0, "Remove: could not stop the tunnel first; removing it anyway");
+        }
+        let outcome = crate::delete_tunnel_internal(&self.app, &t.id, "addon-page").await.map_err(|(_, body)| {
+            let why = body.0.get("error").and_then(|e| e.as_str()).unwrap_or("unknown error").to_string();
+            tracing::warn!(tunnel = %t.id, "Could not remove older tunnel '{}': {why}", t.label);
+            ActionError {
+                status: StatusCode::BAD_GATEWAY,
+                message: format!("Could not remove the tunnel: {why}. Nothing more was changed here; try again."),
+            }
+        })?;
+        tracing::info!(
+            "Removed older tunnel '{}' ({}) from Datum{}",
+            t.label,
+            t.id,
+            match &outcome.connector {
+                Some(c) => format!(", with its connector {c}"),
+                None => String::new(),
+            }
+        );
+        Ok(RemoveOutcome { id: t.id, label: t.label })
     }
 
     async fn forget_inner(&self, unpair: bool) -> Result<ForgetOutcome, ActionError> {
@@ -161,13 +367,15 @@ impl PairedView for DaemonPaired {
     fn status(&self) -> BoxFuture<'_, PairedStatus> {
         Box::pin(async move {
             let mut cache = self.cache.lock().await;
-            if let Some((at, s)) = cache.as_ref()
+            let version = self.job_version();
+            if let Some((at, v, s)) = cache.as_ref()
                 && at.elapsed() < STATUS_TTL
+                && *v == version
             {
                 return s.clone();
             }
             let s = self.fresh_status().await;
-            *cache = Some((Instant::now(), s.clone()));
+            *cache = Some((Instant::now(), self.job_version(), s.clone()));
             s
         })
     }
@@ -178,6 +386,71 @@ impl PairedView for DaemonPaired {
             *self.cache.lock().await = None;
             result
         })
+    }
+
+    fn remove(&self, id: String) -> BoxFuture<'_, Result<RemoveOutcome, ActionError>> {
+        Box::pin(async move {
+            let result = self.remove_inner(&id).await;
+            *self.cache.lock().await = None;
+            result
+        })
+    }
+
+    fn allow_proxies(&self) -> BoxFuture<'_, Result<(), ActionError>> {
+        Box::pin(async move {
+            let result = self.allow_inner().await;
+            *self.cache.lock().await = None;
+            result
+        })
+    }
+}
+
+/// The older tunnel `id`, if it is one. Never the add-on's own tunnel, and
+/// never one this device has no local state for: neither is in `older`.
+fn removable<'a>(older: &'a [connect_lib::TunnelSummary], id: &str) -> Option<&'a connect_lib::TunnelSummary> {
+    older.iter().find(|t| t.id == id)
+}
+
+/// What the page says about the trusted-proxy step.
+fn proxy_step_view(setup: Option<&ProxySetup>, last: Option<&(bool, String)>) -> ProxyStepView {
+    let view = |state, message: Option<&str>| ProxyStepView { state, message: message.map(str::to_string) };
+    match (setup, last) {
+        (Some(ProxySetup::Ready), _) => view("ok", None),
+        // The last Allow failed: say why, whatever Home Assistant shows
+        // while it reverts (its pending trial is ours, not someone else's).
+        (_, Some((false, why))) => view("failed", Some(why)),
+        (Some(ProxySetup::Pending), _) => view("pending", Some(PENDING_MESSAGE)),
+        (Some(ProxySetup::Needed { .. }), _) => view("needed", None),
+        (None, _) => view("unknown", Some("Could not ask Home Assistant about its network settings.")),
+    }
+}
+
+/// Whether Allow ended well, and what to say about it.
+fn outcome_message(outcome: &AllowOutcome) -> (bool, String) {
+    match outcome {
+        AllowOutcome::Allowed | AllowOutcome::AlreadyAllowed => (true, ALLOWED_MESSAGE.into()),
+        AllowOutcome::PendingByOther => (false, PENDING_MESSAGE.into()),
+        AllowOutcome::Failed(why) => (false, why.clone()),
+    }
+}
+
+/// One request through the tunnel's local hop to Home Assistant, carrying
+/// `X-Forwarded-For` and `X-Forwarded-Proto` as Datum's edge does: Home
+/// Assistant answers it 400 unless it trusts the hop. Returns the status.
+pub(crate) async fn verify_forwarded(inspector: SocketAddr) -> Result<u16, String> {
+    use http_body_util::Empty;
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+    let client: Client<_, Empty<bytes::Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = axum::http::Request::get(format!("http://{inspector}/"))
+        .header("x-forwarded-for", VERIFY_FORWARDED_FOR)
+        .header("x-forwarded-proto", "https")
+        .body(Empty::new())
+        .map_err(|e| e.to_string())?;
+    match tokio::time::timeout(VERIFY_TIMEOUT, client.request(req)).await {
+        Ok(Ok(r)) => Ok(r.status().as_u16()),
+        Ok(Err(e)) => Err(format!("the request failed: {e}")),
+        Err(_) => Err(format!("no answer within {} seconds", VERIFY_TIMEOUT.as_secs())),
     }
 }
 
@@ -207,7 +480,13 @@ fn key_facts(key_file: Option<&Path>, paired_key_file: Option<&Path>, has_superv
 }
 
 /// One tunnel, as the page shows it.
-fn tunnel_view(t: &connect_lib::TunnelSummary, running: bool, edge: Option<EdgePolicyStatus>, project: &str) -> TunnelView {
+fn tunnel_view(
+    t: &connect_lib::TunnelSummary,
+    running: bool,
+    edge: Option<EdgePolicyStatus>,
+    project: &str,
+    now: SystemTime,
+) -> TunnelView {
     let state = if !t.enabled {
         "off"
     } else if t.connector_ready && t.programmed {
@@ -224,12 +503,14 @@ fn tunnel_view(t: &connect_lib::TunnelSummary, running: bool, edge: Option<EdgeP
         state,
         edge,
         portal_url: Some(format!("{PORTAL}/project/{project}/edge/{}/overview", t.id)),
+        new_address: t.created_within(NEW_ADDRESS_WINDOW, now),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exclusive::tests::tunnel;
 
     fn summary(enabled: bool, ready: bool, hostnames: &[&str]) -> connect_lib::TunnelSummary {
         connect_lib::TunnelSummary {
@@ -250,14 +531,106 @@ mod tests {
 
     #[test]
     fn a_tunnel_reads_as_a_person_would_say_it() {
-        let v = tunnel_view(&summary(true, true, &["abc.datumproxy.net"]), true, None, "p-1");
+        let now = SystemTime::now();
+        let v = tunnel_view(&summary(true, true, &["abc.datumproxy.net"]), true, None, "p-1", now);
         assert_eq!(v.state, "online");
         assert_eq!(v.address.as_deref(), Some("https://abc.datumproxy.net"));
         assert_eq!(v.portal_url.as_deref(), Some("https://cloud.datum.net/project/p-1/edge/t-1/overview"));
-        assert_eq!(tunnel_view(&summary(true, false, &[]), true, None, "p").state, "starting");
-        assert_eq!(tunnel_view(&summary(true, false, &[]), false, None, "p").state, "offline");
-        assert_eq!(tunnel_view(&summary(false, true, &[]), false, None, "p").state, "off");
-        assert_eq!(tunnel_view(&summary(true, true, &[]), true, None, "p").address, None);
+        assert_eq!(tunnel_view(&summary(true, false, &[]), true, None, "p", now).state, "starting");
+        assert_eq!(tunnel_view(&summary(true, false, &[]), false, None, "p", now).state, "offline");
+        assert_eq!(tunnel_view(&summary(false, true, &[]), false, None, "p", now).state, "off");
+        assert_eq!(tunnel_view(&summary(true, true, &[]), true, None, "p", now).address, None);
+    }
+
+    /// The "a new address can take 10-20 minutes" note: only for a tunnel
+    /// whose HTTPProxy is less than half an hour old.
+    #[test]
+    fn only_a_young_tunnel_gets_the_new_address_note() {
+        // 2026-10-07T12:00:00Z
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_791_374_400);
+        let mut t = summary(true, true, &["abc.datumproxy.net"]);
+        t.created_at = Some("2026-10-07T11:50:00Z".into());
+        assert!(tunnel_view(&t, true, None, "p", now).new_address, "10 minutes old");
+        t.created_at = Some("2026-10-07T11:29:00Z".into());
+        assert!(!tunnel_view(&t, true, None, "p", now).new_address, "31 minutes old");
+        t.created_at = Some("2026-09-01T08:00:00Z".into());
+        assert!(!tunnel_view(&t, true, None, "p", now).new_address, "a month old");
+        t.created_at = None;
+        assert!(!tunnel_view(&t, true, None, "p", now).new_address, "unknown");
+    }
+
+    /// Remove only takes a tunnel from the older list, which never holds
+    /// the add-on's own tunnel or one from another machine.
+    #[test]
+    fn only_an_older_tunnel_is_removable() {
+        let tunnels = vec![tunnel("tunnel-old", "home-assistant"), tunnel("tunnel-new", "ha-2"), tunnel("tunnel-far", "other")];
+        let part = exclusive::partition(tunnels, "ha-2", |id| id != "tunnel-far");
+        assert_eq!(removable(&part.older, "tunnel-old").map(|t| t.label.as_str()), Some("home-assistant"));
+        assert!(removable(&part.older, "tunnel-new").is_none(), "the active tunnel");
+        assert!(removable(&part.older, "tunnel-far").is_none(), "another machine's");
+        assert!(removable(&part.older, "tunnel-nope").is_none());
+    }
+
+    #[test]
+    fn the_proxy_step_reads_as_a_person_would_say_it() {
+        let needed = ProxySetup::Needed { config: serde_json::json!({}) };
+        assert_eq!(proxy_step_view(Some(&ProxySetup::Ready), None).state, "ok");
+        assert_eq!(proxy_step_view(Some(&needed), None).state, "needed");
+        let pending = proxy_step_view(Some(&ProxySetup::Pending), None);
+        assert_eq!(pending.state, "pending");
+        assert!(pending.message.unwrap().contains("Settings → System → Network"));
+        assert_eq!(proxy_step_view(None, None).state, "unknown");
+        let failed = (false, "A request ... still got 400".to_string());
+        // Failed wins while Home Assistant reverts its trial of our change.
+        assert_eq!(proxy_step_view(Some(&ProxySetup::Pending), Some(&failed)).state, "failed");
+        assert_eq!(proxy_step_view(Some(&needed), Some(&failed)).message.as_deref(), Some(failed.1.as_str()));
+        // Once it reads as on, that is what counts.
+        assert_eq!(proxy_step_view(Some(&ProxySetup::Ready), Some(&failed)).state, "ok");
+        assert_eq!(outcome_message(&AllowOutcome::Allowed), (true, ALLOWED_MESSAGE.to_string()));
+        assert!(!outcome_message(&AllowOutcome::PendingByOther).0);
+        assert_eq!(outcome_message(&AllowOutcome::Failed("x".into())), (false, "x".to_string()));
+    }
+
+    /// The verify step's request goes through the inspector, as edge
+    /// traffic does, with `X-Forwarded-For`: a Home Assistant that does not
+    /// trust the hop answers 400, one that does answers as usual.
+    #[tokio::test]
+    async fn verify_sends_a_forwarded_request_through_the_inspector() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let trusted = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ha = listener.local_addr().unwrap();
+        {
+            let trusted = trusted.clone();
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                while let Ok((mut s, _)) = listener.accept().await {
+                    let mut buf = vec![0u8; 4096];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                    seen.lock().unwrap().push(head.clone());
+                    let forwarded = head.contains("x-forwarded-for: 203.0.113.10");
+                    let status = if forwarded && !trusted.load(Ordering::SeqCst) { "400 Bad Request" } else { "200 OK" };
+                    let _ = s
+                        .write_all(format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").as_bytes())
+                        .await;
+                }
+            });
+        }
+        let target = crate::parse_real_target(&format!("http://{ha}")).unwrap();
+        let (handle, _) = crate::spawn_inspector(&target).await.unwrap();
+        assert_eq!(verify_forwarded(handle.local_addr).await, Ok(400));
+        trusted.store(true, Ordering::SeqCst);
+        assert_eq!(verify_forwarded(handle.local_addr).await, Ok(200));
+        {
+            let seen = seen.lock().unwrap();
+            assert!(seen.iter().all(|h| h.contains("x-forwarded-proto: https")), "{seen:?}");
+        }
+        drop(handle);
+        let gone = verify_forwarded("127.0.0.1:9".parse().unwrap()).await;
+        assert!(gone.is_err(), "{gone:?}");
     }
 
     #[test]
@@ -291,10 +664,12 @@ mod tests {
             project: "p-1".into(),
             service_account: key_facts(Some(&paired), Some(&paired), true).email,
             key_source: "paired",
+            trusted_proxies: Some(proxy_step_view(None, Some(&(false, "boom".into())))),
+            older: vec![tunnel_view(&summary(false, false, &["old.datumproxy.net"]), false, None, "p-1", SystemTime::now())],
             ..Default::default()
         };
         let json = serde_json::to_string(&status).unwrap();
-        assert!(!json.contains("SECRET") && !json.contains("private_key"), "{json}");
+        assert!(!json.contains("SECRET") && !json.contains("private_key") && !json.contains("token"), "{json}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

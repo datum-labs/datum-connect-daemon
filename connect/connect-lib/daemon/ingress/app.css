@@ -157,3 +157,26 @@ dl.facts dd { margin: 0; overflow-wrap: anywhere; }
   padding: 4px 12px;
   margin: 12px 0;
 }
+
+/* The add-on's tunnel: its address is what the page is for. */
+.card.hero { border-color: var(--accent); }
+a.address {
+  display: inline-block;
+  font-size: 1.25rem;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+  margin: 4px 0;
+}
+
+ul.older { list-style: none; padding: 0; margin: 8px 0 0; }
+ul.older li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+}
+ul.older li button { margin: 0; }
+.older-text { min-width: 0; overflow-wrap: anywhere; }

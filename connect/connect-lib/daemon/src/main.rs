@@ -33,6 +33,7 @@ use tracing_subscriber::prelude::*;
 
 mod addon_page;
 mod auth;
+mod exclusive;
 mod ingress;
 mod inspector;
 mod logs;
@@ -125,6 +126,9 @@ struct AppState {
     edge_policies: bool,
     /// When this daemon process started, for the dashboard's uptime.
     started_at_unix_ms: u128,
+    /// `Args::exclusive_label`: the one tunnel the Home Assistant add-on
+    /// owns. See `exclusive.rs`.
+    exclusive_label: Option<String>,
 }
 
 fn inspector_target_dir(base: &std::path::Path) -> std::path::PathBuf {
@@ -285,6 +289,15 @@ struct Args {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     edge_policies: bool,
+    /// The Home Assistant add-on's `tunnel_label`: the add-on owns exactly
+    /// one tunnel, the first with this label. Every other tunnel this daemon
+    /// has local state for is then an older one: not resumed at start,
+    /// stopped if on, and offered for removal on the add-on's page. Tunnels
+    /// it has no local state for (other machines in a shared project) are
+    /// never touched. Unset (the default), every tunnel is as before. See
+    /// `exclusive.rs`.
+    #[clap(long, env = "DATUM_TUNNEL_EXCLUSIVE_LABEL")]
+    exclusive_label: Option<String>,
     /// Serve the Home Assistant add-on's page (ingress) on this port: the
     /// tunnel's status, Re-pair and Unpair for the daemon; the "Connect to
     /// Datum" flow for `setup`. Set by the add-on. Unset, there is no page.
@@ -626,6 +639,25 @@ mod args_tests {
                 Args::try_parse_from(["datum-connect-daemon", "--edge-policies", raw]).unwrap();
             assert_eq!(args.edge_policies, want, "{raw}");
         }
+    }
+
+    #[test]
+    fn exclusive_label_parses_and_defaults_off() {
+        if std::env::var_os("DATUM_TUNNEL_EXCLUSIVE_LABEL").is_none() {
+            assert_eq!(Args::try_parse_from(["datum-connect-daemon"]).unwrap().exclusive_label, None);
+        }
+        let args = Args::try_parse_from(["datum-connect-daemon", "--exclusive-label", "home-assistant"]).unwrap();
+        assert_eq!(args.exclusive_label.as_deref(), Some("home-assistant"));
+    }
+
+    #[test]
+    fn the_proxy_hint_only_when_something_is_missing() {
+        use connect_lib::datum_cloud::ha_core::ProxySetup;
+        assert_eq!(proxy_hint(None), None);
+        assert_eq!(proxy_hint(Some(&ProxySetup::Ready)), None);
+        let needed = ProxySetup::Needed { config: serde_json::json!({}) };
+        assert!(proxy_hint(Some(&needed)).unwrap().contains("click Allow"));
+        assert!(proxy_hint(Some(&ProxySetup::Pending)).unwrap().contains("Settings > System > Network"));
     }
 
     /// The add-on runs `pair --project "$PROJECT" --key-out <path>`, with
@@ -1106,6 +1138,16 @@ async fn delete_tunnel(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> ApiResult<connect_lib::TunnelDeleteOutcome> {
+    delete_tunnel_internal(&state, &id, "setup").await.map(Json)
+}
+
+/// Shared by `DELETE /v1/tunnels/:id` and the add-on page's Remove.
+pub(crate) async fn delete_tunnel_internal(
+    state: &Arc<AppState>,
+    id: &str,
+    actor_label: &str,
+) -> Result<connect_lib::TunnelDeleteOutcome, (StatusCode, Json<serde_json::Value>)> {
+    let id = id.to_string();
     // Delete server-side FIRST. The inspector holds the only record of this
     // tunnel's real target and its traffic history, with no way to recover
     // either once it's dropped — so it (and the running/heartbeat entry)
@@ -1124,9 +1166,9 @@ async fn delete_tunnel(
         tracing::warn!(tunnel = %id, "failed to remove note file on delete: {e:#}");
     }
     auth::delete_tokens_for_tunnel(&state.connect_dir, &id).await;
-    auth::append_audit(&state.connect_dir, &state.audit_lock, "delete", &id, "setup").await;
+    auth::append_audit(&state.connect_dir, &state.audit_lock, "delete", &id, actor_label).await;
 
-    Ok(Json(outcome))
+    Ok(outcome)
 }
 
 #[derive(Deserialize)]
@@ -1718,6 +1760,10 @@ async fn setup(
                 "Paired: this device now uses service account {} in project {}. To revoke it, delete that service account in the Datum portal under the project's Service accounts.",
                 key.service_account_email, key.project
             ));
+            // The run's own outcome has already asked for this; asked again
+            // here, last in the queue, so nothing shown after it brings the
+            // notification back. The daemon asks once more as it starts.
+            log.notify(|n| n.dismiss());
             tokio::time::sleep(SETUP_HANDOVER).await;
             false
         }
@@ -1839,6 +1885,20 @@ fn init_pairing_tracing() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("datum_connect_daemon=warn,connect_lib=warn")),
         )
         .init();
+}
+
+/// The start-up hint about Home Assistant's trusted proxies, if one is due.
+fn proxy_hint(setup: Option<&connect_lib::datum_cloud::ha_core::ProxySetup>) -> Option<&'static str> {
+    use connect_lib::datum_cloud::ha_core::ProxySetup;
+    match setup? {
+        ProxySetup::Ready => None,
+        ProxySetup::Needed { .. } => Some(
+            "Home Assistant does not accept connections through Datum yet, so its public address answers 400: Bad Request. Open Datum Connect in the sidebar and click Allow, or see the Documentation tab.",
+        ),
+        ProxySetup::Pending => Some(
+            "Home Assistant has a network settings change waiting for confirmation. Finish it in Settings > System > Network, then check the Datum Connect page.",
+        ),
+    }
 }
 
 #[tokio::main]
@@ -1995,7 +2055,11 @@ async fn run() -> n0_error::Result<()> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0),
+        exclusive_label: args.exclusive_label.clone().filter(|l| !l.trim().is_empty()),
     });
+    if let Some(label) = &state.exclusive_label {
+        tracing::info!(%label, "the add-on owns one tunnel: older tunnels from this device are stopped and not resumed");
+    }
 
     // Auto-register the daemon's own log file as a built-in tailable source
     // (see LOG-TAIL-PLAN.md) — reuses `logs::register` verbatim rather than
@@ -2054,6 +2118,27 @@ async fn run() -> n0_error::Result<()> {
         }
     }
 
+    // Inside the add-on: pairing is over (there is a key), so its
+    // notification goes, and a hint if Home Assistant does not accept
+    // requests through Datum yet. In the background: neither may hold the
+    // tunnel up.
+    if let Some(sup) = connect_lib::datum_cloud::ha_supervisor::Supervisor::from_env()
+        && std::env::var_os("DATUM_SA_KEY_FILE")
+            .map(std::path::PathBuf::from)
+            .is_some_and(|k| k.is_file())
+    {
+        tokio::spawn(async move {
+            let check =
+                connect_lib::datum_cloud::ha_core::startup_check(&sup, std::time::Duration::from_secs(20)).await;
+            if let Err(e) = check.dismissed {
+                tracing::debug!("could not dismiss a leftover pairing notification (best-effort): {e}");
+            }
+            if let Some(line) = proxy_hint(check.proxies.as_ref()) {
+                tracing::info!("{line}");
+            }
+        });
+    }
+
     // Reconcile inspectors for any tunnel that was already enabled before
     // this daemon (re)started. Its old inspector process died with the
     // previous process, but the real target was persisted to disk in
@@ -2062,6 +2147,35 @@ async fn run() -> n0_error::Result<()> {
     // after a routine restart.
     match state.control.list_active().await {
         Ok(tunnels) => {
+            // The add-on owns one tunnel; older ones from this device stay
+            // off. See `exclusive.rs`.
+            let older: HashSet<String> = match &state.exclusive_label {
+                Some(label) => {
+                    let part = exclusive::partition(tunnels.clone(), label, |id| {
+                        exclusive::is_locally_known(&state.connect_dir, &state.project_id, id)
+                    });
+                    part.older.into_iter().map(|t| t.id).collect()
+                }
+                None => HashSet::new(),
+            };
+            let (older_tunnels, tunnels): (Vec<_>, Vec<_>) =
+                tunnels.into_iter().partition(|t| older.contains(&t.id));
+            for t in older_tunnels {
+                if !t.enabled {
+                    tracing::info!("{}", exclusive::already_off_line(&t));
+                    continue;
+                }
+                match stop_tunnel_internal(&state, &t.id, StopReason::Manual, "system").await {
+                    Ok(_) => tracing::info!("{}", exclusive::stopped_line(&t)),
+                    Err((status, body)) => tracing::warn!(
+                        tunnel = %t.id,
+                        %status,
+                        error = %body.0,
+                        "Could not stop older tunnel '{}'; it is not resumed, but may still answer until it is stopped or removed",
+                        t.label
+                    ),
+                }
+            }
             // Every existing tunnel gets its inspector reconciled here,
             // regardless of enabled/disabled state — the inspector's
             // lifecycle is tied to the tunnel profile existing at all, not

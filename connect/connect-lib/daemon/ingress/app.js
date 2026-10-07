@@ -2,7 +2,9 @@
 //
 // One page, two servers: while the add-on has no key, `datum-connect-daemon
 // setup` serves it and runs pairing; once paired, the daemon serves it and
-// shows the tunnel. When one hands over to the other, this page notices the
+// shows the tunnel, older tunnels from this Home Assistant (with Remove),
+// and Home Assistant's trusted-proxy step (with Allow). When one hands over
+// to the other, this page notices the
 // mode change and reloads, which also picks up the new server's CSRF token.
 //
 // Every URL is relative: the page runs under Home Assistant's ingress path
@@ -15,8 +17,12 @@
   var csrf = (document.querySelector('meta[name="datum-csrf"]') || {}).content || "";
   var loadedMode = document.body.getAttribute("data-mode");
   var root = document.getElementById("app");
+  // Only for a tunnel created less than half an hour ago (the server says
+  // which, as new_address).
   var NEW_ADDRESS_NOTE =
     "A new address can take 10–20 minutes before it works in every browser.";
+  var PROXY_STEP =
+    "Let Home Assistant accept connections through Datum: turns on X-Forwarded-For and adds 127.0.0.1 and ::1 as trusted proxies. Home Assistant will restart.";
 
   // What the person picked in the project list, kept across re-renders.
   var picked = null;
@@ -24,6 +30,8 @@
   var last = null;
   var busy = false;
   var actionResult = null;
+  // What the last Remove did, shown above the tunnels until the next one.
+  var notice = null;
   var timer = null;
   // What is on screen, so that an unchanged state is not drawn again every
   // second, which would close a project list someone has open.
@@ -221,8 +229,7 @@
         return show(card(
           el("h2", { class: "ok", text: "Done. Starting the tunnel…" }),
           steps(s),
-          el("p", { class: "muted", text: "This page switches to the tunnel's status by itself once it is up." }),
-          el("p", { class: "note", text: NEW_ADDRESS_NOTE })));
+          el("p", { class: "muted", text: "This page switches to the tunnel's status by itself once it is up." })));
       case "failed":
         return renderFailed(s);
       default:
@@ -303,21 +310,13 @@
       return show.apply(null, parts);
     }
     var tunnels = p.tunnels || [];
+    var older = p.older || [];
+    if (notice) parts.push(card(el("p", { class: notice.ok ? "ok" : "error", text: notice.text })));
     if (p.error) parts.push(card(el("p", { class: "warn", text: p.error })));
     if (!tunnels.length && !p.error) parts.push(card(el("p", { class: "muted", text: "No tunnel yet. The add-on creates it as it starts; this page updates by itself." })));
-    tunnels.forEach(function (t) {
-      parts.push(card(
-        el("h2", null, t.label + " ", el("span", { class: "badge " + stateClass(t.state), text: stateText(t.state) })),
-        t.address
-          ? el("p", null, el("a", { class: "button", href: t.address, target: "_blank", rel: "noopener noreferrer" }, t.address))
-          : el("p", { class: "muted", text: "The public address appears here once it is assigned." }),
-        el("p", { class: "note small", text: NEW_ADDRESS_NOTE }),
-        el("dl", { class: "facts" },
-          el("dt", { text: "Edge protection" }), el("dd", { text: wafText(t.edge) }),
-          el("dt", { text: "Request timeout" }), el("dd", { text: timeoutText(t.edge) }),
-          t.portal_url ? el("dt", { text: "Portal" }) : null,
-          t.portal_url ? el("dd", null, el("a", { href: t.portal_url, target: "_blank", rel: "noopener noreferrer", text: "Open in the Datum portal" })) : null)));
-    });
+    tunnels.forEach(function (t) { parts.push(tunnelCard(t)); });
+    parts.push(proxyCard(p.trusted_proxies));
+    if (older.length) parts.push(olderCard(older));
     parts.push(card(
       el("dl", { class: "facts" },
         el("dt", { text: "Project" }), el("dd", { text: p.project }),
@@ -331,6 +330,88 @@
       el("button", { class: "secondary", disabled: busy || !p.can_forget, onclick: function () { forget(false, p); } }, "Re-pair"),
       el("button", { class: "danger", disabled: busy || !p.can_forget, onclick: function () { forget(true, p); } }, "Unpair")));
     show.apply(null, parts);
+  }
+
+  // The add-on's tunnel, first and largest: its address is what this page
+  // is for.
+  function tunnelCard(t) {
+    return el("section", { class: "card hero" },
+      el("h2", null, t.label + " ", el("span", { class: "badge " + stateClass(t.state), text: stateText(t.state) })),
+      t.address
+        ? el("p", null, el("a", { class: "address", href: t.address, target: "_blank", rel: "noopener noreferrer" }, t.address))
+        : el("p", { class: "muted", text: "The public address appears here once it is assigned." }),
+      t.new_address ? el("p", { class: "note small", text: NEW_ADDRESS_NOTE }) : null,
+      el("dl", { class: "facts" },
+        el("dt", { text: "Edge protection" }), el("dd", { text: wafText(t.edge) }),
+        el("dt", { text: "Request timeout" }), el("dd", { text: timeoutText(t.edge) }),
+        t.portal_url ? el("dt", { text: "Portal" }) : null,
+        t.portal_url ? el("dd", null, el("a", { href: t.portal_url, target: "_blank", rel: "noopener noreferrer", text: "Open in the Datum portal" })) : null));
+  }
+
+  // Home Assistant's trusted proxies: without them, every request through
+  // Datum gets 400: Bad Request.
+  function proxyCard(s) {
+    if (!s) return null;
+    var allow = function (label) {
+      return el("button", { disabled: busy, onclick: function () { allowProxies(); } }, label);
+    };
+    switch (s.state) {
+      case "ok":
+        return card(el("p", { class: "ok", text: "Home Assistant accepts connections through Datum ✓" }));
+      case "needed":
+        return card(el("p", { text: PROXY_STEP }), allow("Allow"));
+      case "failed":
+        return card(
+          el("p", { class: "error", text: s.message || "That did not work." }),
+          el("p", { text: PROXY_STEP }),
+          allow("Try again"));
+      case "working":
+        return card(
+          el("h2", { text: "Letting Home Assistant accept connections through Datum" }),
+          el("p", { class: "muted", text: s.message || "Working…" }),
+          el("p", { class: "muted small", text: "Home Assistant restarts, so this page may go blank for a minute or two. It comes back by itself, and the add-on carries on meanwhile." }));
+      case "pending":
+        return card(el("p", { class: "warn", text: s.message || "" }));
+      default:
+        return card(el("p", { class: "muted small", text: s.message || "Could not ask Home Assistant about its network settings." }));
+    }
+  }
+
+  function allowProxies() {
+    post("api/allow-proxies").then(function (s) {
+      if (s) { last = s; render(s); }
+      schedule(2000);
+    }).catch(function (e) {
+      if (last) render(last);
+      root.appendChild(errorLine(e));
+    });
+  }
+
+  function olderCard(older) {
+    return card(
+      el("h2", { text: "Older tunnels from this Home Assistant" }),
+      el("p", { class: "muted small", text: "Made by this add-on before tunnel_label changed. They are stopped and stay that way. Remove deletes one in Datum, with its public address, connector and edge policies." }),
+      el.apply(null, ["ul", { class: "older" }].concat(older.map(function (t) {
+        return el("li", null,
+          el("div", { class: "older-text" },
+            el("div", null, el("strong", { text: t.label }), " ", el("span", { class: "badge " + stateClass(t.state), text: stateText(t.state) })),
+            el("div", { class: "muted small", text: t.address || t.id })),
+          el("button", { class: "danger", disabled: busy, onclick: function () { removeTunnel(t); } }, "Remove"));
+      }))));
+  }
+
+  function removeTunnel(t) {
+    var question = "Remove the tunnel “" + t.label + "” (" + (t.address || t.id) + ")? It is deleted in Datum, with its public address, connector and edge policies. This cannot be undone.";
+    if (!window.confirm(question)) return;
+    post("api/remove-tunnel", { id: t.id }).then(function (r) {
+      if (!r) return;
+      notice = { ok: true, text: "Removed the older tunnel “" + r.label + "”." };
+      rendered = null;
+      schedule(300);
+    }).catch(function (e) {
+      notice = { ok: false, text: e.message || String(e) };
+      if (last) render(last);
+    });
   }
 
   function forget(unpair, p) {
@@ -382,11 +463,15 @@
   function renderAway() {
     rendered = null;
     if (actionResult) return;
+    var proxies = last && last.mode === "paired" && last.paired && last.paired.trusted_proxies;
     if (last && last.mode === "setup" && last.setup.phase === "done") {
       show(card(
         el("h2", { text: "Starting the tunnel…" }),
-        el("p", { class: "muted", text: "This page updates by itself." }),
-        el("p", { class: "note", text: NEW_ADDRESS_NOTE })));
+        el("p", { class: "muted", text: "This page updates by itself." })));
+    } else if (proxies && proxies.state === "working") {
+      show(card(
+        el("h2", { text: "Home Assistant is restarting with the new setting…" }),
+        el("p", { class: "muted", text: "This page comes back by itself." })));
     } else {
       show(card(el("p", { class: "muted", text: "Waiting for the add-on… If this lasts, check that it is running, and its Log tab." })));
     }
