@@ -42,10 +42,14 @@ Home Assistant OS does not allow that — and nothing is built on the device.
 
 5. **Choose the project, if asked.** If you have several projects, the
    notification lists them: set `project` on the Configuration tab and click
-   Save; pairing continues by itself. Use the project's id, as listed, not
-   its display name. There is no need to restart or approve again. Pairing
-   waits up to 30 minutes for this. With only one project, it is used
-   without asking. You can also set `project` before starting.
+   Save. Use the project's id, as listed, not its display name; stray
+   spaces, quotes or capitals from copying it are ignored. Home Assistant
+   then offers to restart the add-on. Either answer works: pairing continues
+   without a new login, and the log says `Continuing pairing as <you> (no
+   new login needed)` after a restart. Pairing waits up to 30 minutes for
+   this, but a restart more than 15 minutes after approving asks you to
+   approve again. With only one project, it is used without asking. You can
+   also set `project` before starting.
 
    Within a few seconds, the log says `Approved as <you>`,
    `Created service account ...`, `Granted access` and `Saved key`, then
@@ -57,8 +61,12 @@ The approval screen says **datumctl**. That is expected: until the add-on has
 its own Datum login app, it borrows the public one that the `datumctl`
 command line tool uses. Approving lets the add-on act as you only while it
 pairs, usually under a minute, or until you choose a project if it asks you
-to (30 minutes at most), to make what is listed below. It keeps your login in
-memory only, and never stores it.
+to (30 minutes at most), to make what is listed below. It never logs your
+login. While it waits for you to choose a project, it keeps your login in
+`/data/pairing-session.json`, readable by this add-on only and left out of
+backups, so that the restart Home Assistant offers when you save does not
+cost a second approval. That file is good for 15 minutes at most and is
+deleted as soon as pairing ends, whether it worked or not.
 
 Updates appear as an **Update** button on the add-on, like any other add-on.
 
@@ -91,8 +99,9 @@ shows a new code. It doesn't delete the old service account; the log names it
 so you can delete it in the portal. Turn `repair` off again afterwards, or
 every restart pairs again.
 
-**Backups.** The paired key is left out of Home Assistant backups, so a backup
-file never contains it. The trade-off: after restoring a backup, the add-on
+**Backups.** The paired key, and your login while pairing waits for a
+project, are left out of Home Assistant backups, so a backup file never
+contains them. The trade-off: after restoring a backup, the add-on
 has no key and asks you to approve again, which creates a new service account.
 Delete the old one in the portal.
 
@@ -265,7 +274,12 @@ works the same either way.
 
 **Pairing says "isn't one of your projects".** The `project` you saved is not
 an id your login can see. Set it to one of the ids listed, and click Save.
-Pairing is still waiting, so there is no need to restart.
+Pairing is still waiting, so you can restart or not, as Home Assistant
+offers; either way there is no new login.
+
+**The log says "Pairing paused".** The add-on was stopped or restarted while
+pairing waited for a project. It continues when the add-on starts again,
+without a new login, as long as that is within 15 minutes of approving.
 
 **Pairing says "Choosing a project took too long".** Nobody set `project` in
 time. Set it on the Configuration tab, click Save, and restart the add-on.

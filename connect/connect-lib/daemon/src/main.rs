@@ -319,8 +319,21 @@ enum Command {
         /// SUPERVISOR_TOKEN is set, and `none` elsewhere.
         #[clap(long, env = "DATUM_PAIRING_OPTIONS_SOURCE", default_value = "auto")]
         options_source: OptionsSource,
+        /// Keep the approving login in this file (0600) while pairing waits
+        /// for a project, so that a restart in the meantime continues
+        /// without a new approval. Saving the add-on's options offers a
+        /// restart, so the add-on passes /data/pairing-session.json. The
+        /// file is deleted as soon as pairing ends. Omitted, the login is
+        /// kept in memory only.
+        #[clap(long, env = "DATUM_PAIRING_SESSION_FILE")]
+        session_file: Option<std::path::PathBuf>,
     },
 }
+
+/// `pair`'s exit status when the add-on is stopped while pairing waits with
+/// its login saved: not a failure, since the next start carries on.
+/// EX_TEMPFAIL. run.sh checks for it.
+const PAIR_PAUSED_EXIT: i32 = 75;
 
 /// `pair --options-source`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -570,7 +583,7 @@ mod args_tests {
         ])
         .unwrap();
         match args.command {
-            Some(Command::Pair { project, key_out, hold_port: None, options_source: OptionsSource::Auto }) => {
+            Some(Command::Pair { project, key_out, hold_port: None, options_source: OptionsSource::Auto, session_file: None }) => {
                 assert_eq!(project.as_deref(), Some("p-1"));
                 assert_eq!(key_out, std::path::PathBuf::from("/data/k.json"));
             }
@@ -651,11 +664,25 @@ mod args_tests {
         let first = choose_project_line(&projects, None, std::time::Duration::from_secs(1800));
         assert_eq!(
             first,
-            "Your Datum login can see 2 projects. Set 'project' on the add-on's Configuration tab to one of these ids and click Save. No restart needed; pairing continues automatically (waiting up to 30 minutes):\n  p-1 (Home, organization o-1)\n  p-2 (Garage, organization o-2)"
+            "Your Datum login can see 2 projects. Set 'project' on the add-on's Configuration tab to one of these ids and click Save. Home Assistant offers to restart the add-on when you save; either way, pairing continues without a new login (waiting up to 30 minutes):\n  p-1 (Home, organization o-1)\n  p-2 (Garage, organization o-2)"
         );
         let again = choose_project_line(&projects, Some("nope"), std::time::Duration::from_secs(600));
         assert!(again.starts_with("'nope' isn't one of your projects. Your Datum login can see 2 projects."), "{again}");
         assert!(again.contains("(waiting up to 10 minutes)"), "{again}");
+    }
+
+    #[test]
+    fn session_file_parses() {
+        let args = Args::try_parse_from([
+            "datum-connect-daemon", "pair", "--key-out", "k.json", "--session-file", "/data/pairing-session.json",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Pair { session_file: Some(p), .. }) => {
+                assert_eq!(p, std::path::PathBuf::from("/data/pairing-session.json"));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -1340,6 +1367,7 @@ async fn pair(
     key_out: std::path::PathBuf,
     hold_port: Option<u16>,
     options_source: OptionsSource,
+    session_file: Option<std::path::PathBuf>,
 ) -> n0_error::Result<()> {
     use connect_lib::datum_cloud::ha_supervisor::{PairingNotifier, Supervisor};
     use connect_lib::datum_cloud::pairing::{self, PairingConfig, PairingEvent, ProjectWait};
@@ -1354,6 +1382,7 @@ async fn pair(
         .init();
 
     let mut cfg = PairingConfig::from_env(project, key_out);
+    cfg.session_file = session_file;
     // Inside a Home Assistant add-on: the link as a clickable notification,
     // and a project chosen on the Configuration tab without a restart. The
     // log lines below are printed either way, as the fallback.
@@ -1371,6 +1400,10 @@ async fn pair(
             ),
             PairingEvent::CodeExpired => "That code expired before it was approved. Here is a new one.".into(),
             PairingEvent::Approved { email } => format!("Approved as {email}"),
+            PairingEvent::Resumed { email } => format!("Continuing pairing as {email} (no new login needed)"),
+            PairingEvent::SessionDropped { reason } => {
+                format!("Could not continue the earlier pairing: {reason}. Starting a new login.")
+            }
             PairingEvent::ChooseProject { projects, rejected, wait } => {
                 choose_project_line(&projects, rejected.as_deref(), wait)
             }
@@ -1413,9 +1446,13 @@ async fn pair(
         r = pairing::pair(&cfg, &mut say) => Some(r),
         _ = shutdown_signal() => None,
     };
+    // Stopped while waiting for a project, with the login saved: the next
+    // start carries on from here, so this is a pause, not a failure.
+    let paused = outcome.is_none() && cfg.session_file.as_deref().is_some_and(std::path::Path::exists);
     if let Some(n) = notifier {
         match &outcome {
             Some(r) => n.outcome(r),
+            None if paused => n.paused(),
             // Stopped with the add-on: its code is no use any more.
             None => n.dismiss(),
         }
@@ -1426,6 +1463,11 @@ async fn pair(
     }
     let paired = match outcome {
         Some(r) => r.map_err(|e| n0_error::anyerr!("Pairing with Datum failed: {e}"))?,
+        None if paused => {
+            println!("Pairing paused; it continues after the restart without a new login.");
+            let _ = std::io::stdout().flush();
+            std::process::exit(PAIR_PAUSED_EXIT);
+        }
         None => return Err(n0_error::anyerr!("Pairing with Datum stopped before it finished.")),
     };
     println!(
@@ -1505,7 +1547,7 @@ fn choose_project_line(
         line.push_str(&format!("'{r}' isn't one of your projects. "));
     }
     line.push_str(&format!(
-        "Your Datum login can see {} projects. Set 'project' on the add-on's Configuration tab to one of these ids and click Save. No restart needed; pairing continues automatically (waiting up to {}):",
+        "Your Datum login can see {} projects. Set 'project' on the add-on's Configuration tab to one of these ids and click Save. Home Assistant offers to restart the add-on when you save; either way, pairing continues without a new login (waiting up to {}):",
         projects.len(),
         minutes(wait)
     ));
@@ -1530,8 +1572,8 @@ async fn run() -> n0_error::Result<()> {
 
     let args = Args::parse();
 
-    if let Some(Command::Pair { project, key_out, hold_port, options_source }) = args.command {
-        return pair(project, key_out, hold_port, options_source).await;
+    if let Some(Command::Pair { project, key_out, hold_port, options_source, session_file }) = args.command {
+        return pair(project, key_out, hold_port, options_source, session_file).await;
     }
 
     let session = std::env::var("DATUM_SESSION").ok();
