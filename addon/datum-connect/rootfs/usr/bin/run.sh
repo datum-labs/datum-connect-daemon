@@ -388,11 +388,9 @@ done
 
 if [ -n "${HOSTNAME}" ]; then
     if [ "${TUNNEL_CREATED:-false}" = true ]; then
-        # Seen on a real install: a brand-new address gave Firefox a 503
-        # and Chrome "Unable to connect" for 15-20 minutes, while plain
-        # HTTP/1.1 worked after about 8. Only said when the tunnel was just
-        # created: a reused one's address is not new.
-        bashio::log.info "Home Assistant is reachable at https://${HOSTNAME} (a new address can take up to 20 minutes to work everywhere)"
+        # Only said when the tunnel was just created: a reused one's
+        # address is not new.
+        bashio::log.info "Home Assistant is reachable at https://${HOSTNAME} (a new address usually works within a minute)"
     else
         bashio::log.info "Home Assistant is reachable at https://${HOSTNAME}"
     fi
@@ -401,7 +399,7 @@ else
 fi
 
 if [ "${CONNECTOR_REPLACED:-false}" = true ]; then
-    bashio::log.info "Re-using tunnel '${LABEL}' (${TUNNEL_ID}) from an earlier install: its connector was replaced, so https://${HOSTNAME:-<its hostname>} may show 'Service offline' for a few minutes. If it's still offline after 20 minutes, restart the add-on; if that doesn't help, set a new 'tunnel_label'."
+    bashio::log.info "Re-using tunnel '${LABEL}' (${TUNNEL_ID}) from an earlier install: its connector was replaced, so https://${HOSTNAME:-<its hostname>} may show 'Service offline' for a few minutes. If it's still offline after 10 minutes, restart the add-on; if that doesn't help, set a new 'tunnel_label'."
 fi
 
 # Surface the daemon's exit status as the container's.

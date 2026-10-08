@@ -18,10 +18,10 @@
   var csrf = (document.querySelector('meta[name="datum-csrf"]') || {}).content || "";
   var loadedMode = document.body.getAttribute("data-mode");
   var root = document.getElementById("app");
-  // Only for a tunnel created less than half an hour ago (the server says
+  // Only for a tunnel created in the last few minutes (the server says
   // which, as new_address).
   var NEW_ADDRESS_NOTE =
-    "A new address can take 10–20 minutes before it works in every browser.";
+    "A new address usually works within a minute. If it doesn't, give it a few minutes.";
   var PROXY_STEP =
     "Let Home Assistant accept connections through Datum: turns on X-Forwarded-For and adds 127.0.0.1 and ::1 as trusted proxies. Home Assistant will restart.";
   var LAST_STEP =

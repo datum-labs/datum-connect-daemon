@@ -42,10 +42,9 @@ const PROXY_TTL: Duration = Duration::from_secs(30);
 const PROXY_STEP_MARKER: &str = "addon_proxy_step_finished";
 /// Long enough for the page's reply to go out before the restart begins.
 const RESTART_DELAY: Duration = Duration::from_millis(500);
-/// A tunnel younger than this gets the "a new address can take 10-20
-/// minutes" note. Seen on a real install: 15-20 minutes before a new
-/// address worked in every browser.
-const NEW_ADDRESS_WINDOW: Duration = Duration::from_secs(30 * 60);
+/// A tunnel younger than this gets the "a new address usually works within
+/// a minute" note.
+const NEW_ADDRESS_WINDOW: Duration = Duration::from_secs(10 * 60);
 const PORTAL: &str = "https://cloud.datum.net";
 /// How long [`DaemonPaired::confirm_ours`] keeps looking at start. Home
 /// Assistant reverts a trial 5 minutes after it started on it, so there is
@@ -786,17 +785,17 @@ mod tests {
         assert!(!old.serves(3, &ids(&[])), "too old");
     }
 
-    /// The "a new address can take 10-20 minutes" note: only for a tunnel
-    /// whose HTTPProxy is less than half an hour old.
+    /// The "a new address usually works within a minute" note: only for a
+    /// tunnel whose HTTPProxy is less than 10 minutes old.
     #[test]
     fn only_a_young_tunnel_gets_the_new_address_note() {
         // 2026-10-07T12:00:00Z
         let now = std::time::UNIX_EPOCH + Duration::from_secs(1_791_374_400);
         let mut t = summary(true, true, &["abc.datumproxy.net"]);
-        t.created_at = Some("2026-10-07T11:50:00Z".into());
-        assert!(tunnel_view(&t, true, None, "p", now).new_address, "10 minutes old");
-        t.created_at = Some("2026-10-07T11:29:00Z".into());
-        assert!(!tunnel_view(&t, true, None, "p", now).new_address, "31 minutes old");
+        t.created_at = Some("2026-10-07T11:55:00Z".into());
+        assert!(tunnel_view(&t, true, None, "p", now).new_address, "5 minutes old");
+        t.created_at = Some("2026-10-07T11:49:00Z".into());
+        assert!(!tunnel_view(&t, true, None, "p", now).new_address, "11 minutes old");
         t.created_at = Some("2026-09-01T08:00:00Z".into());
         assert!(!tunnel_view(&t, true, None, "p", now).new_address, "a month old");
         t.created_at = None;
