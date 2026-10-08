@@ -475,6 +475,14 @@ minutes`), even though the setting then worked. Retry picks up Allow's own
 change if Home Assistant is running it on trial, rather than calling it
 someone else's.
 
+If the add-on restarts while Home Assistant is running Allow's change on
+trial, the add-on confirms it by itself as soon as it is back (the log says
+`Found Datum's change to Home Assistant's proxy settings still on trial;
+confirming it`), with the same check Allow makes, before Home Assistant's
+revert. A waiting change that differs from Allow's in any setting is never
+touched; the page keeps asking you to finish it in **Settings → System →
+Network**.
+
 **The log says "Re-using tunnel ... from an earlier install: its connector was
 replaced".** The add-on found a tunnel from an earlier install by its label,
 but the key that tunnel's connector was registered under was deleted with

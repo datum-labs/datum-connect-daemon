@@ -76,6 +76,13 @@ pub enum ProxySetup {
     /// Someone has a change waiting for confirmation (in Settings → System
     /// → Network). It is theirs to finish, so it is left alone.
     Pending,
+    /// The change waiting for confirmation is Allow's own: exactly what
+    /// Allow sends (`stable` with only the forwarding settings changed,
+    /// store metadata aside), from an Allow that did not get to confirm it
+    /// (it gave up, or the add-on restarted meanwhile). `on_trial`: Home
+    /// Assistant runs it now, and reverts it unless it is confirmed before
+    /// `revert_at`. Allow carries it on rather than refusing it.
+    Ours { on_trial: bool },
 }
 
 /// Reads `http/config`'s result.
@@ -87,10 +94,14 @@ pub fn assess(http_config: &Value) -> Result<ProxySetup, String> {
     if accepts_forwarded(stable) {
         return Ok(ProxySetup::Ready);
     }
+    let wanted = merged(stable);
     if live_pending(http_config).is_some() {
-        return Ok(ProxySetup::Pending);
+        return Ok(match &wanted {
+            Ok(w) if pending_is(http_config, w) => ProxySetup::Ours { on_trial: on_trial_with(http_config, w) },
+            _ => ProxySetup::Pending,
+        });
     }
-    Ok(ProxySetup::Needed { config: merged(stable)? })
+    Ok(ProxySetup::Needed { config: wanted? })
 }
 
 /// A pending config that has not failed. One that has (`error` set) is
@@ -540,13 +551,13 @@ where
     // for that, knowing whether the restart was seen begin.
     let restarted = match setup {
         ProxySetup::Ready => return AllowOutcome::AlreadyAllowed,
-        ProxySetup::Pending if on_trial_with(&current, &wanted) => {
+        ProxySetup::Ours { on_trial: true } => {
             // Back on trial with our change (Retry after an Allow that gave
             // up waiting): check and confirm it.
             ws.close().await;
             None
         }
-        ProxySetup::Pending if pending_is(&current, &wanted) => {
+        ProxySetup::Ours { on_trial: false } => {
             // Our change, saved but not running yet: Home Assistant may be
             // on its way down. Wait for it as after saving.
             step(AllowStep::Restarting);
@@ -624,6 +635,30 @@ where
         Ok(Err(e)) => Failed(format!("Could not confirm the setting: {e}. {REVERTS}")),
         Err(_) => Failed(format!("Home Assistant did not confirm the setting before its own revert was due. {REVERTS}")),
     }
+}
+
+/// After the add-on (or its daemon) restarted: if Home Assistant runs
+/// Allow's own change on trial ([`ProxySetup::Ours`]), left there by an
+/// Allow that did not get to confirm it, check and confirm it before Home
+/// Assistant reverts it, exactly as Allow does. `None` (and nothing done
+/// beyond reading the settings) for anything else: no change waiting, or
+/// one that differs from Allow's, which is never touched.
+pub async fn confirm_ours_on_trial<V, F>(
+    sup: &Supervisor,
+    timing: &AllowTiming,
+    step: impl FnMut(AllowStep),
+    verify: V,
+) -> Option<AllowOutcome>
+where
+    V: FnOnce() -> F,
+    F: std::future::Future<Output = VerifyResult>,
+{
+    let current = read_http_config(sup, timing.call).await.ok()?;
+    if assess(&current).ok()? != (ProxySetup::Ours { on_trial: true }) {
+        return None;
+    }
+    tracing::info!("Found Datum's change to Home Assistant's proxy settings still on trial; confirming it");
+    Some(allow_forwarded_requests(sup, timing, step, verify).await)
 }
 
 /// Waits for Home Assistant to be back on trial with `wanted`, and returns
@@ -830,6 +865,19 @@ mod tests {
         // Someone's change waits for confirmation: hands off.
         c["pending"] = json!({"server_port": 8124, "error": null});
         assert_eq!(assess(&c).unwrap(), ProxySetup::Pending);
+        // Allow's own change, saved, then on trial: ours, store fields aside.
+        let mut ours = merged(&stable()).unwrap();
+        ours["created_at"] = json!("2026-10-08T13:31:05+00:00");
+        ours["error"] = Value::Null;
+        c["pending"] = ours.clone();
+        assert_eq!(assess(&c).unwrap(), ProxySetup::Ours { on_trial: false });
+        c["active_config_type"] = json!("pending");
+        assert_eq!(assess(&c).unwrap(), ProxySetup::Ours { on_trial: true });
+        // Any other difference makes it someone else's.
+        ours["server_port"] = json!(8124);
+        c["pending"] = ours;
+        assert_eq!(assess(&c).unwrap(), ProxySetup::Pending);
+        c["active_config_type"] = json!("stable");
         // A pending config that failed is dead; stable is the base.
         c["pending"] = json!({"server_port": 8124, "error": "not_promoted"});
         assert!(matches!(assess(&c).unwrap(), ProxySetup::Needed { .. }));
@@ -1258,6 +1306,64 @@ mod tests {
         restart.await.unwrap();
         assert_eq!(outcome, AllowOutcome::Allowed);
         assert!(fake.lock().unwrap().configured.is_empty());
+    }
+
+    /// After a restart of the add-on: Allow's own change, on trial, is
+    /// confirmed; anything else is left exactly as it is.
+    #[tokio::test]
+    async fn a_restart_confirms_our_change_on_trial_and_nothing_else() {
+        let mut ha = FakeHa::new();
+        ha.pending = Some(FakeHa::stored(merged(&stable()).unwrap()));
+        ha.active = "pending";
+        ha.revert_due = Some(std::time::Instant::now() + Duration::from_secs(120));
+        let (sup, fake) = serve(ha).await;
+        let outcome = confirm_ours_on_trial(&sup, &scaled(), |_| {}, || async { Ok(200) }).await;
+        assert_eq!(outcome, Some(AllowOutcome::Allowed));
+        {
+            let f = fake.lock().unwrap();
+            assert!(f.configured.is_empty());
+            assert_eq!(f.promoted_in_time, Some(true));
+            assert!(accepts_forwarded(&f.stable) && f.pending.is_none());
+        }
+
+        // Our change, but the check fails: not confirmed (Home Assistant
+        // reverts it by itself).
+        let mut ha = FakeHa::new();
+        ha.pending = Some(FakeHa::stored(merged(&stable()).unwrap()));
+        ha.active = "pending";
+        ha.revert_due = Some(std::time::Instant::now() + Duration::from_secs(120));
+        let (sup, fake) = serve(ha).await;
+        let outcome = confirm_ours_on_trial(&sup, &scaled(), |_| {}, || async { Ok(400) }).await;
+        assert!(matches!(outcome, Some(AllowOutcome::Failed(_))), "{outcome:?}");
+        assert!(!fake.lock().unwrap().commands.iter().any(|c| c == "http/config/promote"));
+
+        // Someone else's change on trial (ours plus a different port): untouched.
+        let mut theirs = merged(&stable()).unwrap();
+        theirs["server_port"] = json!(8124);
+        let mut ha = FakeHa::new();
+        ha.pending = Some(FakeHa::stored(theirs.clone()));
+        ha.active = "pending";
+        let (sup, fake) = serve(ha).await;
+        let outcome = confirm_ours_on_trial(&sup, &scaled(), |_| {}, || async { Ok(200) }).await;
+        assert_eq!(outcome, None);
+        {
+            let f = fake.lock().unwrap();
+            assert_eq!(f.commands, ["http/config"]);
+            assert_eq!(f.pending, Some(FakeHa::stored(theirs)));
+            assert!(!accepts_forwarded(&f.stable));
+        }
+
+        // Nothing waiting, or ours saved but not running: nothing done.
+        for (pending, active) in [(None, "stable"), (Some(FakeHa::stored(merged(&stable()).unwrap())), "stable")] {
+            let mut ha = FakeHa::new();
+            ha.pending = pending;
+            ha.active = active;
+            let (sup, fake) = serve(ha).await;
+            assert_eq!(confirm_ours_on_trial(&sup, &scaled(), |_| {}, || async { Ok(200) }).await, None);
+            let f = fake.lock().unwrap();
+            assert_eq!(f.commands, ["http/config"]);
+            assert!(f.configured.is_empty());
+        }
     }
 
     /// Too little time left before Home Assistant's revert to check and
