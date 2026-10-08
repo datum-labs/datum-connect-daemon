@@ -171,16 +171,20 @@ impl Backend {
 }
 
 /// Home Assistant's own tabs for this add-on (Info, Documentation,
-/// Configuration, Log), which it does not show around an ingress page.
-/// Paths on Home Assistant's origin, as its frontend routes them
-/// (`src/panels/config/apps/ha-config-app-dashboard.ts`); the page links
-/// to them with `target="_top"` to leave its frame.
+/// Configuration, Log), which it does not show around an ingress page, and
+/// the add-on's page itself. Paths on Home Assistant's origin, as its
+/// frontend routes them (`src/panels/config/apps/ha-config-app-dashboard.ts`,
+/// `src/panels/app/ha-panel-app.ts`). The page asks Home Assistant's panel
+/// to go there in-app (its `home-assistant/navigate` message), so that its
+/// frontend is not reloaded; see `daemon/ingress/app.js`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct HaLinks {
     pub info: String,
     pub documentation: String,
     pub config: String,
     pub logs: String,
+    /// This page, opened afresh: `/app/<slug>`.
+    pub app: String,
 }
 
 impl HaLinks {
@@ -190,7 +194,13 @@ impl HaLinks {
     pub(crate) fn for_slug(slug: &str) -> Option<Self> {
         let slug = connect_lib::datum_cloud::ha_supervisor::valid_slug(slug)?;
         let tab = |t: &str| format!("/config/app/{slug}/{t}");
-        Some(Self { info: tab("info"), documentation: tab("documentation"), config: tab("config"), logs: tab("logs") })
+        Some(Self {
+            info: tab("info"),
+            documentation: tab("documentation"),
+            config: tab("config"),
+            logs: tab("logs"),
+            app: connect_lib::datum_cloud::ha_supervisor::panel_path(slug)?,
+        })
     }
 }
 
@@ -982,6 +992,7 @@ mod tests {
                     "documentation": "/config/app/61221542_datum_connect/documentation",
                     "config": "/config/app/61221542_datum_connect/config",
                     "logs": "/config/app/61221542_datum_connect/logs",
+                    "app": "/app/61221542_datum_connect",
                 }),
                 "{mode}"
             );

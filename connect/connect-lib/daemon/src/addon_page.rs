@@ -47,6 +47,10 @@ const RESTART_DELAY: Duration = Duration::from_millis(500);
 /// address worked in every browser.
 const NEW_ADDRESS_WINDOW: Duration = Duration::from_secs(30 * 60);
 const PORTAL: &str = "https://cloud.datum.net";
+/// How long [`DaemonPaired::confirm_ours`] keeps looking at start. Home
+/// Assistant reverts a trial 5 minutes after it started on it, so there is
+/// no point after that.
+const LEFTOVER_TRIAL_WATCH: Duration = Duration::from_secs(5 * 60);
 
 /// The client address the verify step's request claims to forward for: a
 /// documentation address (RFC 5737), never a real one.
@@ -72,6 +76,29 @@ struct ProxyJob {
     /// Bumped whenever the above changes, so a cached page status is not
     /// served past it.
     version: u64,
+    /// Allow's own change, found on trial, was taken up automatically
+    /// already (see [`DaemonPaired::confirm_ours`]); once per daemon run, so
+    /// a check that failed is not repeated until the revert.
+    auto_tried: bool,
+}
+
+/// The page's status as last built, and what it was built from.
+struct CachedStatus {
+    at: Instant,
+    /// [`ProxyJob::version`] then.
+    version: u64,
+    /// The tunnels this daemon was running then (sorted ids).
+    running: Vec<String>,
+    status: PairedStatus,
+}
+
+impl CachedStatus {
+    /// Still good to serve: young, and neither Allow's state nor the set of
+    /// running tunnels has changed since. A tunnel this daemon starts or
+    /// stops shows on the next poll, not up to [`STATUS_TTL`] later.
+    fn serves(&self, version: u64, running: &[String]) -> bool {
+        self.at.elapsed() < STATUS_TTL && self.version == version && self.running == running
+    }
 }
 
 pub(crate) struct DaemonPaired {
@@ -81,7 +108,7 @@ pub(crate) struct DaemonPaired {
     /// Where pairing saves its key. Only a key there may be forgotten.
     paired_key_file: Option<PathBuf>,
     supervisor: Option<Supervisor>,
-    cache: tokio::sync::Mutex<Option<(Instant, u64, PairedStatus)>>,
+    cache: tokio::sync::Mutex<Option<CachedStatus>>,
     edge: tokio::sync::Mutex<HashMap<String, (Instant, EdgePolicyStatus)>>,
     proxy_job: Arc<StdMutex<ProxyJob>>,
 }
@@ -147,7 +174,14 @@ impl DaemonPaired {
         }
     }
 
-    async fn fresh_status(&self) -> PairedStatus {
+    /// The tunnels this daemon runs right now, sorted.
+    async fn running_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.app.running.lock().await.keys().cloned().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    async fn fresh_status(&self, running: &[String]) -> PairedStatus {
         let key = self.key();
         let mut status = PairedStatus {
             project: self.app.project_id.clone(),
@@ -159,19 +193,19 @@ impl DaemonPaired {
         };
         match self.app.control.list_active().await {
             Ok(tunnels) => {
-                let running: Vec<String> = self.app.running.lock().await.keys().cloned().collect();
+                let running = |id: &str| running.iter().any(|r| r == id);
                 let now = SystemTime::now();
                 let (mine, older) = self.split(tunnels);
                 for t in mine {
                     let edge = self.edge_status(&t.id).await;
                     status
                         .tunnels
-                        .push(tunnel_view(&t, running.contains(&t.id), edge, &self.app.project_id, now));
+                        .push(tunnel_view(&t, running(&t.id), edge, &self.app.project_id, now));
                 }
                 for t in older {
                     // Stopped and on their way out: their policies are not
                     // worth a call each.
-                    status.older.push(tunnel_view(&t, running.contains(&t.id), None, &self.app.project_id, now));
+                    status.older.push(tunnel_view(&t, running(&t.id), None, &self.app.project_id, now));
                 }
             }
             Err(e) => status.error = Some(format!("Could not ask Datum about the tunnel: {e}")),
@@ -216,7 +250,39 @@ impl DaemonPaired {
                 setup
             }
         };
+        if auto_confirm_due(setup.as_ref(), &self.proxy_job) && self.allow_inner(true).await.is_ok() {
+            let step = self.proxy_job.lock().unwrap_or_else(|e| e.into_inner()).running.unwrap_or(AllowStep::Verifying);
+            return Some(ProxyStepView { state: "working", message: Some(step.describe().into()), setup: !finished });
+        }
         Some(settled_view(&self.marker(), &self.proxy_job, setup.as_ref(), last.as_ref()))
+    }
+
+    /// At daemon start: if Home Assistant runs Allow's own change on trial
+    /// (the add-on restarted before that Allow could confirm it), confirm
+    /// it before Home Assistant reverts it, whether or not anyone has the
+    /// page open. Keeps asking for a few minutes while the tunnel (whose
+    /// local hop the check goes through) is still being started or Home
+    /// Assistant is not answering; stops at the first clear answer.
+    pub(crate) async fn confirm_ours(&self) {
+        let Some(sup) = self.supervisor.clone() else { return };
+        let deadline = Instant::now() + LEFTOVER_TRIAL_WATCH;
+        while Instant::now() < deadline {
+            match ha_core::read_http_config(&sup, Duration::from_secs(10)).await.map(|c| ha_core::assess(&c)) {
+                Ok(Ok(setup)) => {
+                    if !auto_confirm_due(Some(&setup), &self.proxy_job) {
+                        return;
+                    }
+                    match self.allow_inner(true).await {
+                        Ok(()) => return,
+                        // The tunnel isn't running yet, or Allow already runs.
+                        Err(e) => tracing::debug!("not confirming Datum's change on trial yet: {}", e.message),
+                    }
+                }
+                Ok(Err(e)) => tracing::debug!("could not read Home Assistant's HTTP settings: {e}"),
+                Err(e) => tracing::debug!("could not ask Home Assistant about its HTTP settings: {e}"),
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
     }
 
     /// Where the add-on's tunnel's local hop forwards to: Home Assistant,
@@ -241,7 +307,10 @@ impl DaemonPaired {
         })
     }
 
-    async fn allow_inner(&self) -> Result<(), ActionError> {
+    /// Allow, from the page (`auto` false), or to confirm Allow's own change
+    /// found still on trial (`auto` true: nothing is saved, and if the
+    /// change is no longer there, or no longer ours, nothing is done).
+    async fn allow_inner(&self, auto: bool) -> Result<(), ActionError> {
         let Some(sup) = self.supervisor.clone() else {
             return Err(ActionError {
                 status: StatusCode::CONFLICT,
@@ -254,26 +323,41 @@ impl DaemonPaired {
             if job.running.is_some() {
                 return Err(ActionError { status: StatusCode::CONFLICT, message: "Already in progress.".into() });
             }
-            job.running = Some(AllowStep::Saving);
-            job.last = None;
+            job.running = Some(if auto { AllowStep::Verifying } else { AllowStep::Saving });
+            if auto {
+                job.auto_tried = true;
+            } else {
+                job.last = None;
+            }
             job.version += 1;
         }
-        tracing::info!("Letting Home Assistant accept connections through Datum (from the Datum Connect page); Home Assistant restarts");
+        if !auto {
+            tracing::info!("Letting Home Assistant accept connections through Datum (from the Datum Connect page); Home Assistant restarts");
+        }
         let job = self.proxy_job.clone();
         let marker = self.marker();
         tokio::spawn(async move {
             let progress = job.clone();
-            let outcome = ha_core::allow_forwarded_requests(
-                &sup,
-                &AllowTiming::default(),
-                move |step| {
-                    let mut j = progress.lock().unwrap_or_else(|e| e.into_inner());
-                    j.running = Some(step);
-                    j.version += 1;
-                },
-                move || verify_forwarded(target),
-            )
-            .await;
+            let step = move |step| {
+                let mut j = progress.lock().unwrap_or_else(|e| e.into_inner());
+                j.running = Some(step);
+                j.version += 1;
+            };
+            let verify = move || verify_forwarded(target);
+            let timing = AllowTiming::default();
+            let outcome = if auto {
+                ha_core::confirm_ours_on_trial(&sup, &timing, step, verify).await
+            } else {
+                Some(ha_core::allow_forwarded_requests(&sup, &timing, step, verify).await)
+            };
+            let Some(outcome) = outcome else {
+                // Gone, or not ours after all: nothing was done.
+                let mut j = job.lock().unwrap_or_else(|e| e.into_inner());
+                j.running = None;
+                j.cached = None;
+                j.version += 1;
+                return;
+            };
             let (ok, message) = outcome_message(&outcome);
             if ok {
                 tracing::info!("{message}");
@@ -407,15 +491,15 @@ impl PairedView for DaemonPaired {
         Box::pin(async move {
             let mut cache = self.cache.lock().await;
             let version = self.job_version();
-            if let Some((at, v, s)) = cache.as_ref()
-                && at.elapsed() < STATUS_TTL
-                && *v == version
+            let running = self.running_ids().await;
+            if let Some(c) = cache.as_ref()
+                && c.serves(version, &running)
             {
-                return s.clone();
+                return c.status.clone();
             }
-            let s = self.fresh_status().await;
-            *cache = Some((Instant::now(), self.job_version(), s.clone()));
-            s
+            let status = self.fresh_status(&running).await;
+            *cache = Some(CachedStatus { at: Instant::now(), version: self.job_version(), running, status: status.clone() });
+            status
         })
     }
 
@@ -437,7 +521,7 @@ impl PairedView for DaemonPaired {
 
     fn allow_proxies(&self) -> BoxFuture<'_, Result<(), ActionError>> {
         Box::pin(async move {
-            let result = self.allow_inner().await;
+            let result = self.allow_inner(false).await;
             *self.cache.lock().await = None;
             result
         })
@@ -450,6 +534,13 @@ impl PairedView for DaemonPaired {
             result
         })
     }
+}
+
+/// Whether to take up Allow's own change found on trial: only that, only
+/// while no Allow runs, and once per daemon run.
+fn auto_confirm_due(setup: Option<&ProxySetup>, job: &StdMutex<ProxyJob>) -> bool {
+    let j = job.lock().unwrap_or_else(|e| e.into_inner());
+    setup == Some(&ProxySetup::Ours { on_trial: true }) && j.running.is_none() && !j.auto_tried
 }
 
 /// Whether setup's last step is finished, read from disk the first time.
@@ -531,6 +622,9 @@ fn proxy_step_view(setup: Option<&ProxySetup>, last: Option<&(bool, String)>, fi
         // while it reverts (its pending trial is ours, not someone else's).
         (_, Some((false, why))) => view("failed", Some(why)),
         (Some(ProxySetup::Pending), _) => view("pending", Some(PENDING_MESSAGE)),
+        // Allow's own change, waiting (not taken up automatically, or not
+        // on trial yet): Allow carries it on.
+        (Some(ProxySetup::Ours { .. }), _) => view("needed", None),
         (Some(ProxySetup::Needed { .. }), _) => view("needed", None),
         (None, _) => view("unknown", Some("Could not ask Home Assistant about its network settings.")),
     }
@@ -591,7 +685,19 @@ fn key_facts(key_file: Option<&Path>, paired_key_file: Option<&Path>, has_superv
     KeyFacts { email, source: if paired { "paired" } else { "provided" }, why_not }
 }
 
-/// One tunnel, as the page shows it.
+/// One tunnel, as the page shows it. `running`: this daemon serves it now,
+/// which is what its badge says first.
+///
+/// Datum's `enabled` is only whether the tunnel's ConnectorAdvertisement
+/// exists. The edge routes by the HTTPProxy's connector, not by that
+/// advertisement, so a tunnel this daemon runs serves traffic whether or
+/// not it is there. Seen on a Home Assistant Green (0.3.5) after a
+/// reinstall adopted the old tunnel: the daemon ran it and its address
+/// answered, while the page said "Off" from `enabled`. So a running tunnel
+/// is never "Off": it is "Online" once its connector is ready and its
+/// proxy programmed, "Starting" before. `enabled` only tells apart, for a
+/// tunnel this daemon does not run, one turned off from one that should
+/// be on.
 fn tunnel_view(
     t: &connect_lib::TunnelSummary,
     running: bool,
@@ -599,14 +705,12 @@ fn tunnel_view(
     project: &str,
     now: SystemTime,
 ) -> TunnelView {
-    let state = if !t.enabled {
-        "off"
-    } else if t.connector_ready && t.programmed {
-        "online"
-    } else if running {
-        "starting"
-    } else {
-        "offline"
+    let state = match (running, t.enabled, t.connector_ready && t.programmed) {
+        (true, _, true) => "online",
+        (true, _, false) => "starting",
+        (false, false, _) => "off",
+        (false, true, true) => "online",
+        (false, true, false) => "offline",
     };
     TunnelView {
         id: t.id.clone(),
@@ -652,6 +756,34 @@ mod tests {
         assert_eq!(tunnel_view(&summary(true, false, &[]), false, None, "p", now).state, "offline");
         assert_eq!(tunnel_view(&summary(false, true, &[]), false, None, "p", now).state, "off");
         assert_eq!(tunnel_view(&summary(true, true, &[]), true, None, "p", now).address, None);
+    }
+
+    /// The badge follows what this daemon runs, not Datum's `enabled`
+    /// (whether the ConnectorAdvertisement exists), which read false for a
+    /// tunnel the daemon was serving on a real device: "Off" while online.
+    #[test]
+    fn a_running_tunnel_is_never_off() {
+        let now = SystemTime::now();
+        let not_enabled_but_serving = summary(false, true, &["abc.datumproxy.net"]);
+        assert_eq!(tunnel_view(&not_enabled_but_serving, true, None, "p", now).state, "online");
+        assert_eq!(tunnel_view(&summary(false, false, &[]), true, None, "p", now).state, "starting");
+        // Not running here: Datum's view.
+        assert_eq!(tunnel_view(&not_enabled_but_serving, false, None, "p", now).state, "off");
+        assert_eq!(tunnel_view(&summary(true, true, &[]), false, None, "p", now).state, "online");
+        assert_eq!(tunnel_view(&summary(true, false, &[]), false, None, "p", now).state, "offline");
+    }
+
+    /// The page's status is rebuilt as soon as this daemon starts or stops
+    /// a tunnel, or Allow moves on, not only every few seconds.
+    #[test]
+    fn the_status_is_rebuilt_when_what_runs_changes() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let c = CachedStatus { at: Instant::now(), version: 3, running: ids(&[]), status: PairedStatus::default() };
+        assert!(c.serves(3, &ids(&[])));
+        assert!(!c.serves(3, &ids(&["tunnel-mkbpd"])), "a tunnel started since");
+        assert!(!c.serves(4, &ids(&[])), "Allow moved on");
+        let old = CachedStatus { at: Instant::now() - STATUS_TTL, ..c };
+        assert!(!old.serves(3, &ids(&[])), "too old");
     }
 
     /// The "a new address can take 10-20 minutes" note: only for a tunnel
@@ -701,6 +833,12 @@ mod tests {
             assert_eq!(proxy_step_view(Some(&ProxySetup::Ready), Some(&failed), finished).state, "ok");
             // The setup step until finished; a row after.
             assert_eq!(proxy_step_view(Some(&needed), None, finished).setup, !finished);
+        }
+        // Allow's own change waiting is never someone else's: Allow is offered.
+        for on_trial in [false, true] {
+            let ours = ProxySetup::Ours { on_trial };
+            assert_eq!(proxy_step_view(Some(&ours), None, false).state, "needed");
+            assert_eq!(proxy_step_view(Some(&ours), None, true).state, "needed");
         }
         // Right after an Allow that worked, still the step, for its ✓ Done.
         let allowed = (true, ALLOWED_MESSAGE.to_string());
@@ -784,6 +922,29 @@ mod tests {
         for d in ["ready", "allow", "skip", "unknown"] {
             let _ = std::fs::remove_dir_all(step_dir(d));
         }
+    }
+
+    /// After a restart, Allow's own change on trial is taken up by itself,
+    /// once, and only while no Allow runs; any other state never is.
+    #[test]
+    fn only_our_change_on_trial_is_confirmed_by_itself() {
+        let job = StdMutex::new(ProxyJob::default());
+        let ours = ProxySetup::Ours { on_trial: true };
+        assert!(auto_confirm_due(Some(&ours), &job));
+        for other in [
+            ProxySetup::Pending,
+            ProxySetup::Ours { on_trial: false },
+            ProxySetup::Ready,
+            ProxySetup::Needed { config: serde_json::json!({}) },
+        ] {
+            assert!(!auto_confirm_due(Some(&other), &job), "{other:?}");
+        }
+        assert!(!auto_confirm_due(None, &job));
+        job.lock().unwrap().running = Some(AllowStep::Restarting);
+        assert!(!auto_confirm_due(Some(&ours), &job), "an Allow runs");
+        job.lock().unwrap().running = None;
+        job.lock().unwrap().auto_tried = true;
+        assert!(!auto_confirm_due(Some(&ours), &job), "once per run");
     }
 
     #[test]

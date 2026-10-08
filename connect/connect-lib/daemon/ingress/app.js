@@ -27,9 +27,9 @@
   var LAST_STEP =
     "Last step: let Home Assistant accept connections through Datum. This turns on “Trust X-Forwarded-For” and adds 127.0.0.1 and ::1 as trusted proxies, so Home Assistant still sees each visitor's real address. Home Assistant will restart.";
   var REVERTS_NOTE =
-    "If Home Assistant took the new setting, it goes back to the previous one by itself within 5 minutes; nothing else was changed.";
+    "If Home Assistant took the new setting, it goes back to the previous one by itself 5 minutes after restarting with it; nothing else was changed.";
   var RESTART_NOTE =
-    "Home Assistant restarts, so this page may go blank or say Home Assistant is restarting for a minute or two. It comes back by itself, and the add-on carries on meanwhile.";
+    "Home Assistant restarts, so this page may go blank or say Home Assistant is restarting for several minutes (on a Home Assistant Green, up to about 10). It comes back by itself, and the add-on carries on meanwhile: it waits up to 15 minutes for Home Assistant, then checks and confirms the setting.";
 
   // What the person picked in the project list, kept across re-renders.
   var picked = null;
@@ -77,7 +77,7 @@
   // The title, and links back to the add-on's own tabs, which Home
   // Assistant does not show around this page. The server sends them (as
   // `ha`) only for a valid add-on slug. They are absolute paths on Home
-  // Assistant's origin, opened in the top window to leave this frame.
+  // Assistant's origin; see haLink for how they are followed.
   function header() {
     var title = el("h1", { text: "Datum Connect" });
     var ha = last && last.ha;
@@ -85,8 +85,84 @@
     var tabs = [["Info", ha.info], ["Documentation", ha.documentation], ["Configuration", ha.config], ["Log", ha.logs]];
     return el("header", { class: "top" }, title,
       el.apply(null, ["nav", { class: "ha-tabs", "aria-label": "Add-on" }].concat(tabs.map(function (t) {
-        return el("a", { href: t[1], target: "_top", text: t[0] });
+        return el("a", { href: t[1], target: "_top", text: t[0], onclick: haLink });
       }))));
+  }
+
+  // ---- Moving around Home Assistant without reloading it ----
+  //
+  // This page runs in Home Assistant's app panel (home-assistant/frontend,
+  // src/panels/app/ha-panel-app.ts), in an iframe on Home Assistant's own
+  // origin. Following a link in the top window loads Home Assistant's
+  // frontend afresh, and someone who signed in without "Keep me logged in"
+  // keeps their tokens only in memory, so that reload sends them to the
+  // login page (seen on a real install with 0.3.5's links).
+  //
+  // Instead the page asks the panel to move within the app. The panel
+  // listens for messages from its iframe:
+  //   window.parent.postMessage(
+  //     {type: "home-assistant/navigate", path: "/config/...", options: {replace: false}},
+  //     <Home Assistant's origin>)
+  // and calls the frontend's own navigate(path, options) (options:
+  // {replace?: boolean, data?}). It checks only that event.source is its
+  // iframe's window, not the origin; the message is still addressed to
+  // Home Assistant's origin, which is this page's (location.origin), so it
+  // goes nowhere else.
+  //
+  // Each link keeps its href and target="_top", so a middle click, a
+  // modified click (new tab or window) or "Open in new tab" work as links
+  // do, and so does a plain click outside a frame (the page opened on its
+  // own). If nothing acts on the message (an older or different parent),
+  // this frame is still here, and the parent where it was, a moment later;
+  // the link is then followed the plain way after all.
+  var NAV_FALLBACK_MS = 1500;
+
+  function inFrame() {
+    try {
+      return window.parent !== window;
+    } catch (e) {
+      return true;
+    }
+  }
+
+  // The parent's path, if it can be read (it can on Home Assistant's own
+  // origin); null if not.
+  function parentPath() {
+    try {
+      return window.parent.location.pathname;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Asks Home Assistant's panel to go to `path` in-app. False if this page
+  // is not in a frame, or the message could not be sent.
+  function haNavigate(path, replace) {
+    if (!inFrame()) return false;
+    try {
+      window.parent.postMessage(
+        { type: "home-assistant/navigate", path: path, options: { replace: !!replace } },
+        location.origin);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function haLink(e) {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    var path = e.currentTarget.getAttribute("href");
+    var before = parentPath();
+    if (!haNavigate(path, false)) return;
+    e.preventDefault();
+    setTimeout(function () {
+      if (parentPath() !== before) return;
+      try {
+        window.top.location.href = path;
+      } catch (err) {
+        // Nothing more to try.
+      }
+    }, NAV_FALLBACK_MS);
   }
 
   function card() {
@@ -98,13 +174,110 @@
     timer = setTimeout(poll, ms);
   }
 
-  function poll() {
-    fetch("api/state", { cache: "no-store", credentials: "same-origin" })
+  // ---- When the page loses its server ----
+  //
+  // Every request goes through Home Assistant: Core's ingress view, then
+  // the Supervisor, which checks the browser's ingress session cookie (it
+  // answers 401 for one it does not know, supervisor/api/ingress.py). While
+  // Home Assistant restarts (Allow), requests fail outright, or can hang
+  // on a connection that never answers; on a Home Assistant Green that
+  // lasted several minutes, and 0.3.5's page stayed on "Home Assistant is
+  // restarting…" until it was reloaded by hand.
+  //
+  // How the page gets out:
+  // - Every poll gives up after POLL_TIMEOUT_MS, so one hung request never
+  //   stops the polling.
+  // - Polling carries on. Home Assistant's app panel re-validates the
+  //   ingress session every minute and, if the Supervisor no longer knows
+  //   it, creates a new one and sets the cookie (frontend ha-panel-app.ts:
+  //   validateHassioSession, else createHassioSession), which the next poll
+  //   then carries.
+  // - If Home Assistant is back but refuses the page (401, 403 or 404) and
+  //   polls have failed for REOPEN_AFTER_MS, the page asks the panel to
+  //   open it afresh in-app at /app/<slug> (the
+  //   navigate message, see haNavigate), which creates a new session and a
+  //   new frame. Home Assistant only does that when the add-on in the path
+  //   changes, so it is sent only when Home Assistant shows the page under
+  //   another path (the sidebar's /<slug>); at /app/<slug> it would do
+  //   nothing, and the panel's own session renewal above is what helps.
+  //   Requests that fail without an answer (Home Assistant down) or with
+  //   502 (the add-on away) are left to the polling: a new frame cannot
+  //   load either until Home Assistant or the add-on is back.
+  // - After RELOAD_AFTER_MS of failures, a Reload button, as a last
+  //   resort: it reloads this frame only (never the top window, which can
+  //   sign the person out, see haLink).
+  // The daemon keeps Allow's state, so whichever way the page comes back,
+  // it shows where Allow is or how it ended.
+  var POLL_TIMEOUT_MS = 15000;
+  var REOPEN_AFTER_MS = 20000;
+  var RELOAD_AFTER_MS = 30000;
+  // Since when polls have failed (null: the last one worked), whether Home
+  // Assistant refused the page meanwhile, and whether the panel was
+  // already asked to reopen it.
+  var failingSince = null;
+  var refused = false;
+  var reopenAsked = false;
+
+  function getState() {
+    var ctl = typeof AbortController === "function" ? new AbortController() : null;
+    var timeout = ctl ? setTimeout(function () { ctl.abort(); }, POLL_TIMEOUT_MS) : null;
+    return fetch("api/state", { cache: "no-store", credentials: "same-origin", signal: ctl ? ctl.signal : undefined })
       .then(function (r) {
-        if (!r.ok) throw new Error("HTTP " + r.status);
+        if (!r.ok) {
+          var e = new Error("HTTP " + r.status);
+          e.status = r.status;
+          throw e;
+        }
         return r.json();
       })
+      .finally(function () {
+        if (timeout) clearTimeout(timeout);
+      });
+  }
+
+  // `startedAt`: when the failed poll was sent; a hung one counts from
+  // then, not from when it gave up.
+  function pollFailed(e, startedAt) {
+    var status = (e && e.status) || 0;
+    if (failingSince === null) failingSince = startedAt;
+    if (status === 401 || status === 403 || status === 404) refused = true;
+    var failing = Date.now() - failingSince;
+    if (!reopenAsked && failing >= REOPEN_AFTER_MS && refused) {
+      reopenAsked = true;
+      reopen();
+    }
+  }
+
+  function pollWorked() {
+    failingSince = null;
+    refused = false;
+    reopenAsked = false;
+  }
+
+  // Asks Home Assistant's panel to open this page afresh, if that would do
+  // anything (see above). True if asked.
+  function reopen() {
+    var app = last && last.ha && last.ha.app;
+    var here = parentPath();
+    if (!app || here === null || here === app) return false;
+    return haNavigate(app, true);
+  }
+
+  function failingLong() {
+    return failingSince !== null && Date.now() - failingSince >= RELOAD_AFTER_MS;
+  }
+
+  function reloadCard() {
+    return card(
+      el("p", { class: "muted small", text: "Still no answer. Once Home Assistant is back, reload this page; Datum Connect carries on meanwhile, and shows where it is when the page is back." }),
+      el("button", { class: "secondary", onclick: function () { location.reload(); } }, "Reload"));
+  }
+
+  function poll() {
+    var startedAt = Date.now();
+    getState()
       .then(function (state) {
+        pollWorked();
         if (state.mode !== loadedMode) {
           location.reload();
           return;
@@ -118,7 +291,8 @@
           state.paired.trusted_proxies.state === "working";
         schedule(state.mode === "paired" ? (working ? 3000 : 10000) : 1000);
       })
-      .catch(function () {
+      .catch(function (e) {
+        pollFailed(e, startedAt);
         renderAway();
         schedule(2000);
       });
@@ -229,7 +403,11 @@
           s.code_renewed ? el("p", { class: "warn", text: "The last code expired before it was approved. Here is a new one." }) : null,
           el("p", null, "1. Open the Datum approval page and sign in:"),
           el("p", null, el("a", { class: "button", href: s.code.url, target: "_blank", rel: "noopener noreferrer" }, "Open the approval page")),
-          el("p", null, "2. Check that it shows this code, then approve:"),
+          // The IdP's own link usually carries the code; when it doesn't,
+          // the approval page asks for it.
+          el("p", null, s.code.prefilled === false
+            ? "2. Enter this code there, then approve:"
+            : "2. Check that it shows this code, then approve:"),
           el("div", { class: "code", text: s.code.user_code }),
           el("div", { class: "code-row" },
             el("span", { id: "countdown", class: "countdown", role: "timer", text: countdownText() }),
@@ -564,16 +742,17 @@
     rendered = null;
     if (actionResult) return;
     var proxies = last && last.mode === "paired" && last.paired && last.paired.trusted_proxies;
+    var reload = failingLong() ? reloadCard() : null;
     if (last && last.mode === "setup" && last.setup.phase === "done") {
       show(card(
         el("h2", { text: "Starting the tunnel…" }),
-        el("p", { class: "muted", text: "This page updates by itself." })));
+        el("p", { class: "muted", text: "This page updates by itself." })), reload);
     } else if (proxies && proxies.state === "working") {
       show(card(
         el("h2", { text: "Home Assistant is restarting with the new setting…" }),
-        el("p", { class: "muted", text: "This page comes back by itself." })));
+        el("p", { class: "muted", text: "This can take several minutes (on a Home Assistant Green, up to about 10). This page comes back by itself." })), reload);
     } else {
-      show(card(el("p", { class: "muted", text: "Waiting for the add-on… If this lasts, check that it is running, and its Log tab." })));
+      show(card(el("p", { class: "muted", text: "Waiting for the add-on… If this lasts, check that it is running, and its Log tab." })), reload);
     }
   }
 

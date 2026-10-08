@@ -233,10 +233,13 @@ fn default_client_id(issuer: &str) -> &'static str {
 /// Progress, for the caller to show. Plain data; never carries a secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairingEvent {
-    /// Show this to the person.
+    /// Show this to the person: open `url` and approve `user_code`. The
+    /// code is always shown as well, so it can be checked against the
+    /// approval page (`prefilled`: `url` carries it) or typed there (not).
     Code {
         url: String,
         user_code: String,
+        prefilled: bool,
         expires_in: Duration,
     },
     /// The last code expired unapproved; a [`PairingEvent::Code`] follows.
@@ -538,6 +541,12 @@ struct Login {
 struct DeviceAuthorization {
     device_code: String,
     user_code: String,
+    /// Where to approve a code (RFC 8628 §3.2), the code typed by hand.
+    #[serde(default)]
+    verification_uri: Option<String>,
+    /// The same page with the code filled in (RFC 8628 §3.3.1).
+    #[serde(default)]
+    verification_uri_complete: Option<String>,
     #[serde(default)]
     interval: u64,
     #[serde(default)]
@@ -588,11 +597,8 @@ async fn device_login(
         }
         let auth = start_device_authorization(cfg, http).await?;
         let expires_in = Duration::from_secs(if auth.expires_in == 0 { 300 } else { auth.expires_in });
-        on_event(PairingEvent::Code {
-            url: verification_url(&cfg.issuer, &auth.user_code),
-            user_code: auth.user_code.clone(),
-            expires_in,
-        });
+        let (url, prefilled) = approval_link(&cfg.issuer, &auth);
+        on_event(PairingEvent::Code { url, user_code: auth.user_code.clone(), prefilled, expires_in });
         match poll_for_approval(cfg, http, &auth, deadline).await? {
             CodeOutcome::Approved(login) => return Ok(login),
             CodeOutcome::Expired => {
@@ -605,11 +611,34 @@ async fn device_login(
     }
 }
 
-/// datumctl forces the v2 login UI's device page regardless of what the IdP
-/// returns as `verification_uri`, with the code filled in.
-fn verification_url(issuer: &str, user_code: &str) -> String {
-    let code: String = url::form_urlencoded::byte_serialize(user_code.as_bytes()).collect();
-    format!("{}/ui/v2/login/device?user_code={code}", issuer.trim_end_matches('/'))
+/// Where the person approves the code, and whether that link carries it.
+///
+/// The IdP's own links come first. For auth.datum.net,
+/// `verification_uri_complete` is `/device?user_code=…`, which goes through
+/// Zitadel's classic login, and approving from it works for a person who is
+/// not signed in to Datum yet. datumctl instead builds
+/// `/ui/v2/login/device?user_code=…`, the newer login UI, where a signed-out
+/// person signs in and then gets "Something went wrong" on Authorize (seen
+/// on a real Home Assistant Green, 0.3.5). So: `verification_uri_complete`,
+/// else `verification_uri` with the code typed by hand, and the built link
+/// only when the IdP sent neither (or nothing usable).
+fn approval_link(issuer: &str, auth: &DeviceAuthorization) -> (String, bool) {
+    if let Some(url) = auth.verification_uri_complete.as_deref().and_then(usable_link) {
+        return (url, true);
+    }
+    if let Some(url) = auth.verification_uri.as_deref().and_then(usable_link) {
+        return (url, false);
+    }
+    let code: String = url::form_urlencoded::byte_serialize(auth.user_code.as_bytes()).collect();
+    (format!("{}/ui/v2/login/device?user_code={code}", issuer.trim_end_matches('/')), true)
+}
+
+/// A link from the IdP that is fit to show and click: an absolute http(s)
+/// URL with a host. Anything else (empty, relative, `javascript:`) is
+/// ignored, and the next choice is used.
+fn usable_link(raw: &str) -> Option<String> {
+    let url = url::Url::parse(raw.trim()).ok()?;
+    (matches!(url.scheme(), "https" | "http") && url.host_str().is_some_and(|h| !h.is_empty())).then(|| url.to_string())
 }
 
 async fn start_device_authorization(
@@ -1581,6 +1610,45 @@ pub(crate) mod tests {
     pub(crate) const PROJECT: &str = "project-7r4rl";
     pub(crate) const PROJECT_UID: &str = "11111111-2222-3333-4444-555555555555";
 
+    fn device_auth(uri: Option<&str>, complete: Option<&str>) -> DeviceAuthorization {
+        DeviceAuthorization {
+            device_code: "d".into(),
+            user_code: "WXYZ-ABCD".into(),
+            verification_uri: uri.map(str::to_string),
+            verification_uri_complete: complete.map(str::to_string),
+            interval: 5,
+            expires_in: 300,
+        }
+    }
+
+    /// The IdP's complete link first (auth.datum.net's `/device?user_code=`
+    /// works for a person not signed in to Datum; the v2 login's device
+    /// page did not), then its plain link with the code typed by hand, and
+    /// the built v2 link only when the IdP sent neither.
+    #[test]
+    fn the_approval_link_prefers_what_the_idp_sent() {
+        let issuer = "https://auth.datum.net";
+        let complete = "https://auth.datum.net/device?user_code=WXYZ-ABCD";
+        let plain = "https://auth.datum.net/device";
+        assert_eq!(approval_link(issuer, &device_auth(Some(plain), Some(complete))), (complete.to_string(), true));
+        assert_eq!(approval_link(issuer, &device_auth(None, Some(complete))), (complete.to_string(), true));
+        assert_eq!(approval_link(issuer, &device_auth(Some(plain), None)), (plain.to_string(), false));
+        let built = ("https://auth.datum.net/ui/v2/login/device?user_code=WXYZ-ABCD".to_string(), true);
+        assert_eq!(approval_link("https://auth.datum.net/", &device_auth(None, None)), built);
+        // Unusable links are skipped, never shown.
+        for bad in ["", "  ", "/device?user_code=WXYZ-ABCD", "javascript:alert(1)", "data:text/html,x", "https://"] {
+            assert_eq!(approval_link(issuer, &device_auth(Some(bad), Some(bad))), built, "{bad:?}");
+            assert_eq!(approval_link(issuer, &device_auth(Some(plain), Some(bad))), (plain.to_string(), false), "{bad:?}");
+        }
+        // The response as Zitadel sends it.
+        let parsed: DeviceAuthorization = serde_json::from_value(json!({
+            "device_code": "d", "user_code": "WXYZ-ABCD", "verification_uri": plain,
+            "verification_uri_complete": complete, "expires_in": 300, "interval": 5,
+        }))
+        .unwrap();
+        assert_eq!(approval_link(issuer, &parsed), (complete.to_string(), true));
+    }
+
     #[derive(Clone, Copy, Debug)]
     pub(crate) enum Poll {
         Pending,
@@ -1714,7 +1782,8 @@ pub(crate) mod tests {
                     (200, json!({
                         "device_code": format!("device-code-{n}"),
                         "user_code": format!("ABCD-EFG{n}"),
-                        "verification_uri": "https://ignored.example/device",
+                        "verification_uri": "https://auth.example/device",
+                        "verification_uri_complete": format!("https://auth.example/device?user_code=ABCD-EFG{n}"),
                         "expires_in": self.code_expires_in,
                         "interval": 1,
                     }))
@@ -1955,8 +2024,9 @@ pub(crate) mod tests {
             run.events,
             vec![
                 PairingEvent::Code {
-                    url: format!("{}/ui/v2/login/device?user_code=ABCD-EFG1", run.cfg.issuer),
+                    url: "https://auth.example/device?user_code=ABCD-EFG1".into(),
                     user_code: "ABCD-EFG1".into(),
+                    prefilled: true,
                     expires_in: Duration::from_secs(300),
                 },
                 PairingEvent::Approved { email: "person@example.com".into() },
@@ -2386,10 +2456,7 @@ pub(crate) mod tests {
         let code = notes[0].1["message"].as_str().unwrap();
         assert_eq!(
             code,
-            format!(
-                "[Open the Datum approval page]({}/ui/v2/login/device?user_code=ABCD-EFG1) and confirm code **ABCD-EFG1**. The code expires in 5 minutes; a new one appears here if it does.",
-                run.cfg.issuer
-            )
+            "[Open the Datum approval page](https://auth.example/device?user_code=ABCD-EFG1) and confirm code **ABCD-EFG1**. The code expires in 5 minutes; a new one appears here if it does."
         );
         let list = notes[1].1["message"].as_str().unwrap();
         assert!(list.contains("Set **project** on the add-on's Configuration tab to one of these ids and click Save. Home Assistant offers to restart the add-on when you save; either way, pairing continues without a new login."), "{list}");

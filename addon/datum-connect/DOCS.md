@@ -55,14 +55,16 @@ Home Assistant OS does not allow that — and nothing is built on the device.
    real address. Home Assistant will restart." Click **Allow**. The add-on
    changes only those two settings and keeps every other network setting
    as it is. Home Assistant restarts: inside Home Assistant the page goes
-   blank or says `Home Assistant is restarting with the new setting…` for a
-   minute or two, and comes back by itself. The add-on then sends a request
+   blank or says `Home Assistant is restarting with the new setting…` for
+   several minutes (on a Home Assistant Green, up to about 10), and comes
+   back by itself. The add-on then sends a request
    the way Datum does, and only confirms the change once Home Assistant
    accepts it. The page then says `Done ✓`. The tunnel is already running
    meanwhile; it starts whether or not you answer.
 
    If the check fails, the change is not confirmed and Home Assistant goes
-   back to the previous setting by itself within 5 minutes. The page says
+   back to the previous setting by itself, 5 minutes after it restarted
+   with it. The page says
    why and offers **Retry** or **Skip**. If someone has a change to these
    settings waiting for confirmation, the page leaves it alone and asks you
    to finish it in **Settings → System → Network** first. If Home Assistant
@@ -88,7 +90,7 @@ The page is the easiest way, but not the only one:
   the approval link and the code.
 - **The log.** The same link and code are in the add-on's **Log** tab:
 
-  `To connect this Home Assistant to Datum, open https://auth.datum.net/ui/v2/login/device?user_code=ABCD-EFGH and enter code ABCD-EFGH (expires in 5 minutes)`
+  `To connect this Home Assistant to Datum, open https://auth.datum.net/device?user_code=ABCD-EFGH and check that it shows code ABCD-EFGH, then approve (expires in 5 minutes)`
 
   After approving, instead of choosing on the page, you can set `project`
   on the Configuration tab to one of the ids the log lists and click Save.
@@ -357,9 +359,16 @@ independently.
 **Datum Connect isn't in the sidebar.** Turn on **Show in sidebar** on the
 add-on's Info tab, or click **Open Web UI** there.
 
-**The page says "Waiting for the add-on…".** The add-on is starting,
+**The page says "Waiting for the add-on…" or "Home Assistant is restarting
+with the new setting…".** The add-on is starting,
 restarting, or stopped, or Home Assistant itself is restarting (the page
-reaches you through Home Assistant). It comes back by itself. Check that it is running, and its Log tab. If the log
+reaches you through Home Assistant). It comes back by itself. Since 0.3.6
+it no longer gets stuck there after Home Assistant restarts: each request
+gives up after 15 seconds and the page keeps asking, and if Home Assistant
+answers but refuses the page's old session it asks Home Assistant to open
+the page afresh (without reloading Home Assistant). After 30 seconds without
+an answer a **Reload** button appears; it reloads only the page, and the
+page then shows where Allow is or how it ended (the add-on keeps that). Check that it is running, and its Log tab. If the log
 says `cannot serve the Datum Connect page`, the add-on pairs from the log
 and notification instead, as before 0.3.0.
 
@@ -368,13 +377,29 @@ Something other than the Supervisor tried to open the page, or the
 Supervisor connects from an unusual address on this system. If the page
 itself does not load, report the address the log names.
 
-**Datum's approval page says "Something went wrong. Please try again."** The
+**Datum's approval page says "Something went wrong. Please try again."**
+Before 0.3.6 the approval link went to Datum's newer login page
+(`/ui/v2/login/device`), where Authorize failed for someone who was not
+already signed in to Datum. Since 0.3.6 the link is the one Datum's sign-in
+service hands out (`https://auth.datum.net/device?user_code=…`), which signs
+you in first and then asks to approve; if an older log or notification shows
+a `/ui/v2/` link, get a new code. Otherwise the
 usual cause is a stale Datum sign-in in that browser: Authorize fails even
 with a fresh code. Open the link in a private window or another browser, sign
 in to Datum there, and click Authorize. Signing out of auth.datum.net in your
 usual browser fixes it for next time. If the code has expired in the
 meantime, click **Get a new code** on the Datum Connect page (0.3.1 and
 later).
+
+**Clicking Info, Documentation, Configuration or Log on the page logged me
+out.** That was 0.3.5: those links reloaded the whole Home Assistant window,
+and if you signed in without "Keep me logged in", Home Assistant keeps your
+login only in that window's memory, so the reload asked you to sign in
+again. Since 0.3.6 the page asks Home Assistant to switch tabs inside the
+app (the same message Home Assistant's own app panel accepts from add-on
+pages), without a reload. Opening a link in a new tab (middle click, or
+Ctrl/Cmd-click) still works as a normal link, and a new tab is a fresh load
+of Home Assistant, so it may ask you to sign in.
 
 **The page says "This page is out of date".** The add-on restarted since the
 page was opened. Reload the page.
@@ -432,10 +457,31 @@ start while it is missing:
 
 **Allow says "still got 400: Bad Request" or "did not come back with the new
 setting".** The change was not confirmed, and Home Assistant goes back to
-the previous setting by itself within 5 minutes; nothing else changed. Click
+the previous setting by itself, 5 minutes after it restarted with it;
+nothing else changed. Click
 **Retry** (or **Try again**) once Home Assistant is back, or set it by hand
 (step 5 of "Installing"). If the page says a change is waiting for confirmation, finish
 or discard it in **Settings → System → Network** first.
+
+How long Allow waits (0.3.6 and later): up to 15 minutes for Home Assistant
+to come back, since a Home Assistant Green can take several minutes to
+restart. Home Assistant starts its own 5-minute revert clock only once it is
+back (it reads `revert_at` from Home Assistant), and Allow checks and
+confirms well inside that; with less than 45 seconds left it stops and says
+`too soon to check and confirm it safely` rather than race the revert.
+Before 0.3.6 Allow gave up after 4 minutes, often while Home Assistant was
+still restarting (`did not come back with the new setting within 4
+minutes`), even though the setting then worked. Retry picks up Allow's own
+change if Home Assistant is running it on trial, rather than calling it
+someone else's.
+
+If the add-on restarts while Home Assistant is running Allow's change on
+trial, the add-on confirms it by itself as soon as it is back (the log says
+`Found Datum's change to Home Assistant's proxy settings still on trial;
+confirming it`), with the same check Allow makes, before Home Assistant's
+revert. A waiting change that differs from Allow's in any setting is never
+touched; the page keeps asking you to finish it in **Settings → System →
+Network**.
 
 **The log says "Re-using tunnel ... from an earlier install: its connector was
 replaced".** The add-on found a tunnel from an earlier install by its label,

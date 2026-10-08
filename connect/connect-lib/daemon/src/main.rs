@@ -658,6 +658,8 @@ mod args_tests {
         let needed = ProxySetup::Needed { config: serde_json::json!({}) };
         assert!(proxy_hint(Some(&needed)).unwrap().contains("click Allow"));
         assert!(proxy_hint(Some(&ProxySetup::Pending)).unwrap().contains("Settings > System > Network"));
+        assert_eq!(proxy_hint(Some(&ProxySetup::Ours { on_trial: true })), None);
+        assert!(proxy_hint(Some(&ProxySetup::Ours { on_trial: false })).unwrap().contains("click Allow"));
     }
 
     /// The add-on runs `pair --project "$PROJECT" --key-out <path>`, with
@@ -1572,7 +1574,11 @@ async fn pair(
 fn pairing_line(event: &connect_lib::datum_cloud::pairing::PairingEvent) -> String {
     use connect_lib::datum_cloud::pairing::PairingEvent;
     match event {
-        PairingEvent::Code { url, user_code, expires_in } => format!(
+        PairingEvent::Code { url, user_code, prefilled: true, expires_in } => format!(
+            "To connect this Home Assistant to Datum, open {url} and check that it shows code {user_code}, then approve (expires in {})",
+            minutes(*expires_in)
+        ),
+        PairingEvent::Code { url, user_code, prefilled: false, expires_in } => format!(
             "To connect this Home Assistant to Datum, open {url} and enter code {user_code} (expires in {})",
             minutes(*expires_in)
         ),
@@ -1641,9 +1647,9 @@ impl connect_lib::datum_cloud::pairing_setup::SetupObserver for SetupLog {
                 say_line(&line);
                 self.notify(|n| n.show(setup_choose_message(panel, projects.len())));
             }
-            PairingEvent::Code { url, user_code, expires_in } => {
+            PairingEvent::Code { url, user_code, prefilled, expires_in } => {
                 say_line(&pairing_line(event));
-                self.notify(|n| n.show(setup_code_message(panel, url, user_code, *expires_in)));
+                self.notify(|n| n.show(setup_code_message(panel, url, user_code, *prefilled, *expires_in)));
             }
             other => say_line(&pairing_line(other)),
         }
@@ -1899,6 +1905,11 @@ fn proxy_hint(setup: Option<&connect_lib::datum_cloud::ha_core::ProxySetup>) -> 
         ProxySetup::Pending => Some(
             "Home Assistant has a network settings change waiting for confirmation. Finish it in Settings > System > Network, then check the Datum Connect page.",
         ),
+        // Running on trial: the daemon confirms it (addon_page::confirm_ours).
+        ProxySetup::Ours { on_trial: true } => None,
+        ProxySetup::Ours { on_trial: false } => Some(
+            "Datum Connect's change to Home Assistant's proxy settings is saved but not in use yet. Open Datum Connect in the sidebar and click Allow to finish it.",
+        ),
     }
 }
 
@@ -2119,7 +2130,14 @@ async fn run() -> n0_error::Result<()> {
                         args.paired_key_file.clone(),
                         supervisor,
                     );
-                    let router = ingress::router(ingress::Backend::Paired(Arc::new(view)), allowed.clone(), slug.as_deref());
+                    let view = Arc::new(view);
+                    // Allow's own change, left on trial by a restart, is
+                    // confirmed whether or not the page is open.
+                    {
+                        let view = view.clone();
+                        tokio::spawn(async move { view.confirm_ours().await });
+                    }
+                    let router = ingress::router(ingress::Backend::Paired(view), allowed.clone(), slug.as_deref());
                     // Detached: it serves for as long as the daemon runs.
                     drop(ingress::serve_on(listener, router));
                     tracing::info!(%bind, port, ?allowed, "serving the Datum Connect page");

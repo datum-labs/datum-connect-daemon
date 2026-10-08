@@ -452,7 +452,9 @@ impl PairingNotifier {
     /// Updates the notification for the events a person has to act on.
     pub fn event(&self, event: &PairingEvent) {
         let message = match event {
-            PairingEvent::Code { url, user_code, expires_in } => code_message(url, user_code, *expires_in),
+            PairingEvent::Code { url, user_code, prefilled, expires_in } => {
+                code_message(url, user_code, *prefilled, *expires_in)
+            }
             PairingEvent::ChooseProject { projects, rejected, wait } => {
                 choose_project_message(projects, rejected.as_deref(), *wait)
             }
@@ -508,11 +510,18 @@ impl PairingNotifier {
 pub const PAUSED_MESSAGE: &str =
     "Pairing paused while the add-on restarts. It continues without a new login when the add-on starts again.";
 
-/// The code notification. `url` already carries the code.
-pub fn code_message(url: &str, user_code: &str, expires_in: Duration) -> String {
+/// What to do with the code on the approval page: check it when `url`
+/// already carries it (`prefilled`), type it when not.
+fn code_verb(prefilled: bool) -> &'static str {
+    if prefilled { "confirm" } else { "enter" }
+}
+
+/// The code notification.
+pub fn code_message(url: &str, user_code: &str, prefilled: bool, expires_in: Duration) -> String {
     format!(
-        "[Open the Datum approval page]({}) and confirm code **{}**. The code expires in {}; a new one appears here if it does.",
+        "[Open the Datum approval page]({}) and {} code **{}**. The code expires in {}; a new one appears here if it does.",
         link_target(url),
+        code_verb(prefilled),
         escape(user_code),
         duration_words(expires_in)
     )
@@ -579,11 +588,18 @@ pub fn setup_waiting_message(panel: Option<&str>) -> String {
 }
 
 /// A code has been issued, from the page.
-pub fn setup_code_message(panel: Option<&str>, url: &str, user_code: &str, expires_in: Duration) -> String {
+pub fn setup_code_message(
+    panel: Option<&str>,
+    url: &str,
+    user_code: &str,
+    prefilled: bool,
+    expires_in: Duration,
+) -> String {
     format!(
-        "{} to finish connecting to Datum. Or [open the Datum approval page]({}) and confirm code **{}** (expires in {}).",
+        "{} to finish connecting to Datum. Or [open the Datum approval page]({}) and {} code **{}** (expires in {}).",
         panel_link(panel),
         link_target(url),
+        code_verb(prefilled),
         escape(user_code),
         duration_words(expires_in)
     )
@@ -651,20 +667,19 @@ mod tests {
 
     #[test]
     fn code_message_is_a_link_and_the_code() {
-        let m = code_message(
-            "https://auth.datum.net/ui/v2/login/device?user_code=DPDX-JRRN",
-            "DPDX-JRRN",
-            Duration::from_secs(300),
-        );
+        let m = code_message("https://auth.datum.net/device?user_code=DPDX-JRRN", "DPDX-JRRN", true, Duration::from_secs(300));
         assert_eq!(
             m,
-            "[Open the Datum approval page](https://auth.datum.net/ui/v2/login/device?user_code=DPDX-JRRN) and confirm code **DPDX-JRRN**. The code expires in 5 minutes; a new one appears here if it does."
+            "[Open the Datum approval page](https://auth.datum.net/device?user_code=DPDX-JRRN) and confirm code **DPDX-JRRN**. The code expires in 5 minutes; a new one appears here if it does."
         );
+        // A link without the code: the code is typed there.
+        let m = code_message("https://auth.datum.net/device", "DPDX-JRRN", false, Duration::from_secs(300));
+        assert!(m.contains("(https://auth.datum.net/device) and enter code **DPDX-JRRN**"), "{m}");
     }
 
     #[test]
     fn a_url_cannot_break_out_of_the_link() {
-        let m = code_message("https://x.example/a)b (c)", "C", Duration::from_secs(60));
+        let m = code_message("https://x.example/a)b (c)", "C", true, Duration::from_secs(60));
         assert!(m.contains("(https://x.example/a%29b%20%28c%29)"), "{m}");
     }
 
@@ -733,7 +748,7 @@ mod tests {
 
     #[test]
     fn setup_messages_point_at_the_page_and_escape() {
-        let m = setup_code_message(Some("/app/s_1"), "https://a.example/d?user_code=AB-CD", "AB-CD", Duration::from_secs(300));
+        let m = setup_code_message(Some("/app/s_1"), "https://a.example/d?user_code=AB-CD", "AB-CD", true, Duration::from_secs(300));
         assert_eq!(
             m,
             "[Open Datum Connect](/app/s_1) to finish connecting to Datum. Or [open the Datum approval page](https://a.example/d?user_code=AB-CD) and confirm code **AB-CD** (expires in 5 minutes)."
