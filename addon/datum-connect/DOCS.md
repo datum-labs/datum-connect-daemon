@@ -359,9 +359,16 @@ independently.
 **Datum Connect isn't in the sidebar.** Turn on **Show in sidebar** on the
 add-on's Info tab, or click **Open Web UI** there.
 
-**The page says "Waiting for the add-on…".** The add-on is starting,
+**The page says "Waiting for the add-on…" or "Home Assistant is restarting
+with the new setting…".** The add-on is starting,
 restarting, or stopped, or Home Assistant itself is restarting (the page
-reaches you through Home Assistant). It comes back by itself. Check that it is running, and its Log tab. If the log
+reaches you through Home Assistant). It comes back by itself. Since 0.3.6
+it no longer gets stuck there after Home Assistant restarts: each request
+gives up after 15 seconds and the page keeps asking, and if Home Assistant
+answers but refuses the page's old session it asks Home Assistant to open
+the page afresh (without reloading Home Assistant). After 30 seconds without
+an answer a **Reload** button appears; it reloads only the page, and the
+page then shows where Allow is or how it ended (the add-on keeps that). Check that it is running, and its Log tab. If the log
 says `cannot serve the Datum Connect page`, the add-on pairs from the log
 and notification instead, as before 0.3.0.
 
