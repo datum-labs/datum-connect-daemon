@@ -20,6 +20,8 @@ Home Assistant OS does not allow that — and nothing is built on the device.
 3. **Start, then open Datum Connect.** Start the add-on, then open
    **Datum Connect** in the sidebar. If it isn't there, turn on **Show in
    sidebar** on the add-on's Info tab, or click **Open Web UI** there.
+   Opened that way, Home Assistant hides the add-on's tabs; the links at
+   the top of the page (Info, Documentation, Configuration, Log) go back.
 4. **Connect, approve, and pick a project.** Click **Connect to Datum**. The
    page shows a link and a code: open the link (it opens in a new tab), sign
    in to Datum as usual, check that the code there matches the one on the

@@ -70,8 +70,23 @@
   }
 
   function show() {
-    root.replaceChildren.apply(root, [el("h1", { text: "Datum Connect" })].concat(
+    root.replaceChildren.apply(root, [header()].concat(
       Array.prototype.slice.call(arguments).filter(Boolean)));
+  }
+
+  // The title, and links back to the add-on's own tabs, which Home
+  // Assistant does not show around this page. The server sends them (as
+  // `ha`) only for a valid add-on slug. They are absolute paths on Home
+  // Assistant's origin, opened in the top window to leave this frame.
+  function header() {
+    var title = el("h1", { text: "Datum Connect" });
+    var ha = last && last.ha;
+    if (!ha) return title;
+    var tabs = [["Info", ha.info], ["Documentation", ha.documentation], ["Configuration", ha.config], ["Log", ha.logs]];
+    return el("header", { class: "top" }, title,
+      el.apply(null, ["nav", { class: "ha-tabs", "aria-label": "Add-on" }].concat(tabs.map(function (t) {
+        return el("a", { href: t[1], target: "_top", text: t[0] });
+      }))));
   }
 
   function card() {
