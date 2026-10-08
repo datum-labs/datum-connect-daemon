@@ -77,7 +77,7 @@
   // The title, and links back to the add-on's own tabs, which Home
   // Assistant does not show around this page. The server sends them (as
   // `ha`) only for a valid add-on slug. They are absolute paths on Home
-  // Assistant's origin, opened in the top window to leave this frame.
+  // Assistant's origin; see haLink for how they are followed.
   function header() {
     var title = el("h1", { text: "Datum Connect" });
     var ha = last && last.ha;
@@ -85,8 +85,84 @@
     var tabs = [["Info", ha.info], ["Documentation", ha.documentation], ["Configuration", ha.config], ["Log", ha.logs]];
     return el("header", { class: "top" }, title,
       el.apply(null, ["nav", { class: "ha-tabs", "aria-label": "Add-on" }].concat(tabs.map(function (t) {
-        return el("a", { href: t[1], target: "_top", text: t[0] });
+        return el("a", { href: t[1], target: "_top", text: t[0], onclick: haLink });
       }))));
+  }
+
+  // ---- Moving around Home Assistant without reloading it ----
+  //
+  // This page runs in Home Assistant's app panel (home-assistant/frontend,
+  // src/panels/app/ha-panel-app.ts), in an iframe on Home Assistant's own
+  // origin. Following a link in the top window loads Home Assistant's
+  // frontend afresh, and someone who signed in without "Keep me logged in"
+  // keeps their tokens only in memory, so that reload sends them to the
+  // login page (seen on a real install with 0.3.5's links).
+  //
+  // Instead the page asks the panel to move within the app. The panel
+  // listens for messages from its iframe:
+  //   window.parent.postMessage(
+  //     {type: "home-assistant/navigate", path: "/config/...", options: {replace: false}},
+  //     <Home Assistant's origin>)
+  // and calls the frontend's own navigate(path, options) (options:
+  // {replace?: boolean, data?}). It checks only that event.source is its
+  // iframe's window, not the origin; the message is still addressed to
+  // Home Assistant's origin, which is this page's (location.origin), so it
+  // goes nowhere else.
+  //
+  // Each link keeps its href and target="_top", so a middle click, a
+  // modified click (new tab or window) or "Open in new tab" work as links
+  // do, and so does a plain click outside a frame (the page opened on its
+  // own). If nothing acts on the message (an older or different parent),
+  // this frame is still here, and the parent where it was, a moment later;
+  // the link is then followed the plain way after all.
+  var NAV_FALLBACK_MS = 1500;
+
+  function inFrame() {
+    try {
+      return window.parent !== window;
+    } catch (e) {
+      return true;
+    }
+  }
+
+  // The parent's path, if it can be read (it can on Home Assistant's own
+  // origin); null if not.
+  function parentPath() {
+    try {
+      return window.parent.location.pathname;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Asks Home Assistant's panel to go to `path` in-app. False if this page
+  // is not in a frame, or the message could not be sent.
+  function haNavigate(path, replace) {
+    if (!inFrame()) return false;
+    try {
+      window.parent.postMessage(
+        { type: "home-assistant/navigate", path: path, options: { replace: !!replace } },
+        location.origin);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function haLink(e) {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    var path = e.currentTarget.getAttribute("href");
+    var before = parentPath();
+    if (!haNavigate(path, false)) return;
+    e.preventDefault();
+    setTimeout(function () {
+      if (parentPath() !== before) return;
+      try {
+        window.top.location.href = path;
+      } catch (err) {
+        // Nothing more to try.
+      }
+    }, NAV_FALLBACK_MS);
   }
 
   function card() {

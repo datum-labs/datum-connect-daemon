@@ -384,6 +384,16 @@ usual browser fixes it for next time. If the code has expired in the
 meantime, click **Get a new code** on the Datum Connect page (0.3.1 and
 later).
 
+**Clicking Info, Documentation, Configuration or Log on the page logged me
+out.** That was 0.3.5: those links reloaded the whole Home Assistant window,
+and if you signed in without "Keep me logged in", Home Assistant keeps your
+login only in that window's memory, so the reload asked you to sign in
+again. Since 0.3.6 the page asks Home Assistant to switch tabs inside the
+app (the same message Home Assistant's own app panel accepts from add-on
+pages), without a reload. Opening a link in a new tab (middle click, or
+Ctrl/Cmd-click) still works as a normal link, and a new tab is a fresh load
+of Home Assistant, so it may ask you to sign in.
+
 **The page says "This page is out of date".** The add-on restarted since the
 page was opened. Reload the page.
 
