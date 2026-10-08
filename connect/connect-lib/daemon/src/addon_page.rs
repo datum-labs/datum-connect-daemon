@@ -74,6 +74,25 @@ struct ProxyJob {
     version: u64,
 }
 
+/// The page's status as last built, and what it was built from.
+struct CachedStatus {
+    at: Instant,
+    /// [`ProxyJob::version`] then.
+    version: u64,
+    /// The tunnels this daemon was running then (sorted ids).
+    running: Vec<String>,
+    status: PairedStatus,
+}
+
+impl CachedStatus {
+    /// Still good to serve: young, and neither Allow's state nor the set of
+    /// running tunnels has changed since. A tunnel this daemon starts or
+    /// stops shows on the next poll, not up to [`STATUS_TTL`] later.
+    fn serves(&self, version: u64, running: &[String]) -> bool {
+        self.at.elapsed() < STATUS_TTL && self.version == version && self.running == running
+    }
+}
+
 pub(crate) struct DaemonPaired {
     app: Arc<AppState>,
     /// The key the daemon runs on (`DATUM_SA_KEY_FILE`).
@@ -81,7 +100,7 @@ pub(crate) struct DaemonPaired {
     /// Where pairing saves its key. Only a key there may be forgotten.
     paired_key_file: Option<PathBuf>,
     supervisor: Option<Supervisor>,
-    cache: tokio::sync::Mutex<Option<(Instant, u64, PairedStatus)>>,
+    cache: tokio::sync::Mutex<Option<CachedStatus>>,
     edge: tokio::sync::Mutex<HashMap<String, (Instant, EdgePolicyStatus)>>,
     proxy_job: Arc<StdMutex<ProxyJob>>,
 }
@@ -147,7 +166,14 @@ impl DaemonPaired {
         }
     }
 
-    async fn fresh_status(&self) -> PairedStatus {
+    /// The tunnels this daemon runs right now, sorted.
+    async fn running_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.app.running.lock().await.keys().cloned().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    async fn fresh_status(&self, running: &[String]) -> PairedStatus {
         let key = self.key();
         let mut status = PairedStatus {
             project: self.app.project_id.clone(),
@@ -159,19 +185,19 @@ impl DaemonPaired {
         };
         match self.app.control.list_active().await {
             Ok(tunnels) => {
-                let running: Vec<String> = self.app.running.lock().await.keys().cloned().collect();
+                let running = |id: &str| running.iter().any(|r| r == id);
                 let now = SystemTime::now();
                 let (mine, older) = self.split(tunnels);
                 for t in mine {
                     let edge = self.edge_status(&t.id).await;
                     status
                         .tunnels
-                        .push(tunnel_view(&t, running.contains(&t.id), edge, &self.app.project_id, now));
+                        .push(tunnel_view(&t, running(&t.id), edge, &self.app.project_id, now));
                 }
                 for t in older {
                     // Stopped and on their way out: their policies are not
                     // worth a call each.
-                    status.older.push(tunnel_view(&t, running.contains(&t.id), None, &self.app.project_id, now));
+                    status.older.push(tunnel_view(&t, running(&t.id), None, &self.app.project_id, now));
                 }
             }
             Err(e) => status.error = Some(format!("Could not ask Datum about the tunnel: {e}")),
@@ -407,15 +433,15 @@ impl PairedView for DaemonPaired {
         Box::pin(async move {
             let mut cache = self.cache.lock().await;
             let version = self.job_version();
-            if let Some((at, v, s)) = cache.as_ref()
-                && at.elapsed() < STATUS_TTL
-                && *v == version
+            let running = self.running_ids().await;
+            if let Some(c) = cache.as_ref()
+                && c.serves(version, &running)
             {
-                return s.clone();
+                return c.status.clone();
             }
-            let s = self.fresh_status().await;
-            *cache = Some((Instant::now(), self.job_version(), s.clone()));
-            s
+            let status = self.fresh_status(&running).await;
+            *cache = Some(CachedStatus { at: Instant::now(), version: self.job_version(), running, status: status.clone() });
+            status
         })
     }
 
@@ -591,7 +617,19 @@ fn key_facts(key_file: Option<&Path>, paired_key_file: Option<&Path>, has_superv
     KeyFacts { email, source: if paired { "paired" } else { "provided" }, why_not }
 }
 
-/// One tunnel, as the page shows it.
+/// One tunnel, as the page shows it. `running`: this daemon serves it now,
+/// which is what its badge says first.
+///
+/// Datum's `enabled` is only whether the tunnel's ConnectorAdvertisement
+/// exists. The edge routes by the HTTPProxy's connector, not by that
+/// advertisement, so a tunnel this daemon runs serves traffic whether or
+/// not it is there. Seen on a Home Assistant Green (0.3.5) after a
+/// reinstall adopted the old tunnel: the daemon ran it and its address
+/// answered, while the page said "Off" from `enabled`. So a running tunnel
+/// is never "Off": it is "Online" once its connector is ready and its
+/// proxy programmed, "Starting" before. `enabled` only tells apart, for a
+/// tunnel this daemon does not run, one turned off from one that should
+/// be on.
 fn tunnel_view(
     t: &connect_lib::TunnelSummary,
     running: bool,
@@ -599,14 +637,12 @@ fn tunnel_view(
     project: &str,
     now: SystemTime,
 ) -> TunnelView {
-    let state = if !t.enabled {
-        "off"
-    } else if t.connector_ready && t.programmed {
-        "online"
-    } else if running {
-        "starting"
-    } else {
-        "offline"
+    let state = match (running, t.enabled, t.connector_ready && t.programmed) {
+        (true, _, true) => "online",
+        (true, _, false) => "starting",
+        (false, false, _) => "off",
+        (false, true, true) => "online",
+        (false, true, false) => "offline",
     };
     TunnelView {
         id: t.id.clone(),
@@ -652,6 +688,34 @@ mod tests {
         assert_eq!(tunnel_view(&summary(true, false, &[]), false, None, "p", now).state, "offline");
         assert_eq!(tunnel_view(&summary(false, true, &[]), false, None, "p", now).state, "off");
         assert_eq!(tunnel_view(&summary(true, true, &[]), true, None, "p", now).address, None);
+    }
+
+    /// The badge follows what this daemon runs, not Datum's `enabled`
+    /// (whether the ConnectorAdvertisement exists), which read false for a
+    /// tunnel the daemon was serving on a real device: "Off" while online.
+    #[test]
+    fn a_running_tunnel_is_never_off() {
+        let now = SystemTime::now();
+        let not_enabled_but_serving = summary(false, true, &["abc.datumproxy.net"]);
+        assert_eq!(tunnel_view(&not_enabled_but_serving, true, None, "p", now).state, "online");
+        assert_eq!(tunnel_view(&summary(false, false, &[]), true, None, "p", now).state, "starting");
+        // Not running here: Datum's view.
+        assert_eq!(tunnel_view(&not_enabled_but_serving, false, None, "p", now).state, "off");
+        assert_eq!(tunnel_view(&summary(true, true, &[]), false, None, "p", now).state, "online");
+        assert_eq!(tunnel_view(&summary(true, false, &[]), false, None, "p", now).state, "offline");
+    }
+
+    /// The page's status is rebuilt as soon as this daemon starts or stops
+    /// a tunnel, or Allow moves on, not only every few seconds.
+    #[test]
+    fn the_status_is_rebuilt_when_what_runs_changes() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let c = CachedStatus { at: Instant::now(), version: 3, running: ids(&[]), status: PairedStatus::default() };
+        assert!(c.serves(3, &ids(&[])));
+        assert!(!c.serves(3, &ids(&["tunnel-mkbpd"])), "a tunnel started since");
+        assert!(!c.serves(4, &ids(&[])), "Allow moved on");
+        let old = CachedStatus { at: Instant::now() - STATUS_TTL, ..c };
+        assert!(!old.serves(3, &ids(&[])), "too old");
     }
 
     /// The "a new address can take 10-20 minutes" note: only for a tunnel
