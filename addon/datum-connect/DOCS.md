@@ -88,7 +88,7 @@ The page is the easiest way, but not the only one:
   the approval link and the code.
 - **The log.** The same link and code are in the add-on's **Log** tab:
 
-  `To connect this Home Assistant to Datum, open https://auth.datum.net/ui/v2/login/device?user_code=ABCD-EFGH and enter code ABCD-EFGH (expires in 5 minutes)`
+  `To connect this Home Assistant to Datum, open https://auth.datum.net/device?user_code=ABCD-EFGH and check that it shows code ABCD-EFGH, then approve (expires in 5 minutes)`
 
   After approving, instead of choosing on the page, you can set `project`
   on the Configuration tab to one of the ids the log lists and click Save.
@@ -368,7 +368,13 @@ Something other than the Supervisor tried to open the page, or the
 Supervisor connects from an unusual address on this system. If the page
 itself does not load, report the address the log names.
 
-**Datum's approval page says "Something went wrong. Please try again."** The
+**Datum's approval page says "Something went wrong. Please try again."**
+Before 0.3.6 the approval link went to Datum's newer login page
+(`/ui/v2/login/device`), where Authorize failed for someone who was not
+already signed in to Datum. Since 0.3.6 the link is the one Datum's sign-in
+service hands out (`https://auth.datum.net/device?user_code=…`), which signs
+you in first and then asks to approve; if an older log or notification shows
+a `/ui/v2/` link, get a new code. Otherwise the
 usual cause is a stale Datum sign-in in that browser: Authorize fails even
 with a fresh code. Open the link in a private window or another browser, sign
 in to Datum there, and click Authorize. Signing out of auth.datum.net in your

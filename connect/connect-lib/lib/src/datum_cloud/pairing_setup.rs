@@ -79,6 +79,9 @@ pub enum Phase {
 pub struct CodeView {
     pub url: String,
     pub user_code: String,
+    /// `url` carries the code: the approval page shows it to check.
+    /// Otherwise the page asks for it to be typed.
+    pub prefilled: bool,
     /// How long the code was good for when it was issued.
     pub expires_in_secs: u64,
     /// How long it is still good for, as of [`SetupController::status`]:
@@ -408,11 +411,12 @@ impl Inner {
             return false;
         }
         match event {
-            PairingEvent::Code { url, user_code, expires_in } => {
+            PairingEvent::Code { url, user_code, prefilled, expires_in } => {
                 s.phase = Phase::Code;
                 s.code = Some(CodeView {
                     url: url.clone(),
                     user_code: user_code.clone(),
+                    prefilled: *prefilled,
                     expires_in_secs: expires_in.as_secs(),
                     remaining_secs: expires_in.as_secs(),
                     expires_at: Instant::now() + *expires_in,
@@ -628,7 +632,9 @@ mod tests {
 
         s.ctl.start();
         let code = wait_for(&s.ctl, Phase::Code).await.code.unwrap();
-        assert_eq!(code.url, format!("{}/ui/v2/login/device?user_code=ABCD-EFG1", s.cfg.issuer));
+        // The IdP's own link, with the code in it (see pairing::approval_link).
+        assert_eq!(code.url, "https://auth.example/device?user_code=ABCD-EFG1");
+        assert!(code.prefilled);
         assert_eq!(code.user_code, "ABCD-EFG1");
         assert_eq!(code.expires_in_secs, 300);
         assert!((295..=300).contains(&code.remaining_secs), "{}", code.remaining_secs);
@@ -952,7 +958,7 @@ mod tests {
         let code = v["code"].as_object().unwrap();
         let mut keys: Vec<&str> = code.keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["expires_in_secs", "remaining_secs", "url", "user_code"]);
+        assert_eq!(keys, ["expires_in_secs", "prefilled", "remaining_secs", "url", "user_code"]);
         assert_eq!(code["expires_in_secs"], 100_000);
         let remaining = code["remaining_secs"].as_u64().unwrap();
         assert!((99_995..=100_000).contains(&remaining), "{remaining}");

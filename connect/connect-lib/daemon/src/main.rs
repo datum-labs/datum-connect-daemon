@@ -1572,7 +1572,11 @@ async fn pair(
 fn pairing_line(event: &connect_lib::datum_cloud::pairing::PairingEvent) -> String {
     use connect_lib::datum_cloud::pairing::PairingEvent;
     match event {
-        PairingEvent::Code { url, user_code, expires_in } => format!(
+        PairingEvent::Code { url, user_code, prefilled: true, expires_in } => format!(
+            "To connect this Home Assistant to Datum, open {url} and check that it shows code {user_code}, then approve (expires in {})",
+            minutes(*expires_in)
+        ),
+        PairingEvent::Code { url, user_code, prefilled: false, expires_in } => format!(
             "To connect this Home Assistant to Datum, open {url} and enter code {user_code} (expires in {})",
             minutes(*expires_in)
         ),
@@ -1641,9 +1645,9 @@ impl connect_lib::datum_cloud::pairing_setup::SetupObserver for SetupLog {
                 say_line(&line);
                 self.notify(|n| n.show(setup_choose_message(panel, projects.len())));
             }
-            PairingEvent::Code { url, user_code, expires_in } => {
+            PairingEvent::Code { url, user_code, prefilled, expires_in } => {
                 say_line(&pairing_line(event));
-                self.notify(|n| n.show(setup_code_message(panel, url, user_code, *expires_in)));
+                self.notify(|n| n.show(setup_code_message(panel, url, user_code, *prefilled, *expires_in)));
             }
             other => say_line(&pairing_line(other)),
         }

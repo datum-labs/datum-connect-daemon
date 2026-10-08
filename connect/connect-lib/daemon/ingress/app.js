@@ -229,7 +229,11 @@
           s.code_renewed ? el("p", { class: "warn", text: "The last code expired before it was approved. Here is a new one." }) : null,
           el("p", null, "1. Open the Datum approval page and sign in:"),
           el("p", null, el("a", { class: "button", href: s.code.url, target: "_blank", rel: "noopener noreferrer" }, "Open the approval page")),
-          el("p", null, "2. Check that it shows this code, then approve:"),
+          // The IdP's own link usually carries the code; when it doesn't,
+          // the approval page asks for it.
+          el("p", null, s.code.prefilled === false
+            ? "2. Enter this code there, then approve:"
+            : "2. Check that it shows this code, then approve:"),
           el("div", { class: "code", text: s.code.user_code }),
           el("div", { class: "code-row" },
             el("span", { id: "countdown", class: "countdown", role: "timer", text: countdownText() }),
