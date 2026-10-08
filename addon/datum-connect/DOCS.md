@@ -55,14 +55,16 @@ Home Assistant OS does not allow that — and nothing is built on the device.
    real address. Home Assistant will restart." Click **Allow**. The add-on
    changes only those two settings and keeps every other network setting
    as it is. Home Assistant restarts: inside Home Assistant the page goes
-   blank or says `Home Assistant is restarting with the new setting…` for a
-   minute or two, and comes back by itself. The add-on then sends a request
+   blank or says `Home Assistant is restarting with the new setting…` for
+   several minutes (on a Home Assistant Green, up to about 10), and comes
+   back by itself. The add-on then sends a request
    the way Datum does, and only confirms the change once Home Assistant
    accepts it. The page then says `Done ✓`. The tunnel is already running
    meanwhile; it starts whether or not you answer.
 
    If the check fails, the change is not confirmed and Home Assistant goes
-   back to the previous setting by itself within 5 minutes. The page says
+   back to the previous setting by itself, 5 minutes after it restarted
+   with it. The page says
    why and offers **Retry** or **Skip**. If someone has a change to these
    settings waiting for confirmation, the page leaves it alone and asks you
    to finish it in **Settings → System → Network** first. If Home Assistant
@@ -438,10 +440,23 @@ start while it is missing:
 
 **Allow says "still got 400: Bad Request" or "did not come back with the new
 setting".** The change was not confirmed, and Home Assistant goes back to
-the previous setting by itself within 5 minutes; nothing else changed. Click
+the previous setting by itself, 5 minutes after it restarted with it;
+nothing else changed. Click
 **Retry** (or **Try again**) once Home Assistant is back, or set it by hand
 (step 5 of "Installing"). If the page says a change is waiting for confirmation, finish
 or discard it in **Settings → System → Network** first.
+
+How long Allow waits (0.3.6 and later): up to 15 minutes for Home Assistant
+to come back, since a Home Assistant Green can take several minutes to
+restart. Home Assistant starts its own 5-minute revert clock only once it is
+back (it reads `revert_at` from Home Assistant), and Allow checks and
+confirms well inside that; with less than 45 seconds left it stops and says
+`too soon to check and confirm it safely` rather than race the revert.
+Before 0.3.6 Allow gave up after 4 minutes, often while Home Assistant was
+still restarting (`did not come back with the new setting within 4
+minutes`), even though the setting then worked. Retry picks up Allow's own
+change if Home Assistant is running it on trial, rather than calling it
+someone else's.
 
 **The log says "Re-using tunnel ... from an earlier install: its connector was
 replaced".** The add-on found a tunnel from an earlier install by its label,

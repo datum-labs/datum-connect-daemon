@@ -27,9 +27,9 @@
   var LAST_STEP =
     "Last step: let Home Assistant accept connections through Datum. This turns on “Trust X-Forwarded-For” and adds 127.0.0.1 and ::1 as trusted proxies, so Home Assistant still sees each visitor's real address. Home Assistant will restart.";
   var REVERTS_NOTE =
-    "If Home Assistant took the new setting, it goes back to the previous one by itself within 5 minutes; nothing else was changed.";
+    "If Home Assistant took the new setting, it goes back to the previous one by itself 5 minutes after restarting with it; nothing else was changed.";
   var RESTART_NOTE =
-    "Home Assistant restarts, so this page may go blank or say Home Assistant is restarting for a minute or two. It comes back by itself, and the add-on carries on meanwhile.";
+    "Home Assistant restarts, so this page may go blank or say Home Assistant is restarting for several minutes (on a Home Assistant Green, up to about 10). It comes back by itself, and the add-on carries on meanwhile: it waits up to 15 minutes for Home Assistant, then checks and confirms the setting.";
 
   // What the person picked in the project list, kept across re-renders.
   var picked = null;

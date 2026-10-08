@@ -369,14 +369,32 @@ pub async fn core_api_up(sup: &Supervisor) -> bool {
 // ---- Allow ----
 
 /// How long each wait of [`allow_forwarded_requests`] may take.
+///
+/// Home Assistant's five-minute revert clock starts when it is *back*: it
+/// schedules the revert while loading the pending config at start
+/// (`components/http/config.py`, `async_load_config`: `if
+/// store.active_config_type is PENDING: store.async_schedule_revert_to_stable()`),
+/// and reports when in `http/config`'s `revert_at`. So the wait for it to
+/// come back is not bounded by that revert; only the time from "back on
+/// trial" to promote is, and that is measured against `revert_at`.
 #[derive(Debug, Clone)]
 pub struct AllowTiming {
-    /// For Home Assistant to start restarting after it took the setting.
+    /// For Home Assistant to close the websocket after it took the setting,
+    /// as it does when its restart begins. A close that never arrives is
+    /// not taken as "no restart" by itself (a relay can miss it): Allow
+    /// goes on to look for Home Assistant on trial, and only one seen
+    /// answering on its old setting, never down, for twice this long
+    /// counts as one that did not restart.
     pub restart_begins: Duration,
-    /// For it to come back with the setting on trial. Home Assistant
-    /// reverts an unconfirmed setting five minutes after it starts, so this
-    /// stays under that.
+    /// For it to come back on trial with the new setting, from when it took
+    /// it. A Home Assistant Green can take several minutes to restart.
     pub restart_ends: Duration,
+    /// The least time left before `revert_at` to start checking and
+    /// confirming; with less, Allow stops rather than race the revert.
+    pub confirm_margin: Duration,
+    /// Home Assistant's revert delay (`AUTO_REVERT_DELAY`), counted from
+    /// when it was seen back, if `revert_at` is missing.
+    pub revert_after: Duration,
     pub poll: Duration,
     /// Per websocket call.
     pub call: Duration,
@@ -386,7 +404,9 @@ impl Default for AllowTiming {
     fn default() -> Self {
         Self {
             restart_begins: Duration::from_secs(90),
-            restart_ends: Duration::from_secs(4 * 60),
+            restart_ends: Duration::from_secs(15 * 60),
+            confirm_margin: Duration::from_secs(45),
+            revert_after: Duration::from_secs(5 * 60),
             poll: Duration::from_secs(3),
             call: Duration::from_secs(20),
         }
@@ -406,7 +426,9 @@ impl AllowStep {
     pub fn describe(self) -> &'static str {
         match self {
             AllowStep::Saving => "Saving the setting in Home Assistant…",
-            AllowStep::Restarting => "Home Assistant is restarting with the new setting…",
+            AllowStep::Restarting => {
+                "Home Assistant is restarting with the new setting… This can take several minutes (on a Home Assistant Green, up to about 10)."
+            }
             AllowStep::Verifying => "Checking a request the way Datum sends it…",
             AllowStep::Confirming => "Confirming the setting…",
         }
@@ -431,16 +453,56 @@ pub enum AllowOutcome {
 /// local hop got, carrying `X-Forwarded-For`.
 pub type VerifyResult = Result<u16, String>;
 
-const REVERTS: &str = "Home Assistant goes back to the previous setting by itself within 5 minutes.";
+const REVERTS: &str = "Home Assistant goes back to the previous setting by itself, 5 minutes after it restarted with it.";
+
+/// `config` without the store's metadata, to compare slots by content.
+fn without_meta(config: &Value) -> Value {
+    let mut c = config.clone();
+    if let Some(m) = c.as_object_mut() {
+        for key in META_KEYS {
+            m.remove(key);
+        }
+    }
+    c
+}
+
+/// Whether the pending slot holds `wanted` (what Allow sends), failed or
+/// not.
+fn pending_is(http_config: &Value, wanted: &Value) -> bool {
+    http_config.get("pending").filter(|p| p.is_object()).is_some_and(|p| without_meta(p) == *wanted)
+}
+
+/// Home Assistant runs `wanted` on trial: started on the pending slot, and
+/// that slot is `wanted` and has not failed.
+fn on_trial_with(http_config: &Value, wanted: &Value) -> bool {
+    http_config["active_config_type"] == "pending" && live_pending(http_config).is_some() && pending_is(http_config, wanted)
+}
+
+/// When Home Assistant reverts its trial, from `http/config`'s `revert_at`
+/// (an ISO 8601 time on Home Assistant's clock, which inside the add-on is
+/// the same machine's), as an instant on ours.
+fn revert_instant(http_config: &Value) -> Option<tokio::time::Instant> {
+    let at = chrono::DateTime::parse_from_rfc3339(http_config.get("revert_at")?.as_str()?).ok()?;
+    let left = at.with_timezone(&chrono::Utc).signed_duration_since(chrono::Utc::now());
+    let now = tokio::time::Instant::now();
+    Some(match left.to_std() {
+        Ok(d) => now + d,
+        // Already past.
+        Err(_) => now,
+    })
+}
 
 /// Turns on `use_x_forwarded_for` with the loopback addresses as trusted
 /// proxies, the way Settings → System → Network does: save it as pending,
 /// let Home Assistant restart on it, check that a request through the
 /// add-on's local hop with `X-Forwarded-For` is no longer refused
-/// (`verify`), and only then confirm it. On any failure it is not
-/// confirmed, and Home Assistant's own revert restores the old setting.
+/// (`verify`), and only then confirm it, before Home Assistant's own revert
+/// is due. On any failure it is not confirmed, and that revert restores the
+/// old setting.
 ///
-/// A pending change made by someone else is never touched.
+/// Allow's own change, found pending (an earlier Allow that gave up while
+/// Home Assistant was still restarting, then Retry), is carried on rather
+/// than refused. A pending change made by someone else is never touched.
 pub async fn allow_forwarded_requests<V, F>(
     sup: &Supervisor,
     timing: &AllowTiming,
@@ -461,83 +523,172 @@ where
         Ok(c) => c,
         Err(e) => return Failed(format!("Could not read Home Assistant's network settings, so nothing was changed: {e}.")),
     };
-    let config = match assess(&current) {
+    let unreadable = |e: &str| Failed(format!("Home Assistant's network settings could not be read, so nothing was changed: {e}."));
+    let setup = match assess(&current) {
         Ok(ProxySetup::Ready) => return AllowOutcome::AlreadyAllowed,
-        Ok(ProxySetup::Pending) => return AllowOutcome::PendingByOther,
-        Ok(ProxySetup::Needed { config }) => config,
-        Err(e) => return Failed(format!("Home Assistant's network settings could not be read, so nothing was changed: {e}.")),
+        Ok(s) => s,
+        Err(e) => return unreadable(&e),
+    };
+    // What Allow sends, and recognises as its own when it finds it
+    // pending: stable with only the forwarding settings changed.
+    let wanted = match merged(&current["stable"]) {
+        Ok(w) => w,
+        Err(e) => return unreadable(&e),
+    };
+    let started = tokio::time::Instant::now();
+    // `None`: already on trial with our change. `Some(seen_down)`: wait
+    // for that, knowing whether the restart was seen begin.
+    let restarted = match setup {
+        ProxySetup::Ready => return AllowOutcome::AlreadyAllowed,
+        ProxySetup::Pending if on_trial_with(&current, &wanted) => {
+            // Back on trial with our change (Retry after an Allow that gave
+            // up waiting): check and confirm it.
+            ws.close().await;
+            None
+        }
+        ProxySetup::Pending if pending_is(&current, &wanted) => {
+            // Our change, saved but not running yet: Home Assistant may be
+            // on its way down. Wait for it as after saving.
+            step(AllowStep::Restarting);
+            ws.close().await;
+            Some(false)
+        }
+        ProxySetup::Pending => return AllowOutcome::PendingByOther,
+        ProxySetup::Needed { config } => {
+            step(AllowStep::Saving);
+            match ws.command(json!({"type": "http/config/configure", "config": config})).await {
+                Ok(r) if r["restart"] == true => {}
+                Ok(_) => return Failed("Home Assistant did not take the new setting, so it did not restart. Nothing was changed.".into()),
+                Err(WsError::Command { code, .. }) if code == "not_running" => {
+                    return Failed("Home Assistant is still starting. Try again in a minute.".into());
+                }
+                Err(e) => return Failed(format!("Home Assistant did not take the new setting: {e}. Nothing was changed.")),
+            }
+            step(AllowStep::Restarting);
+            let closed = ws.wait_closed(timing.restart_begins).await;
+            ws.close().await;
+            Some(closed)
+        }
     };
 
-    step(AllowStep::Saving);
-    match ws.command(json!({"type": "http/config/configure", "config": config})).await {
-        Ok(r) if r["restart"] == true => {}
-        Ok(_) => return Failed("Home Assistant did not take the new setting, so it did not restart. Nothing was changed.".into()),
-        Err(WsError::Command { code, .. }) if code == "not_running" => {
-            return Failed("Home Assistant is still starting. Try again in a minute.".into());
-        }
-        Err(e) => return Failed(format!("Home Assistant did not take the new setting: {e}. Nothing was changed.")),
-    }
+    let (mut ws, trial) = match restarted {
+        None => match HaWebsocket::connect(sup, timing.call).await {
+            Ok(ws) => (ws, current),
+            Err(e) => return Failed(format!("Could not reach Home Assistant to confirm the setting: {e}. {REVERTS}")),
+        },
+        Some(seen_down) => match wait_for_trial(sup, timing, &wanted, seen_down, started).await {
+            Ok(back) => back,
+            Err(why) => return Failed(why),
+        },
+    };
+    let seen_back = tokio::time::Instant::now();
 
-    step(AllowStep::Restarting);
-    if !ws.wait_closed(timing.restart_begins).await {
+    // Confirm before Home Assistant's revert, or not at all.
+    let revert_at = revert_instant(&trial).unwrap_or(seen_back + timing.revert_after);
+    let left = revert_at.saturating_duration_since(tokio::time::Instant::now());
+    if left < timing.confirm_margin {
         ws.close().await;
         return Failed(format!(
-            "Home Assistant saved the setting but did not restart within {} seconds, so it was not confirmed. Restart Home Assistant, then confirm or discard the change in Settings → System → Network.",
-            timing.restart_begins.as_secs()
+            "Home Assistant came back with the new setting, but reverts it in {} seconds: too soon to check and confirm it safely, so it was not confirmed. It goes back to the previous setting by itself then; try again after that.",
+            left.as_secs()
         ));
     }
-
-    // Back up, on trial with the new setting. The old instance can still
-    // answer while it shuts down, which is why the active slot is checked
-    // rather than just "it answers".
-    let deadline = tokio::time::Instant::now() + timing.restart_ends;
-    let mut ws = loop {
-        if tokio::time::Instant::now() >= deadline {
-            return Failed(format!(
-                "Home Assistant did not come back with the new setting within {} minutes, so it was not confirmed. {REVERTS}",
-                timing.restart_ends.as_secs().div_ceil(60)
-            ));
-        }
-        if core_api_up(sup).await
-            && let Ok(mut ws) = HaWebsocket::connect(sup, timing.call).await
-        {
-            match ws.command(json!({"type": "http/config"})).await {
-                Ok(c) if c["active_config_type"] == "pending" && live_pending(&c).is_some() => break ws,
-                Ok(c) if c.pointer("/pending/error").is_some_and(|e| !e.is_null()) => {
-                    ws.close().await;
-                    let why = c.pointer("/pending/error_message").and_then(Value::as_str).unwrap_or_default();
-                    return Failed(format!(
-                        "Home Assistant could not use the new setting and went back to the previous one{}.",
-                        if why.is_empty() { String::new() } else { format!(": {why}") }
-                    ));
-                }
-                _ => ws.close().await,
-            }
-        }
-        tokio::time::sleep(timing.poll).await;
-    };
+    let verify_by = revert_at - timing.confirm_margin / 2;
 
     step(AllowStep::Verifying);
-    match verify().await {
-        Ok(400) => {
+    match tokio::time::timeout_at(verify_by, verify()).await {
+        Ok(Ok(400)) => {
             ws.close().await;
             return Failed(format!(
                 "A request sent the way Datum sends it still got 400: Bad Request, so the setting was not confirmed. {REVERTS}"
             ));
         }
-        Ok(_) => {}
-        Err(e) => {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
             ws.close().await;
             return Failed(format!("Could not check a request the way Datum sends it ({e}), so the setting was not confirmed. {REVERTS}"));
+        }
+        Err(_) => {
+            ws.close().await;
+            return Failed(format!(
+                "Checking a request the way Datum sends it did not finish before Home Assistant's own revert was due, so the setting was not confirmed. {REVERTS}"
+            ));
         }
     }
 
     step(AllowStep::Confirming);
-    let promoted = ws.command(json!({"type": "http/config/promote"})).await;
+    let promoted = tokio::time::timeout_at(revert_at, ws.command(json!({"type": "http/config/promote"}))).await;
     ws.close().await;
     match promoted {
-        Ok(_) => AllowOutcome::Allowed,
-        Err(e) => Failed(format!("Could not confirm the setting: {e}. {REVERTS}")),
+        Ok(Ok(_)) => AllowOutcome::Allowed,
+        Ok(Err(e)) => Failed(format!("Could not confirm the setting: {e}. {REVERTS}")),
+        Err(_) => Failed(format!("Home Assistant did not confirm the setting before its own revert was due. {REVERTS}")),
+    }
+}
+
+/// Waits for Home Assistant to be back on trial with `wanted`, and returns
+/// a connection to it and its `http/config`. `seen_down`: its restart was
+/// already seen begin (the websocket closed). `started`: when the setting
+/// was saved (or found saved).
+async fn wait_for_trial(
+    sup: &Supervisor,
+    timing: &AllowTiming,
+    wanted: &Value,
+    mut seen_down: bool,
+    started: tokio::time::Instant,
+) -> Result<(HaWebsocket, Value), String> {
+    let deadline = started + timing.restart_ends;
+    // Seen answering on the old setting, never down, for this long: it did
+    // not restart.
+    let no_restart_after = started + timing.restart_begins * 2;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "Home Assistant did not come back with the new setting within {} minutes, so it was not confirmed. If it comes back with it later, it goes back to the previous setting by itself 5 minutes after that.",
+                timing.restart_ends.as_secs().div_ceil(60)
+            ));
+        }
+        // The old instance can still answer while it shuts down, which is
+        // why the active slot is checked rather than just "it answers".
+        if !core_api_up(sup).await {
+            seen_down = true;
+        } else {
+            match HaWebsocket::connect(sup, timing.call).await {
+                Err(_) => seen_down = true,
+                Ok(mut ws) => match ws.command(json!({"type": "http/config"})).await {
+                    Ok(c) if on_trial_with(&c, wanted) => return Ok((ws, c)),
+                    Ok(c) if pending_is(&c, wanted) && c.pointer("/pending/error").is_some_and(|e| !e.is_null()) => {
+                        ws.close().await;
+                        let error = c.pointer("/pending/error").and_then(Value::as_str).unwrap_or_default();
+                        if error == "not_promoted" {
+                            return Err("Home Assistant went back to the previous setting before the add-on could confirm the new one (it reverts an unconfirmed setting 5 minutes after restarting with it). Nothing else was changed; try again.".into());
+                        }
+                        let why = c.pointer("/pending/error_message").and_then(Value::as_str).unwrap_or_default();
+                        return Err(format!(
+                            "Home Assistant could not use the new setting and went back to the previous one{}.",
+                            if why.is_empty() { String::new() } else { format!(": {why}") }
+                        ));
+                    }
+                    Ok(c) => {
+                        ws.close().await;
+                        if !pending_is(&c, wanted) {
+                            return Err("The new setting is no longer waiting in Home Assistant (it was confirmed, discarded or replaced in Settings → System → Network), so the add-on did not confirm it.".into());
+                        }
+                        if !seen_down && tokio::time::Instant::now() >= no_restart_after {
+                            return Err(
+                                "Home Assistant saved the setting but did not restart, so it was not confirmed. Restart Home Assistant, then confirm or discard the change in Settings → System → Network."
+                                    .into(),
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        ws.close().await;
+                        seen_down = true;
+                    }
+                },
+            }
+        }
+        tokio::time::sleep(timing.poll).await;
     }
 }
 
@@ -703,9 +854,19 @@ mod tests {
         stable: Value,
         pending: Option<Value>,
         active: &'static str,
-        /// API polls left that answer 502 after a restart began.
-        down_for: Option<u32>,
-        restart_polls: u32,
+        /// Down (the Supervisor answers 502) until then, after a restart
+        /// began.
+        down_until: Option<std::time::Instant>,
+        /// How long a restart takes.
+        restart_takes: Duration,
+        /// Whether configure's connection is closed as Home Assistant stops
+        /// (false: a relay that never passes the close on).
+        closes: bool,
+        /// Home Assistant's AUTO_REVERT_DELAY, from when it is back.
+        revert_after: Duration,
+        revert_due: Option<std::time::Instant>,
+        /// Whether a promote came in before the revert was due.
+        promoted_in_time: Option<bool>,
         /// Whether the restart takes the new config (or fails to apply it).
         apply_ok: bool,
         /// Whether configure restarts at all.
@@ -721,32 +882,70 @@ mod tests {
 
     impl FakeHa {
         fn new() -> Self {
-            Self { stable: stable(), active: "stable", restart_polls: 3, apply_ok: true, restarts: true, ..Default::default() }
+            Self {
+                stable: stable(),
+                active: "stable",
+                restart_takes: Duration::from_millis(60),
+                closes: true,
+                revert_after: Duration::from_secs(300),
+                apply_ok: true,
+                restarts: true,
+                ..Default::default()
+            }
         }
 
-        fn config(&self) -> Value {
-            json!({"stable": self.stable, "pending": self.pending, "revert_at": null,
+        /// What configure stores as pending.
+        fn stored(config: Value) -> Value {
+            let mut pending = config;
+            pending["created_at"] = json!("2026-10-07T12:00:00+00:00");
+            pending["error"] = Value::Null;
+            pending["error_message"] = Value::Null;
+            pending
+        }
+
+        /// Home Assistant as it is now: back from a restart once it has
+        /// taken long enough (on trial with the pending config, revert
+        /// scheduled from then), and reverted once that is due.
+        fn tick(&mut self) {
+            let now = std::time::Instant::now();
+            if self.down_until.is_some_and(|t| now >= t) {
+                self.down_until = None;
+                if self.apply_ok {
+                    self.active = "pending";
+                    // async_load_config: a pending start schedules the revert.
+                    self.revert_due = Some(now + self.revert_after);
+                } else if let Some(p) = self.pending.as_mut() {
+                    p["error"] = json!("apply_failed");
+                    p["error_message"] = json!("cannot bind");
+                }
+            }
+            if self.active == "pending" && self.revert_due.is_some_and(|t| now >= t) {
+                // _async_revert_to_stable (and its restart, instant here).
+                self.revert_due = None;
+                self.active = "stable";
+                if let Some(p) = self.pending.as_mut() {
+                    p["error"] = json!("not_promoted");
+                }
+            }
+        }
+
+        fn down(&mut self) -> bool {
+            self.tick();
+            self.down_until.is_some()
+        }
+
+        fn config(&mut self) -> Value {
+            self.tick();
+            let revert_at = self.revert_due.map(|t| {
+                let left = t.saturating_duration_since(std::time::Instant::now());
+                (chrono::Utc::now() + chrono::Duration::from_std(left).unwrap()).to_rfc3339()
+            });
+            json!({"stable": self.stable, "pending": self.pending, "revert_at": revert_at,
                    "active_config_type": self.active, "default": {}})
         }
 
         fn api_poll(&mut self) -> bool {
-            match self.down_for {
-                Some(0) => {
-                    self.down_for = None;
-                    if self.apply_ok {
-                        self.active = "pending";
-                    } else if let Some(p) = self.pending.as_mut() {
-                        p["error"] = json!("apply_failed");
-                        p["error_message"] = json!("cannot bind");
-                    }
-                    true
-                }
-                Some(n) => {
-                    self.down_for = Some(n - 1);
-                    false
-                }
-                None => true,
-            }
+            !self.down()
         }
 
         /// The reply, and whether to drop the connection after it.
@@ -764,25 +963,29 @@ mod tests {
                         return (err("invalid_format", &e), false);
                     }
                     self.configured.push(config.clone());
-                    let mut pending = config;
-                    pending["created_at"] = json!("2026-10-07T12:00:00+00:00");
-                    pending["error"] = Value::Null;
-                    pending["error_message"] = Value::Null;
-                    self.pending = Some(pending);
+                    self.pending = Some(Self::stored(config));
                     if !self.restarts {
                         return (ok(json!({"restart": true})), false);
                     }
-                    self.down_for = Some(self.restart_polls);
-                    (ok(json!({"restart": true})), true)
+                    self.down_until = Some(std::time::Instant::now() + self.restart_takes);
+                    (ok(json!({"restart": true})), self.closes)
                 }
-                "http/config/promote" => match self.pending.take() {
-                    Some(p) => {
-                        self.stable = p;
-                        self.active = "stable";
-                        (ok(Value::Null), false)
+                "http/config/promote" => {
+                    self.tick();
+                    match self.pending.take() {
+                        Some(p) if p["error"].is_null() => {
+                            self.promoted_in_time = Some(self.revert_due.is_none_or(|t| std::time::Instant::now() < t));
+                            self.stable = p;
+                            self.active = "stable";
+                            self.revert_due = None;
+                            (ok(Value::Null), false)
+                        }
+                        other => {
+                            self.pending = other;
+                            (err("not_allowed", "No pending HTTP config to promote"), false)
+                        }
                     }
-                    None => (err("not_allowed", "No pending HTTP config to promote"), false),
-                },
+                }
                 _ => (err("unknown_command", "Unknown command."), false),
             }
         }
@@ -836,7 +1039,7 @@ mod tests {
             let _ = sock.write_all(reply(if authed { 200 } else { 401 }, "[]").as_bytes()).await;
             return;
         }
-        if !line.starts_with("GET /core/websocket ") || fake.lock().unwrap().down_for.is_some() {
+        if !line.starts_with("GET /core/websocket ") || fake.lock().unwrap().down() {
             // What the Supervisor answers while Core restarts.
             let _ = sock.write_all(reply(502, "{}").as_bytes()).await;
             return;
@@ -873,6 +1076,8 @@ mod tests {
         AllowTiming {
             restart_begins: Duration::from_secs(5),
             restart_ends: Duration::from_secs(10),
+            confirm_margin: Duration::from_millis(500),
+            revert_after: Duration::from_secs(300),
             poll: Duration::from_millis(20),
             call: Duration::from_secs(5),
         }
@@ -942,13 +1147,168 @@ mod tests {
         assert!(!fake.lock().unwrap().commands.iter().any(|c| c == "http/config/promote"));
 
         let mut ha = FakeHa::new();
-        ha.restart_polls = u32::MAX;
+        ha.restart_takes = Duration::from_secs(3600);
         let (sup, fake) = serve(ha).await;
         let mut t = fast();
         t.restart_ends = Duration::from_millis(500);
         let outcome = allow_forwarded_requests(&sup, &t, |_| {}, || async { Ok(200) }).await;
         assert!(matches!(&outcome, AllowOutcome::Failed(w) if w.contains("did not come back")), "{outcome:?}");
         assert!(!fake.lock().unwrap().commands.iter().any(|c| c == "http/config/promote"));
+    }
+
+    /// Real timing scaled down 600 times (1 minute is 100 ms): the 90 s for
+    /// the restart to begin, 15 minutes for Home Assistant to come back,
+    /// its 5-minute revert, and a 45 s margin.
+    fn scaled() -> AllowTiming {
+        AllowTiming {
+            restart_begins: Duration::from_millis(150),
+            restart_ends: Duration::from_millis(1500),
+            confirm_margin: Duration::from_millis(75),
+            revert_after: Duration::from_millis(500),
+            poll: Duration::from_millis(5),
+            call: Duration::from_secs(5),
+        }
+    }
+
+    /// Seen on a Home Assistant Green: Allow started 13:31:04 and gave up
+    /// at 13:35:05, four minutes on, while Home Assistant was still
+    /// restarting; it came back on the new setting later. Its revert clock
+    /// starts when it is back, so a restart of 6 to 10 minutes is waited
+    /// for, and the setting confirmed well before the revert.
+    #[tokio::test]
+    async fn a_slow_restart_is_waited_for_and_confirmed_before_the_revert() {
+        for minutes in [6u64, 8, 10] {
+            let mut ha = FakeHa::new();
+            ha.revert_after = scaled().revert_after;
+            ha.restart_takes = Duration::from_millis(minutes * 100);
+            let (sup, fake) = serve(ha).await;
+            let outcome = allow_forwarded_requests(&sup, &scaled(), |_| {}, || async { Ok(200) }).await;
+            assert_eq!(outcome, AllowOutcome::Allowed, "{minutes} minutes");
+            let f = fake.lock().unwrap();
+            assert_eq!(f.promoted_in_time, Some(true), "{minutes} minutes");
+            assert!(accepts_forwarded(&f.stable));
+        }
+
+        // 0.3.5's four-minute limit gave up on the same restart.
+        let mut ha = FakeHa::new();
+        ha.revert_after = scaled().revert_after;
+        ha.restart_takes = Duration::from_millis(800);
+        let (sup, fake) = serve(ha).await;
+        let mut t = scaled();
+        t.restart_ends = Duration::from_millis(400);
+        let outcome = allow_forwarded_requests(&sup, &t, |_| {}, || async { Ok(200) }).await;
+        let AllowOutcome::Failed(why) = outcome else { panic!("{outcome:?}") };
+        assert!(why.contains("did not come back") && why.contains("5 minutes after that"), "{why}");
+        assert!(!fake.lock().unwrap().commands.iter().any(|c| c == "http/config/promote"));
+    }
+
+    /// The close of configure's connection never arrives (the relay missed
+    /// it), and Home Assistant is already back on trial at the first look:
+    /// carry on, without saving again.
+    #[tokio::test]
+    async fn back_on_trial_at_the_first_look_carries_on() {
+        let mut ha = FakeHa::new();
+        ha.closes = false;
+        ha.revert_after = scaled().revert_after;
+        ha.restart_takes = Duration::from_millis(50);
+        let (sup, fake) = serve(ha).await;
+        let mut steps = Vec::new();
+        let outcome = allow_forwarded_requests(&sup, &scaled(), |s| steps.push(s), || async { Ok(200) }).await;
+        assert_eq!(outcome, AllowOutcome::Allowed);
+        assert_eq!(steps, [AllowStep::Saving, AllowStep::Restarting, AllowStep::Verifying, AllowStep::Confirming]);
+        let f = fake.lock().unwrap();
+        assert_eq!(f.configured.len(), 1, "saved once");
+        assert_eq!(f.promoted_in_time, Some(true));
+    }
+
+    /// Retry after an Allow that gave up: Home Assistant is on trial with
+    /// Allow's own change. It is checked and confirmed, not refused as
+    /// someone else's, and not saved again.
+    #[tokio::test]
+    async fn our_own_change_on_trial_is_confirmed_on_retry() {
+        let mut ha = FakeHa::new();
+        ha.pending = Some(FakeHa::stored(merged(&stable()).unwrap()));
+        ha.active = "pending";
+        ha.revert_due = Some(std::time::Instant::now() + Duration::from_secs(120));
+        let (sup, fake) = serve(ha).await;
+        let mut steps = Vec::new();
+        let outcome = allow_forwarded_requests(&sup, &scaled(), |s| steps.push(s), || async { Ok(200) }).await;
+        assert_eq!(outcome, AllowOutcome::Allowed);
+        assert_eq!(steps, [AllowStep::Verifying, AllowStep::Confirming]);
+        let f = fake.lock().unwrap();
+        assert!(f.configured.is_empty());
+        assert_eq!(f.commands, ["http/config", "http/config/promote"]);
+        assert!(accepts_forwarded(&f.stable));
+
+        // Saved but Home Assistant not on it yet (still going down): wait
+        // for it, then confirm.
+        let mut ha = FakeHa::new();
+        ha.pending = Some(FakeHa::stored(merged(&stable()).unwrap()));
+        ha.revert_after = scaled().revert_after;
+        // It answers at first (the old instance), then goes down.
+        let (sup, fake) = serve(ha).await;
+        let restart = {
+            let fake = fake.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                fake.lock().unwrap().down_until = Some(std::time::Instant::now() + Duration::from_millis(100));
+            })
+        };
+        let outcome = allow_forwarded_requests(&sup, &scaled(), |_| {}, || async { Ok(200) }).await;
+        restart.await.unwrap();
+        assert_eq!(outcome, AllowOutcome::Allowed);
+        assert!(fake.lock().unwrap().configured.is_empty());
+    }
+
+    /// Too little time left before Home Assistant's revert to check and
+    /// confirm safely: stop, and say so; nothing is promoted.
+    #[tokio::test]
+    async fn too_close_to_the_revert_is_not_confirmed() {
+        let mut ha = FakeHa::new();
+        ha.revert_after = Duration::from_millis(40);
+        ha.restart_takes = Duration::from_millis(30);
+        let (sup, fake) = serve(ha).await;
+        let mut steps = Vec::new();
+        let outcome = allow_forwarded_requests(&sup, &scaled(), |s| steps.push(s), || async { Ok(200) }).await;
+        let AllowOutcome::Failed(why) = outcome else { panic!("{outcome:?}") };
+        assert!(why.contains("too soon to check and confirm"), "{why}");
+        assert!(!steps.contains(&AllowStep::Verifying));
+        assert!(!fake.lock().unwrap().commands.iter().any(|c| c == "http/config/promote"));
+
+        // A check that would run past the revert is cut short.
+        let mut ha = FakeHa::new();
+        ha.revert_after = Duration::from_millis(300);
+        ha.restart_takes = Duration::from_millis(30);
+        let (sup, fake) = serve(ha).await;
+        let outcome = allow_forwarded_requests(&sup, &scaled(), |_| {}, || async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(200)
+        })
+        .await;
+        let AllowOutcome::Failed(why) = outcome else { panic!("{outcome:?}") };
+        assert!(why.contains("did not finish before Home Assistant's own revert"), "{why}");
+        assert!(!fake.lock().unwrap().commands.iter().any(|c| c == "http/config/promote"));
+
+        // Already reverted by the time it is seen back: say that.
+        let mut ha = FakeHa::new();
+        ha.revert_after = Duration::ZERO;
+        ha.restart_takes = Duration::from_millis(30);
+        let (sup, _) = serve(ha).await;
+        let outcome = allow_forwarded_requests(&sup, &scaled(), |_| {}, || async { Ok(200) }).await;
+        let AllowOutcome::Failed(why) = outcome else { panic!("{outcome:?}") };
+        assert!(why.contains("went back to the previous setting before the add-on could confirm"), "{why}");
+    }
+
+    #[test]
+    fn revert_at_is_read_as_home_assistant_writes_it() {
+        let soon = (chrono::Utc::now() + chrono::Duration::seconds(120)).format("%Y-%m-%dT%H:%M:%S%.6f+00:00").to_string();
+        let at = revert_instant(&json!({"revert_at": soon})).unwrap();
+        let left = at.saturating_duration_since(tokio::time::Instant::now());
+        assert!(left > Duration::from_secs(115) && left <= Duration::from_secs(120), "{left:?}");
+        let past = revert_instant(&json!({"revert_at": "2020-01-01T00:00:00+00:00"})).unwrap();
+        assert!(past <= tokio::time::Instant::now());
+        assert_eq!(revert_instant(&json!({"revert_at": null})), None);
+        assert_eq!(revert_instant(&json!({"revert_at": "soon"})), None);
     }
 
     /// Someone's change waits in Settings → System → Network: untouched.
