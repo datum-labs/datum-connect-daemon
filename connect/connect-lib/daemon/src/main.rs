@@ -181,10 +181,25 @@ fn needs_repoint(has_inspector: bool, persisted: Option<&str>, wanted: &str) -> 
     !has_inspector || persisted.map(|p| p.trim_end_matches('/')) != Some(wanted.trim_end_matches('/'))
 }
 
+/// The port of an inspector endpoint this daemon wrote to a tunnel's
+/// HTTPProxy (`http://127.0.0.1:<port>`), so a restart can try to bind the
+/// same one. `None` for anything else, including a tunnel that points
+/// straight at its real target.
+fn inspector_port(endpoint: &str) -> Option<u16> {
+    let uri: axum::http::Uri = endpoint.parse().ok()?;
+    (uri.scheme_str() == Some("http") && uri.host() == Some("127.0.0.1"))
+        .then(|| uri.port_u16())
+        .flatten()
+}
+
 /// Starts an inspector forwarding to `target`, returning it with the
 /// endpoint the tunnel's HTTPProxy should point at instead of the target.
-async fn spawn_inspector(target: &RealTarget) -> n0_error::Result<(InspectorHandle, String)> {
-    let handle = inspector::start(target.uri.clone()).await?;
+/// `preferred_port` is tried first; see `inspector::start_at`.
+async fn spawn_inspector(
+    target: &RealTarget,
+    preferred_port: Option<u16>,
+) -> n0_error::Result<(InspectorHandle, String)> {
+    let handle = inspector::start_at(target.uri.clone(), preferred_port).await?;
     let endpoint = format!("http://{}", handle.local_addr);
     Ok((handle, endpoint))
 }
@@ -934,6 +949,35 @@ mod start_request_tests {
         assert!(!needs_repoint(true, Some("http://127.0.0.1:80/"), want));
     }
 
+    #[test]
+    fn inspector_port_reads_only_loopback_inspector_endpoints() {
+        assert_eq!(inspector_port("http://127.0.0.1:34149"), Some(34149));
+        assert_eq!(inspector_port("http://127.0.0.1:34149/"), Some(34149));
+        assert_eq!(inspector_port("http://127.0.0.1"), None);
+        assert_eq!(inspector_port("https://127.0.0.1:34149"), None);
+        assert_eq!(inspector_port("http://192.168.0.17:8123"), None);
+        assert_eq!(inspector_port("not a url"), None);
+    }
+
+    /// A restart gets its old port back when nothing else holds it, which is
+    /// what keeps the HTTPProxy unchanged; when something does, it still
+    /// starts, on another port.
+    #[tokio::test]
+    async fn spawn_inspector_reuses_a_free_preferred_port_and_falls_back_when_taken() {
+        let target = parse_real_target("127.0.0.1:80").unwrap();
+        let (first, first_endpoint) = spawn_inspector(&target, None).await.unwrap();
+        let port = first.local_addr.port();
+
+        let (_holder, taken) = spawn_inspector(&target, Some(port)).await.unwrap();
+        assert_ne!(taken, first_endpoint, "a held port must not be shared");
+
+        drop(first);
+        tokio::task::yield_now().await;
+        let (again, endpoint) = spawn_inspector(&target, Some(port)).await.unwrap();
+        assert_eq!(again.local_addr.port(), port);
+        assert_eq!(endpoint, first_endpoint);
+    }
+
     /// The installed inspector must be the one handed in, and its target
     /// must be on disk where the restart reconciliation looks for it.
     #[tokio::test]
@@ -942,11 +986,11 @@ mod start_request_tests {
         let inspectors = Mutex::new(HashMap::new());
 
         let first = parse_real_target("http://127.0.0.1:8123").unwrap();
-        let (handle, _) = spawn_inspector(&first).await.unwrap();
+        let (handle, _) = spawn_inspector(&first, None).await.unwrap();
         install_inspector(&dir, &inspectors, "tunnel-a", &first.normalized, handle).await;
 
         let second = parse_real_target("127.0.0.1:80").unwrap();
-        let (handle, endpoint) = spawn_inspector(&second).await.unwrap();
+        let (handle, endpoint) = spawn_inspector(&second, None).await.unwrap();
         let addr = handle.local_addr;
         install_inspector(&dir, &inspectors, "tunnel-a", &second.normalized, handle).await;
 
@@ -1116,7 +1160,7 @@ async fn create_tunnel(
     let target = parse_real_target(&req.endpoint)
         .map_err(|e| err_response(format!("invalid endpoint '{}': {e}", req.endpoint)))?;
 
-    let (handle, inspector_endpoint) = spawn_inspector(&target).await.map_err(err_response)?;
+    let (handle, inspector_endpoint) = spawn_inspector(&target, None).await.map_err(err_response)?;
 
     // This makes a Connector for `control`'s throwaway key, which never goes
     // Ready. The tunnel's first start replaces it with one for the tunnel's
@@ -1349,16 +1393,16 @@ async fn start_tunnel_internal(
         let Some(t) = repoint else {
             return Ok(tunnel);
         };
-        let (handle, endpoint) = spawn_inspector(t).await.map_err(err_response)?;
+        let (handle, endpoint) = spawn_inspector(t, None).await.map_err(err_response)?;
         let updated = service.retarget_active(id, &endpoint).await.map_err(err_response)?;
         install_inspector(&state.connect_dir, &state.inspectors, id, &t.normalized, handle).await;
-        tracing::info!(tunnel = %id, target = %t.normalized, "repointed running tunnel at a new inspector");
+        tracing::info!(tunnel = %id, target = %t.normalized, inspector = %endpoint, "repointed running tunnel at a new inspector");
         auth::append_audit(&state.connect_dir, &state.audit_lock, "retarget", id, actor_label).await;
         return Ok(updated);
     }
 
     let inspector = match repoint {
-        Some(t) => Some((t, spawn_inspector(t).await.map_err(err_response)?)),
+        Some(t) => Some((t, spawn_inspector(t, None).await.map_err(err_response)?)),
         None => None,
     };
     let endpoint = match &inspector {
@@ -1412,7 +1456,7 @@ async fn start_tunnel_internal(
     }
     if let Some((t, (handle, _))) = inspector {
         install_inspector(&state.connect_dir, &state.inspectors, id, &t.normalized, handle).await;
-        tracing::info!(tunnel = %id, target = %t.normalized, "pointed tunnel at a new inspector");
+        tracing::info!(tunnel = %id, target = %t.normalized, inspector = %endpoint, "pointed tunnel at a new inspector");
         auth::append_audit(&state.connect_dir, &state.audit_lock, "retarget", id, actor_label).await;
     }
 
@@ -2229,18 +2273,27 @@ async fn run() -> n0_error::Result<()> {
                 };
                 let was_enabled = t.enabled;
                 let tunnel_id = t.id.clone();
-                match spawn_inspector(&real_target).await {
+                // Rebind the port the HTTPProxy already points at. Getting it
+                // back means the proxy needs no change, and the edge serves
+                // "Service offline" for minutes after a change while it rolls
+                // the new endpoint out.
+                let previous_port = inspector_port(&t.endpoint);
+                match spawn_inspector(&real_target, previous_port).await {
                     Ok((handle, inspector_endpoint)) => {
-                        // Endpoint only: `update_active` here made a new
-                        // Connector for `control`'s fresh key on every
-                        // restart, pointed the tunnel at it until the
-                        // auto-resume below pointed it back, and left it
-                        // behind, never Ready.
-                        if let Err(e) = state.control.retarget_active(&t.id, &inspector_endpoint).await {
-                            tracing::warn!(tunnel = %t.id, "failed to repoint tunnel at reconciled inspector: {e:#}");
-                            continue;
+                        if inspector_endpoint == t.endpoint.trim_end_matches('/') {
+                            tracing::info!(tunnel = %t.id, %target, inspector = %inspector_endpoint, "reconciled inspector after restart on its previous port; HTTPProxy unchanged");
+                        } else {
+                            // Endpoint only: `update_active` here made a new
+                            // Connector for `control`'s fresh key on every
+                            // restart, pointed the tunnel at it until the
+                            // auto-resume below pointed it back, and left it
+                            // behind, never Ready.
+                            if let Err(e) = state.control.retarget_active(&t.id, &inspector_endpoint).await {
+                                tracing::warn!(tunnel = %t.id, "failed to repoint tunnel at reconciled inspector: {e:#}");
+                                continue;
+                            }
+                            tracing::info!(tunnel = %t.id, %target, inspector = %inspector_endpoint, previous = %t.endpoint, "reconciled inspector after restart on a new port; HTTPProxy repointed, the edge may serve 'Service offline' until it picks that up");
                         }
-                        tracing::info!(tunnel = %t.id, %target, "reconciled inspector after restart");
                         install_inspector(&state.connect_dir, &state.inspectors, &t.id, &real_target.normalized, handle)
                             .await;
 

@@ -662,10 +662,27 @@ mod tests {
 
 /// Starts a new inspector bound to an OS-assigned loopback port, forwarding
 /// to `real_target`. Returns immediately once the listener is bound.
+#[cfg(test)]
 pub async fn start(real_target: Uri) -> n0_error::Result<InspectorHandle> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|e| n0_error::anyerr!("inspector: failed to bind local port: {e}"))?;
+    start_at(real_target, None).await
+}
+
+/// Like `start`, but binds `preferred_port` on loopback when it's free and
+/// falls back to an OS-assigned port when it isn't. A restart that gets its
+/// old port back leaves the tunnel's HTTPProxy untouched, so the edge has no
+/// new config to roll out before traffic flows again. Callers compare
+/// `local_addr` with what they asked for to tell which happened.
+pub async fn start_at(real_target: Uri, preferred_port: Option<u16>) -> n0_error::Result<InspectorHandle> {
+    let preferred = match preferred_port {
+        Some(port) => TcpListener::bind(("127.0.0.1", port)).await.ok(),
+        None => None,
+    };
+    let listener = match preferred {
+        Some(l) => l,
+        None => TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| n0_error::anyerr!("inspector: failed to bind local port: {e}"))?,
+    };
     let local_addr = listener
         .local_addr()
         .map_err(|e| n0_error::anyerr!("inspector: failed to read local addr: {e}"))?;

@@ -986,7 +986,7 @@ mod tests {
         }
         // The address the check uses is the tunnel's hop's real target.
         let target = crate::parse_real_target(&format!("http://{ha}")).unwrap();
-        let (handle, _) = crate::spawn_inspector(&target).await.unwrap();
+        let (handle, _) = crate::spawn_inspector(&target, None).await.unwrap();
         let target = target_addr(handle.real_target()).unwrap();
         assert_eq!(target, ha);
         assert_eq!(verify_forwarded(target).await, Ok(400));
