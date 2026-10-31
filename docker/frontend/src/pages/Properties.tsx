@@ -1,6 +1,6 @@
 import React from 'react';
 import { useQuery } from 'react-query';
-import { Link } from 'react-router-dom';
+import { Link } from 'react-router';
 import { api } from '../services/api';
 
 export const Properties: React.FC = () => {
