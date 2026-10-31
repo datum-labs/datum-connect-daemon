@@ -43,7 +43,7 @@ jobs:
       image: rust:1-bookworm
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install build dependencies
         # aws-lc-sys needs cmake and a C toolchain; binutils gives us objdump
@@ -118,7 +118,7 @@ jobs:
       IMAGE: ghcr.io/datum-labs/aarch64-addon-datum-connect
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Fetch the daemon binary
         uses: actions/download-artifact@v4
