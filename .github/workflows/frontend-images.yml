@@ -1,0 +1,36 @@
+name: Build frontend images
+
+on:
+  pull_request:
+    paths:
+      - 'docker/frontend/**'
+      - 'docker/build-deploy/frontend.Dockerfile'
+      - 'docker/build-deploy/nginx.conf'
+      - '.github/workflows/frontend-images.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'docker/frontend/**'
+      - 'docker/build-deploy/frontend.Dockerfile'
+      - 'docker/build-deploy/nginx.conf'
+      - '.github/workflows/frontend-images.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: frontend images
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build production image
+        run: docker build -f docker/build-deploy/frontend.Dockerfile -t frontend-prod docker
+
+      - name: Build dev image
+        run: docker build -t frontend-dev docker/frontend
+
+      - name: Compile the app in the dev image
+        run: docker run --rm --entrypoint npm frontend-dev run build
