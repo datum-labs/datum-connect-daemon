@@ -19,5 +19,5 @@ inquire = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
 iroh = { version = "0.95", default-features = false }
 rand = { workspace = true }
-hickory-resolver = "0.25"
+hickory-resolver = "0.26"
 url = { workspace = true }
