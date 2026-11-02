@@ -13,7 +13,9 @@ jobs:
     uses: datum-cloud/actions/.github/workflows/ci-basic.yaml@v1.26.0
     with:
       path: connect/connect-plugin
+      skip: test
       run: |
+        go test ./internal/daemon/... ./internal/env/... ./internal/pidfile/... ./internal/state/... ./internal/svcconfig/...
         cd ../connect-lib
         cargo build --locked
         cargo test --locked
