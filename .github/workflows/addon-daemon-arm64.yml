@@ -93,7 +93,7 @@ jobs:
           bash ./connect/scripts/check-glibc-max.sh "$BIN" "$TARGET_GLIBC"
 
       - name: Upload the binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: datum-connect-daemon-linux-arm64
           path: connect/connect-lib/target/release/datum-connect-daemon
@@ -121,7 +121,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Fetch the daemon binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: datum-connect-daemon-linux-arm64
           path: ${{ env.ADDON_DIR }}/bin
