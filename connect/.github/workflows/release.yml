@@ -58,7 +58,7 @@ jobs:
             /tmp/rust-bin/datum-connect-${{ matrix.name }}
         shell: bash
       - name: Upload Rust binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rust-${{ matrix.name }}
           path: /tmp/rust-bin/datum-connect-${{ matrix.name }}
@@ -79,7 +79,7 @@ jobs:
         with:
           go-version-file: connect-plugin/go.mod
       - name: Download all Rust binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: /tmp/rust-artifacts
       - name: Stage Rust binaries for goreleaser
