@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { useQuery, useMutation, useQueryClient } from 'react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'react-toastify';
 import { api } from '../services/api';
 
@@ -17,30 +17,31 @@ export const DocumentUpload: React.FC = () => {
   const [documentType, setDocumentType] = useState('');
   const queryClient = useQueryClient();
 
-  const { data: documents, isLoading } = useQuery('myDocuments', async () => {
-    const response = await api.get('/documents/my-documents');
-    return response.data;
+  const { data: documents, isLoading } = useQuery({
+    queryKey: ['myDocuments'],
+    queryFn: async () => {
+      const response = await api.get('/documents/my-documents');
+      return response.data;
+    },
   });
 
-  const uploadMutation = useMutation(
-    async (formData: FormData) => {
+  const uploadMutation = useMutation({
+    mutationFn: async (formData: FormData) => {
       const response = await api.post('/documents/upload', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
       return response.data;
     },
-    {
-      onSuccess: () => {
-        toast.success('Document uploaded successfully!');
-        queryClient.invalidateQueries('myDocuments');
-        setSelectedFile(null);
-        setDocumentType('');
-      },
-      onError: (error: any) => {
-        toast.error(error.response?.data?.error || 'Upload failed');
-      },
-    }
-  );
+    onSuccess: () => {
+      toast.success('Document uploaded successfully!');
+      queryClient.invalidateQueries({ queryKey: ['myDocuments'] });
+      setSelectedFile(null);
+      setDocumentType('');
+    },
+    onError: (error: any) => {
+      toast.error(error.response?.data?.error || 'Upload failed');
+    },
+  });
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files?.[0]) setSelectedFile(e.target.files[0]);
@@ -118,10 +119,10 @@ export const DocumentUpload: React.FC = () => {
 
           <button
             onClick={handleUpload}
-            disabled={uploadMutation.isLoading || !selectedFile || !documentType}
+            disabled={uploadMutation.isPending || !selectedFile || !documentType}
             className="btn-datum-primary text-sm px-6 py-2.5 disabled:opacity-40"
           >
-            {uploadMutation.isLoading ? 'Uploading…' : 'Upload document'}
+            {uploadMutation.isPending ? 'Uploading…' : 'Upload document'}
           </button>
         </div>
       </div>

@@ -1,12 +1,15 @@
 import React from 'react';
-import { useQuery } from 'react-query';
+import { useQuery } from '@tanstack/react-query';
 import { Link } from 'react-router';
 import { api } from '../services/api';
 
 export const Properties: React.FC = () => {
-  const { data, isLoading, error } = useQuery('properties', async () => {
-    const response = await api.get('/properties');
-    return response.data;
+  const { data, isLoading, error } = useQuery({
+    queryKey: ['properties'],
+    queryFn: async () => {
+      const response = await api.get('/properties');
+      return response.data;
+    },
   });
 
   if (isLoading) {

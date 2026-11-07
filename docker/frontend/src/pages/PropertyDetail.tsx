@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useParams } from 'react-router';
-import { useQuery, useMutation, useQueryClient } from 'react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'react-toastify';
 import { api } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
@@ -12,49 +12,47 @@ export const PropertyDetail: React.FC = () => {
   const [selectedSlot, setSelectedSlot] = useState<string>('');
   const [notes, setNotes] = useState('');
 
-  const { data: property, isLoading: propertyLoading } = useQuery(
-    ['property', id],
-    async () => {
+  const { data: property, isLoading: propertyLoading } = useQuery({
+    queryKey: ['property', id],
+    queryFn: async () => {
       const response = await api.get(`/properties/${id}`);
       return response.data;
-    }
-  );
+    },
+  });
 
-  const { data: slots, isLoading: slotsLoading } = useQuery(
-    ['viewingSlots', id],
-    async () => {
+  const { data: slots, isLoading: slotsLoading } = useQuery({
+    queryKey: ['viewingSlots', id],
+    queryFn: async () => {
       const response = await api.get(`/bookings/slots/property/${id}`);
       return response.data;
-    }
-  );
+    },
+  });
 
-  const { data: verificationStatus } = useQuery(
-    'verificationStatus',
-    async () => {
+  const { data: verificationStatus } = useQuery({
+    queryKey: ['verificationStatus'],
+    queryFn: async () => {
       if (!user || user.role !== 'buyer') return null;
       const response = await api.get('/documents/verification-status');
       return response.data;
     },
-    { enabled: !!user && user.role === 'buyer' }
-  );
+    enabled: !!user && user.role === 'buyer',
+  });
 
-  const bookingMutation = useMutation(
-    async (data: { viewingSlotId: string; notes?: string }) => {
+  const bookingMutation = useMutation({
+    mutationFn: async (data: { viewingSlotId: string; notes?: string }) => {
       const response = await api.post('/bookings/book', data);
       return response.data;
     },
-    {
-      onSuccess: () => {
-        toast.success('Viewing booked!');
-        queryClient.invalidateQueries(['viewingSlots', id]);
-        setSelectedSlot('');
-        setNotes('');
-      },
-      onError: (error: any) => {
-        toast.error(error.response?.data?.error || 'Booking failed');
-      },
-    }
-  );
+    onSuccess: () => {
+      toast.success('Viewing booked!');
+      queryClient.invalidateQueries({ queryKey: ['viewingSlots', id] });
+      setSelectedSlot('');
+      setNotes('');
+    },
+    onError: (error: any) => {
+      toast.error(error.response?.data?.error || 'Booking failed');
+    },
+  });
 
   const handleBooking = () => {
     if (!selectedSlot) {
@@ -209,10 +207,10 @@ export const PropertyDetail: React.FC = () => {
                 />
                 <button
                   onClick={handleBooking}
-                  disabled={bookingMutation.isLoading}
+                  disabled={bookingMutation.isPending}
                   className="btn-datum-primary text-sm px-6 py-2.5 disabled:opacity-50"
                 >
-                  {bookingMutation.isLoading ? 'Booking…' : 'Confirm booking'}
+                  {bookingMutation.isPending ? 'Booking…' : 'Confirm booking'}
                 </button>
               </div>
             )}
