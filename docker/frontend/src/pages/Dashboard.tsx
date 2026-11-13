@@ -1,19 +1,19 @@
 import React from 'react';
-import { useQuery } from 'react-query';
+import { useQuery } from '@tanstack/react-query';
 import { api } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
 
 export const Dashboard: React.FC = () => {
   const { user } = useAuth();
 
-  const { data: bookings } = useQuery(
-    'myBookings',
-    async () => {
+  const { data: bookings } = useQuery({
+    queryKey: ['myBookings'],
+    queryFn: async () => {
       const response = await api.get('/bookings/my-bookings');
       return response.data;
     },
-    { enabled: user?.role === 'buyer' }
-  );
+    enabled: user?.role === 'buyer',
+  });
 
   const downloadICS = async (bookingId: string) => {
     try {
