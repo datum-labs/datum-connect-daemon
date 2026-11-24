@@ -1963,7 +1963,7 @@ fn proxy_rule(endpoint: &str, connector_name: &str) -> HTTPProxyRule {
         matches: vec![default_match()],
         filters: None,
         backends: Some(vec![HTTPProxyRuleBackend {
-            endpoint: endpoint.to_string(),
+            endpoint: Some(endpoint.to_string()),
             connector: Some(ConnectorReference {
                 name: connector_name.to_string(),
             }),
@@ -2027,7 +2027,7 @@ fn proxy_backend_endpoint(proxy: &HTTPProxy) -> Option<String> {
         .rules
         .iter()
         .find_map(|rule| rule.backends.as_ref().and_then(|b| b.first()))
-        .map(|backend| backend.endpoint.clone())
+        .and_then(|backend| backend.endpoint.clone())
 }
 
 fn advertisement_spec(connector_name: &str, target: ParsedTarget) -> ConnectorAdvertisementSpec {
@@ -2768,6 +2768,46 @@ mod tests {
         assert_eq!(proxy_connector_name(&proxy).as_deref(), Some(CONN));
     }
 
+    /// A Compute HTTPProxy in the same project points at a `networkService`
+    /// and has no `endpoint`. It must still deserialize: one unparseable
+    /// proxy fails the whole list, and the add-on exits on startup.
+    #[test]
+    fn network_service_backend_deserializes_without_endpoint() {
+        let list: kube::core::ObjectList<HTTPProxy> = serde_json::from_value(json!({
+            "apiVersion": "networking.datumapis.com/v1alpha",
+            "kind": "HTTPProxyList",
+            "metadata": {},
+            "items": [{
+                "apiVersion": "networking.datumapis.com/v1alpha",
+                "kind": "HTTPProxy",
+                "metadata": { "name": "header-echo", "namespace": "default" },
+                "spec": { "rules": [{
+                    "name": "catch-all",
+                    "matches": [{ "path": { "type": "PathPrefix", "value": "/" } }],
+                    "backends": [{
+                        "networkService": { "name": "header-echo", "port": "http" },
+                        "weight": 1
+                    }],
+                    "timeouts": { "request": "1h" }
+                }]}
+            }]
+        }))
+        .expect("a networkService backend must not fail the list");
+
+        let proxy = &list.items[0];
+        assert_eq!(proxy_backend_endpoint(proxy), None);
+        assert_eq!(proxy_connector_name(proxy), None);
+    }
+
+    #[test]
+    fn tunnel_backend_round_trips_endpoint() {
+        let rule = proxy_rule(EP, CONN);
+        let value = serde_json::to_value(&rule).unwrap();
+        assert_eq!(value["backends"][0]["endpoint"], EP);
+        let back: HTTPProxyRule = serde_json::from_value(value).unwrap();
+        assert_eq!(back.backends.unwrap()[0].endpoint.as_deref(), Some(EP));
+    }
+
     fn target(host: &str, port: u16) -> ParsedTarget {
         ParsedTarget {
             address: host.to_string(),
@@ -2832,7 +2872,7 @@ mod tests {
         // Both backend rules move to the new endpoint, on the same connector.
         for rule in rules.iter().filter(|r| r.backends.is_some()) {
             let backend = &rule.backends.as_ref().unwrap()[0];
-            assert_eq!(backend.endpoint, "http://127.0.0.1:41795");
+            assert_eq!(backend.endpoint.as_deref(), Some("http://127.0.0.1:41795"));
             assert_eq!(backend.connector.as_ref().unwrap().name, CONN);
         }
     }

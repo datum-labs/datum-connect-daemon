@@ -113,7 +113,11 @@ pub struct ConnectorReference {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HTTPProxyRuleBackend {
-    pub endpoint: String,
+    /// Set on tunnel backends. Other backends (e.g. a Compute
+    /// `networkService`) have no endpoint, and must still deserialize so
+    /// one of them doesn't fail listing every proxy in the project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     pub connector: Option<ConnectorReference>,
     pub filters: Option<Vec<HTTPRouteRulesFilters>>,
 }
