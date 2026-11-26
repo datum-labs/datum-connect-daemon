@@ -271,7 +271,7 @@ impl AdvertismentTicket {
     /// consumers of this crate don't need `iroh-tickets` as a direct
     /// dependency just to print a ticket.
     pub fn to_ticket_string(&self) -> String {
-        Ticket::serialize(self)
+        self.encode_string()
     }
 }
 
@@ -279,18 +279,18 @@ impl FromStr for AdvertismentTicket {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        iroh_tickets::Ticket::deserialize(s)
+        Self::decode_string(s)
     }
 }
 
 impl Ticket for AdvertismentTicket {
     const KIND: &'static str = "datum";
 
-    fn to_bytes(&self) -> Vec<u8> {
+    fn encode_bytes(&self) -> Vec<u8> {
         postcard::to_allocvec(&self).expect("serialize should work")
     }
 
-    fn from_bytes(bytes: &[u8]) -> Result<Self, iroh_tickets::ParseError> {
+    fn decode_bytes(bytes: &[u8]) -> Result<Self, iroh_tickets::ParseError> {
         let ticket: Self = postcard::from_bytes(bytes)?;
         Ok(ticket)
     }

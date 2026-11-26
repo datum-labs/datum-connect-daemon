@@ -123,7 +123,7 @@ async fn resolve_listen_key(
                  The hostname will stay the same but the old connector will be replaced."
             );
             let _ = std::io::stderr().flush();
-            let new_key = SecretKey::generate(&mut rand::rng());
+            let new_key = SecretKey::generate();
             Ok((new_key, true))
         }
         Err(e) => Err(e),
@@ -369,7 +369,7 @@ async fn run() -> n0_error::Result<()> {
             let endpoint: String = match (endpoint, id) {
                 (Some(ep), None) => {
                     // --endpoint only: generate key in memory, use new_with_key()
-                    let secret_key = SecretKey::generate(&mut rand::rng());
+                    let secret_key = SecretKey::generate();
                     in_memory_key = Some(secret_key.clone());
                     ListenNode::new_with_key(repo.clone(), secret_key).await?;
                     // No existing tunnel — preresolved_ns stays None so

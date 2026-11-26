@@ -29,8 +29,6 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::Json;
 use connect_lib::{Advertisment, AdvertismentTicket, ConnectNode, ListenNode, OutboundProxyHandle, ProxyState, Repo, TcpProxyData};
-use iroh::endpoint::ConnectionType;
-use iroh::Watcher as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{Mutex, OnceCell, RwLock};
@@ -321,8 +319,7 @@ async fn watch_connection_transitions(
             return; // disconnected — stop watching
         }
         let Some(node) = state.peer.connect_node_if_present() else { continue };
-        let Some(mut watcher) = node.endpoint().conn_type(remote_id) else { continue };
-        let current = watcher.get();
+        let Some(current) = current_conn_type(node.endpoint(), remote_id).await else { continue };
         if let Some(prev) = &last {
             if *prev != current {
                 transitions.fetch_add(1, Ordering::Relaxed);
@@ -390,6 +387,36 @@ pub struct ConnectionSummary {
 /// human-readable detail string — decouples the API's wire format from
 /// iroh's own `Display` formatting (`"direct(1.2.3.4:5678)"` etc.), which
 /// isn't a contract we want to depend on verbatim.
+#[derive(Clone, PartialEq, Eq)]
+enum ConnectionType {
+    Direct(std::net::SocketAddr),
+    Relay(iroh::RelayUrl),
+    Mixed(std::net::SocketAddr, iroh::RelayUrl),
+    None,
+}
+
+async fn current_conn_type(endpoint: &iroh::Endpoint, remote_id: iroh::EndpointId) -> Option<ConnectionType> {
+    let info = endpoint.remote_info(remote_id).await?;
+    let mut direct = None;
+    let mut relay = None;
+    for addr in info.addrs() {
+        if !matches!(addr.usage(), iroh::endpoint::TransportAddrUsage::Active) {
+            continue;
+        }
+        match addr.addr() {
+            iroh::TransportAddr::Ip(ip) => direct = direct.or(Some(*ip)),
+            iroh::TransportAddr::Relay(url) => relay = relay.or(Some(url.clone())),
+            _ => {}
+        }
+    }
+    Some(match (direct, relay) {
+        (Some(ip), Some(url)) => ConnectionType::Mixed(ip, url),
+        (Some(ip), None) => ConnectionType::Direct(ip),
+        (None, Some(url)) => ConnectionType::Relay(url),
+        (None, None) => ConnectionType::None,
+    })
+}
+
 fn describe_conn_type(ct: &ConnectionType) -> (&'static str, Option<String>) {
     match ct {
         ConnectionType::Direct(addr) => ("direct", Some(addr.to_string())),
@@ -451,34 +478,41 @@ pub async fn list(State(state): State<Arc<crate::AppState>>) -> ApiResult<PeerLi
     };
 
     let connect_node = state.peer.connect_node_if_present();
-    let connections = state
+    let tracked: Vec<_> = state
         .peer
         .connections
         .lock()
         .await
         .iter()
-        .map(|(id, tc)| {
-            let handle = &tc.handle;
-            let (conn_type, conn_detail) = connect_node
-                .and_then(|node| node.endpoint().conn_type(handle.remote_id()))
-                .map(|mut w| describe_conn_type(&w.get()))
-                .map(|(label, detail)| (label.to_string(), detail))
-                .unwrap_or_else(|| ("unknown".to_string(), None));
-            let latency_ms = connect_node
-                .and_then(|node| node.endpoint().latency(handle.remote_id()))
-                .map(|d| d.as_millis() as u64);
-            ConnectionSummary {
-                id: id.clone(),
-                bound_addr: handle.bound_addr().to_string(),
-                remote_endpoint_id: handle.remote_id().to_string(),
-                target: handle.advertisment().address(),
-                conn_type,
-                conn_detail,
-                latency_ms,
-                transition_count: tc.transitions.load(Ordering::Relaxed),
-            }
-        })
+        .map(|(id, tc)| (
+            id.clone(),
+            tc.handle.remote_id(),
+            tc.handle.bound_addr().to_string(),
+            tc.handle.advertisment().address(),
+            tc.transitions.load(Ordering::Relaxed),
+        ))
         .collect();
+    let mut connections = Vec::with_capacity(tracked.len());
+    for (id, remote_id, bound_addr, target, transition_count) in tracked {
+        let current = match connect_node {
+            Some(node) => current_conn_type(node.endpoint(), remote_id).await,
+            None => None,
+        };
+        let (conn_type, conn_detail) = current
+            .map(|ct| describe_conn_type(&ct))
+            .map(|(label, detail)| (label.to_string(), detail))
+            .unwrap_or_else(|| ("unknown".to_string(), None));
+        connections.push(ConnectionSummary {
+            id,
+            bound_addr,
+            remote_endpoint_id: remote_id.to_string(),
+            target,
+            conn_type,
+            conn_detail,
+            latency_ms: None,
+            transition_count,
+        });
+    }
 
     let connect_metrics = state.peer.connect_node_if_present().map(|node| {
         let m = node.metrics();

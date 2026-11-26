@@ -38,11 +38,11 @@ tracing = { workspace = true }
 url = { workspace = true }
 
 # iroh dependencies
-iroh = { version = "0.95", default-features = false }
-iroh-base = { version = "0.95" }
-iroh-relay = { version = "0.95" }
-iroh-tickets = "0.2"
-iroh-n0des = { version = "0.8" }
+iroh = { version = "1.0", default-features = false }
+iroh-base = { version = "1.0" }
+iroh-relay = { version = "1.0" }
+iroh-tickets = "1.0"
+iroh-services = { version = "1.0" }
 iroh-proxy-utils = { git = "https://github.com/n0-computer/iroh-proxy-utils", rev = "e87788bb49d985ebdf6e9bb8ff17874db4740016" }
 
 # Home Assistant Core's websocket API, through the Supervisor (the add-on's
