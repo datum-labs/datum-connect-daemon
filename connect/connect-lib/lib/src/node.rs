@@ -7,6 +7,7 @@ use iroh::{
     endpoint::{default_relay_mode, presets},
     protocol::Router,
 };
+use crate::path_tracker::{PathTracker, PeerPath};
 use iroh_base::RelayUrl;
 use iroh_services::ApiSecret;
 use iroh_proxy_utils::upstream::{TargetMetrics, UpstreamMetrics};
@@ -313,6 +314,7 @@ impl AuthHandler for StateWrapper {
 #[derive(Debug, Clone)]
 pub struct ConnectNode {
     endpoint: Endpoint,
+    paths: PathTracker,
     proxy: DownstreamProxy,
     _n0des: Option<Arc<iroh_services::Client>>,
 }
@@ -330,11 +332,14 @@ impl ConnectNode {
     ) -> Result<Self> {
         let config = repo.config().await?;
         let secret_key = repo.connect_key().await?;
-        let endpoint = build_endpoint(secret_key, &config).await?;
+        let paths = PathTracker::default();
+        let endpoint =
+            build_endpoint_tracked(secret_key, &config, None, paths.clone()).await?;
         let n0des = build_n0des_client_opt(&endpoint, n0des_api_secret).await;
         let pool = DownstreamProxy::new(endpoint.clone(), Default::default());
         Ok(Self {
             endpoint,
+            paths,
             _n0des: n0des,
             proxy: pool,
         })
@@ -352,11 +357,14 @@ impl ConnectNode {
         let n0des_api_secret = n0des_api_secret_from_env()?;
         let config = repo.config().await?;
         let secret_key = repo.connect_key().await?;
-        let endpoint = build_endpoint_with_relay_mode(secret_key, &config, relay_mode).await?;
+        let paths = PathTracker::default();
+        let endpoint =
+            build_endpoint_tracked(secret_key, &config, Some(relay_mode), paths.clone()).await?;
         let n0des = build_n0des_client_opt(&endpoint, n0des_api_secret).await;
         let pool = DownstreamProxy::new(endpoint.clone(), Default::default());
         Ok(Self {
             endpoint,
+            paths,
             _n0des: n0des,
             proxy: pool,
         })
@@ -366,9 +374,11 @@ impl ConnectNode {
         self.endpoint.id()
     }
 
-    /// The raw iroh endpoint — gives callers access to `conn_type()`/
-    /// `latency()` per remote peer (direct-vs-relay, RTT), mirroring
-    /// `ListenNode::endpoint()`.
+    pub fn selected_path(&self, remote_id: EndpointId) -> Option<PeerPath> {
+        self.paths.selected_path(remote_id)
+    }
+
+    /// The raw iroh endpoint, mirroring `ListenNode::endpoint()`.
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
     }
@@ -446,6 +456,19 @@ pub async fn build_endpoint(secret_key: SecretKey, common: &Config) -> Result<En
     build_endpoint_with_relay_mode(secret_key, common, relay_mode).await
 }
 
+async fn build_endpoint_tracked(
+    secret_key: SecretKey,
+    common: &Config,
+    relay_mode: Option<iroh::endpoint::RelayMode>,
+    tracker: PathTracker,
+) -> Result<Endpoint> {
+    let relay_mode = match relay_mode {
+        Some(mode) => mode,
+        None => relay_mode_from_env_or_build().await?,
+    };
+    build_endpoint_inner(secret_key, common, relay_mode, Some(tracker)).await
+}
+
 /// Same as `build_endpoint`, but with the relay mode passed in directly
 /// instead of resolved from `DATUM_CONNECT_RELAY_URLS`/the built-in Datum
 /// shortlist — for callers that must not route through Datum's relay
@@ -454,6 +477,15 @@ pub async fn build_endpoint_with_relay_mode(
     secret_key: SecretKey,
     common: &Config,
     relay_mode: iroh::endpoint::RelayMode,
+) -> Result<Endpoint> {
+    build_endpoint_inner(secret_key, common, relay_mode, None).await
+}
+
+async fn build_endpoint_inner(
+    secret_key: SecretKey,
+    common: &Config,
+    relay_mode: iroh::endpoint::RelayMode,
+    tracker: Option<PathTracker>,
 ) -> Result<Endpoint> {
     let mut builder = match common.discovery_mode {
         crate::config::DiscoveryMode::Dns => Endpoint::builder(presets::Empty)
@@ -496,6 +528,9 @@ pub async fn build_endpoint_with_relay_mode(
             };
             builder = builder.address_lookup(DnsAddressLookup::builder(origin));
         }
+    }
+    if let Some(tracker) = tracker {
+        builder = builder.hooks(tracker);
     }
     let endpoint = builder.bind().await?;
     info!(id = %endpoint.id(), "iroh endpoint bound");

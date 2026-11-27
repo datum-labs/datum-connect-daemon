@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::Json;
-use connect_lib::{Advertisment, AdvertismentTicket, ConnectNode, ListenNode, OutboundProxyHandle, ProxyState, Repo, TcpProxyData};
+use connect_lib::{PathKind, PeerPath, Advertisment, AdvertismentTicket, ConnectNode, ListenNode, OutboundProxyHandle, ProxyState, Repo, TcpProxyData};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{Mutex, OnceCell, RwLock};
@@ -311,7 +311,7 @@ async fn watch_connection_transitions(
     remote_id: iroh::EndpointId,
     transitions: Arc<AtomicU32>,
 ) {
-    let mut last: Option<ConnectionType> = None;
+    let mut last: Option<PeerPath> = None;
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
     loop {
         interval.tick().await;
@@ -319,13 +319,13 @@ async fn watch_connection_transitions(
             return; // disconnected — stop watching
         }
         let Some(node) = state.peer.connect_node_if_present() else { continue };
-        let Some(current) = current_conn_type(node.endpoint(), remote_id).await else { continue };
+        let Some(current) = node.selected_path(remote_id) else { continue };
         if let Some(prev) = &last {
-            if *prev != current {
+            if prev.kind != current.kind {
                 transitions.fetch_add(1, Ordering::Relaxed);
-                let (label, detail) = describe_conn_type(&current);
+                let (label, detail) = describe_path(&current);
                 tracing::info!(
-                    connection = %connection_id, from = %describe_conn_type(prev).0, to = %label, detail = ?detail,
+                    connection = %connection_id, from = %describe_path(prev).0, to = %label, detail = ?detail,
                     "peer connection type changed"
                 );
                 crate::auth::append_audit(
@@ -387,42 +387,10 @@ pub struct ConnectionSummary {
 /// human-readable detail string — decouples the API's wire format from
 /// iroh's own `Display` formatting (`"direct(1.2.3.4:5678)"` etc.), which
 /// isn't a contract we want to depend on verbatim.
-#[derive(Clone, PartialEq, Eq)]
-enum ConnectionType {
-    Direct(std::net::SocketAddr),
-    Relay(iroh::RelayUrl),
-    Mixed(std::net::SocketAddr, iroh::RelayUrl),
-    None,
-}
-
-async fn current_conn_type(endpoint: &iroh::Endpoint, remote_id: iroh::EndpointId) -> Option<ConnectionType> {
-    let info = endpoint.remote_info(remote_id).await?;
-    let mut direct = None;
-    let mut relay = None;
-    for addr in info.addrs() {
-        if !matches!(addr.usage(), iroh::endpoint::TransportAddrUsage::Active) {
-            continue;
-        }
-        match addr.addr() {
-            iroh::TransportAddr::Ip(ip) => direct = direct.or(Some(*ip)),
-            iroh::TransportAddr::Relay(url) => relay = relay.or(Some(url.clone())),
-            _ => {}
-        }
-    }
-    Some(match (direct, relay) {
-        (Some(ip), Some(url)) => ConnectionType::Mixed(ip, url),
-        (Some(ip), None) => ConnectionType::Direct(ip),
-        (None, Some(url)) => ConnectionType::Relay(url),
-        (None, None) => ConnectionType::None,
-    })
-}
-
-fn describe_conn_type(ct: &ConnectionType) -> (&'static str, Option<String>) {
-    match ct {
-        ConnectionType::Direct(addr) => ("direct", Some(addr.to_string())),
-        ConnectionType::Relay(url) => ("relay", Some(url.to_string())),
-        ConnectionType::Mixed(addr, url) => ("mixed", Some(format!("{addr} via {url}"))),
-        ConnectionType::None => ("unknown", None),
+fn describe_path(path: &PeerPath) -> (&'static str, Option<String>) {
+    match &path.kind {
+        PathKind::Direct(addr) => ("direct", Some(addr.to_string())),
+        PathKind::Relay(url) => ("relay", Some(url.to_string())),
     }
 }
 
@@ -494,12 +462,11 @@ pub async fn list(State(state): State<Arc<crate::AppState>>) -> ApiResult<PeerLi
         .collect();
     let mut connections = Vec::with_capacity(tracked.len());
     for (id, remote_id, bound_addr, target, transition_count) in tracked {
-        let current = match connect_node {
-            Some(node) => current_conn_type(node.endpoint(), remote_id).await,
-            None => None,
-        };
+        let current = connect_node.and_then(|node| node.selected_path(remote_id));
+        let latency_ms = current.as_ref().map(|p| p.rtt.as_millis() as u64);
         let (conn_type, conn_detail) = current
-            .map(|ct| describe_conn_type(&ct))
+            .as_ref()
+            .map(describe_path)
             .map(|(label, detail)| (label.to_string(), detail))
             .unwrap_or_else(|| ("unknown".to_string(), None));
         connections.push(ConnectionSummary {
@@ -509,7 +476,7 @@ pub async fn list(State(state): State<Arc<crate::AppState>>) -> ApiResult<PeerLi
             target,
             conn_type,
             conn_detail,
-            latency_ms: None,
+            latency_ms,
             transition_count,
         });
     }
