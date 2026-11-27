@@ -653,7 +653,7 @@ dependencies = [
  "n0-error",
  "n0-future",
  "postcard",
- "rand 0.9.3",
+ "rand 0.9.5",
  "reqwest 0.12.28",
  "ring",
  "rustls",
@@ -932,7 +932,7 @@ dependencies = [
  "inquire",
  "iroh",
  "n0-error",
- "rand 0.9.3",
+ "rand 0.9.5",
  "reqwest 0.12.28",
  "rustls",
  "serde_json",
@@ -959,7 +959,7 @@ dependencies = [
  "iroh",
  "n0-error",
  "os_info",
- "rand 0.9.3",
+ "rand 0.9.5",
  "ring",
  "rustls",
  "serde",
@@ -1627,7 +1627,7 @@ dependencies = [
  "idna",
  "ipnet",
  "once_cell",
- "rand 0.9.3",
+ "rand 0.9.5",
  "ring",
  "rustls",
  "thiserror 2.0.21",
@@ -1651,7 +1651,7 @@ dependencies = [
  "moka",
  "once_cell",
  "parking_lot",
- "rand 0.9.3",
+ "rand 0.9.5",
  "resolv-conf",
  "rustls",
  "smallvec",
@@ -1976,7 +1976,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "log",
- "rand 0.9.3",
+ "rand 0.9.5",
  "tokio",
  "url",
  "xmltree",
@@ -2105,7 +2105,7 @@ dependencies = [
  "pkarr",
  "pkcs8",
  "portmapper",
- "rand 0.9.3",
+ "rand 0.9.5",
  "reqwest 0.12.28",
  "rustls",
  "rustls-pki-types",
@@ -2172,7 +2172,7 @@ dependencies = [
  "n0-snafu",
  "nested_enum_utils",
  "postcard",
- "rand 0.9.3",
+ "rand 0.9.5",
  "range-collections",
  "redb",
  "ref-cast",
@@ -2262,7 +2262,7 @@ dependencies = [
  "n0-error",
  "n0-future",
  "postcard",
- "rand 0.9.3",
+ "rand 0.9.5",
  "rcan",
  "serde",
  "serde_json",
@@ -2393,7 +2393,7 @@ dependencies = [
  "pin-project",
  "pkarr",
  "postcard",
- "rand 0.9.3",
+ "rand 0.9.5",
  "reqwest 0.12.28",
  "rustls",
  "rustls-pki-types",
@@ -3624,7 +3624,7 @@ dependencies = [
  "n0-error",
  "netwatch",
  "num_enum",
- "rand 0.9.3",
+ "rand 0.9.5",
  "serde",
  "smallvec",
  "socket2 0.6.3",
@@ -3785,7 +3785,7 @@ dependencies = [
  "bytes",
  "getrandom 0.3.4",
  "lru-slab",
- "rand 0.9.3",
+ "rand 0.9.5",
  "ring",
  "rustc-hash",
  "rustls",
@@ -3845,9 +3845,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.9.3"
+version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ec095654a25171c2124e9e3393a930bddbffdc939556c914957a4c3e0a87166"
+checksum = "b9ef1d0d795eb7d84685bca4f72f3649f064e6641543d3a8c415898726a57b41"
 dependencies = [
  "rand_chacha 0.9.0",
  "rand_core 0.9.5",
@@ -3918,7 +3918,7 @@ dependencies = [
  "hex",
  "n0-future",
  "postcard",
- "rand 0.9.3",
+ "rand 0.9.5",
  "serde",
 ]
 
@@ -4868,7 +4868,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
  "windows-sys 0.52.0",
@@ -5078,7 +5078,7 @@ dependencies = [
  "getrandom 0.3.4",
  "http",
  "httparse",
- "rand 0.9.3",
+ "rand 0.9.5",
  "ring",
  "rustls-pki-types",
  "simdutf8",
