@@ -499,7 +499,7 @@ async fn resolve_listen_key(
         Ok(k) => Ok((k, false)),
         Err(e) if e.to_string().contains("KEY_NOT_FOUND") => {
             tracing::info!(tunnel = %tunnel_id, "no listen key on file — generating one (connector will be (re)created)");
-            Ok((SecretKey::generate(&mut rand::rng()), true))
+            Ok((SecretKey::generate(), true))
         }
         Err(e) => Err(e),
     }

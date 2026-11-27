@@ -1,11 +1,15 @@
 use std::{fmt::Debug, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use iroh::{
-    Endpoint, EndpointId, SecretKey, discovery::dns::DnsDiscovery, endpoint::default_relay_mode,
+    Endpoint, EndpointId, SecretKey,
+    address_lookup::dns::DnsAddressLookup,
+    dns::{DnsProtocol, DnsResolver},
+    endpoint::{default_relay_mode, presets},
     protocol::Router,
 };
+use crate::path_tracker::{PathTracker, PeerPath};
 use iroh_base::RelayUrl;
-use iroh_n0des::ApiSecret;
+use iroh_services::ApiSecret;
 use iroh_proxy_utils::upstream::{TargetMetrics, UpstreamMetrics};
 use iroh_proxy_utils::{
     ALPN as IROH_HTTP_CONNECT_ALPN, Authority, HttpProxyRequest, HttpProxyRequestKind,
@@ -14,7 +18,6 @@ use iroh_proxy_utils::{
     downstream::{DownstreamMetrics, DownstreamProxy, EndpointAuthority, ProxyMode},
     upstream::{AuthError, AuthHandler, UpstreamProxy},
 };
-use iroh_relay::dns::{DnsProtocol, DnsResolver};
 use iroh_relay::{RelayConfig, RelayMap};
 use n0_error::{Result, StackResultExt, StdResultExt};
 use tokio::{
@@ -38,7 +41,7 @@ pub struct ListenNode {
     state: StateWrapper,
     repo: Repo,
     metrics: Arc<UpstreamMetrics>,
-    _n0des: Option<Arc<iroh_n0des::Client>>,
+    _n0des: Option<Arc<iroh_services::Client>>,
 }
 
 impl ListenNode {
@@ -311,8 +314,9 @@ impl AuthHandler for StateWrapper {
 #[derive(Debug, Clone)]
 pub struct ConnectNode {
     endpoint: Endpoint,
+    paths: PathTracker,
     proxy: DownstreamProxy,
-    _n0des: Option<Arc<iroh_n0des::Client>>,
+    _n0des: Option<Arc<iroh_services::Client>>,
 }
 
 impl ConnectNode {
@@ -328,11 +332,14 @@ impl ConnectNode {
     ) -> Result<Self> {
         let config = repo.config().await?;
         let secret_key = repo.connect_key().await?;
-        let endpoint = build_endpoint(secret_key, &config).await?;
+        let paths = PathTracker::default();
+        let endpoint =
+            build_endpoint_tracked(secret_key, &config, None, paths.clone()).await?;
         let n0des = build_n0des_client_opt(&endpoint, n0des_api_secret).await;
         let pool = DownstreamProxy::new(endpoint.clone(), Default::default());
         Ok(Self {
             endpoint,
+            paths,
             _n0des: n0des,
             proxy: pool,
         })
@@ -350,11 +357,14 @@ impl ConnectNode {
         let n0des_api_secret = n0des_api_secret_from_env()?;
         let config = repo.config().await?;
         let secret_key = repo.connect_key().await?;
-        let endpoint = build_endpoint_with_relay_mode(secret_key, &config, relay_mode).await?;
+        let paths = PathTracker::default();
+        let endpoint =
+            build_endpoint_tracked(secret_key, &config, Some(relay_mode), paths.clone()).await?;
         let n0des = build_n0des_client_opt(&endpoint, n0des_api_secret).await;
         let pool = DownstreamProxy::new(endpoint.clone(), Default::default());
         Ok(Self {
             endpoint,
+            paths,
             _n0des: n0des,
             proxy: pool,
         })
@@ -364,9 +374,11 @@ impl ConnectNode {
         self.endpoint.id()
     }
 
-    /// The raw iroh endpoint — gives callers access to `conn_type()`/
-    /// `latency()` per remote peer (direct-vs-relay, RTT), mirroring
-    /// `ListenNode::endpoint()`.
+    pub fn selected_path(&self, remote_id: EndpointId) -> Option<PeerPath> {
+        self.paths.selected_path(remote_id)
+    }
+
+    /// The raw iroh endpoint, mirroring `ListenNode::endpoint()`.
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
     }
@@ -444,6 +456,19 @@ pub async fn build_endpoint(secret_key: SecretKey, common: &Config) -> Result<En
     build_endpoint_with_relay_mode(secret_key, common, relay_mode).await
 }
 
+async fn build_endpoint_tracked(
+    secret_key: SecretKey,
+    common: &Config,
+    relay_mode: Option<iroh::endpoint::RelayMode>,
+    tracker: PathTracker,
+) -> Result<Endpoint> {
+    let relay_mode = match relay_mode {
+        Some(mode) => mode,
+        None => relay_mode_from_env_or_build().await?,
+    };
+    build_endpoint_inner(secret_key, common, relay_mode, Some(tracker)).await
+}
+
 /// Same as `build_endpoint`, but with the relay mode passed in directly
 /// instead of resolved from `DATUM_CONNECT_RELAY_URLS`/the built-in Datum
 /// shortlist — for callers that must not route through Datum's relay
@@ -453,21 +478,30 @@ pub async fn build_endpoint_with_relay_mode(
     common: &Config,
     relay_mode: iroh::endpoint::RelayMode,
 ) -> Result<Endpoint> {
+    build_endpoint_inner(secret_key, common, relay_mode, None).await
+}
+
+async fn build_endpoint_inner(
+    secret_key: SecretKey,
+    common: &Config,
+    relay_mode: iroh::endpoint::RelayMode,
+    tracker: Option<PathTracker>,
+) -> Result<Endpoint> {
     let mut builder = match common.discovery_mode {
-        crate::config::DiscoveryMode::Dns => {
-            Endpoint::empty_builder(relay_mode).secret_key(secret_key)
-        }
+        crate::config::DiscoveryMode::Dns => Endpoint::builder(presets::Empty)
+            .relay_mode(relay_mode)
+            .secret_key(secret_key),
         crate::config::DiscoveryMode::Default | crate::config::DiscoveryMode::Hybrid => {
-            Endpoint::builder()
+            Endpoint::builder(presets::N0)
                 .relay_mode(relay_mode)
                 .secret_key(secret_key)
         }
     };
     if let Some(addr) = common.ipv4_addr {
-        builder = builder.bind_addr_v4(addr);
+        builder = builder.bind_addr(addr)?;
     }
     if let Some(addr) = common.ipv6_addr {
-        builder = builder.bind_addr_v6(addr);
+        builder = builder.bind_addr(addr)?;
     }
     // Applies regardless of discovery_mode — relay and discovery hostname
     // resolution both go through this resolver. Previously only wired up
@@ -492,8 +526,11 @@ pub async fn build_endpoint_with_relay_mode(
                     "dns_origin is required when discovery_mode is set to dns or hybrid"
                 ),
             };
-            builder = builder.discovery(DnsDiscovery::builder(origin));
+            builder = builder.address_lookup(DnsAddressLookup::builder(origin));
         }
+    }
+    if let Some(tracker) = tracker {
+        builder = builder.hooks(tracker);
     }
     let endpoint = builder.bind().await?;
     info!(id = %endpoint.id(), "iroh endpoint bound");
@@ -776,7 +813,7 @@ pub(crate) fn n0des_api_secret_from_env() -> Result<Option<ApiSecret>> {
 pub(crate) async fn build_n0des_client_opt(
     endpoint: &Endpoint,
     api_secret: Option<ApiSecret>,
-) -> Option<Arc<iroh_n0des::Client>> {
+) -> Option<Arc<iroh_services::Client>> {
     match api_secret {
         None => {
             info!("Disabling metrics collection: N0DES_API_SECRET is not set");
@@ -785,7 +822,7 @@ pub(crate) async fn build_n0des_client_opt(
         Some(n0des_api_secret) => {
             let remote_id = n0des_api_secret.remote.id;
             debug!(remote = %remote_id.fmt_short(), "connecting to n0des endpoint");
-            let builder = match iroh_n0des::Client::builder(endpoint)
+            let builder = match iroh_services::Client::builder(endpoint)
                 .api_secret(n0des_api_secret)
             {
                 Ok(b) => b,
@@ -855,7 +892,7 @@ mod tests {
         )))
         .await
         .unwrap();
-        let server_key = SecretKey::generate(&mut rand::rng());
+        let server_key = SecretKey::generate();
         let server_node = ListenNode::new_with_key_and_relay_mode(
             server_repo,
             server_key,
@@ -942,10 +979,10 @@ mod tests {
         let repo = Repo::open_or_create(&dir).await.unwrap();
 
         // Generate a key in memory.
-        let key = SecretKey::generate(&mut rand::rng());
+        let key = SecretKey::generate();
         // Derive expected EndpointId by creating a temporary endpoint.
         let expected_id = {
-            let ep = iroh::Endpoint::builder()
+            let ep = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
                 .relay_mode(iroh::endpoint::RelayMode::Default)
                 .secret_key(key.clone())
                 .bind()

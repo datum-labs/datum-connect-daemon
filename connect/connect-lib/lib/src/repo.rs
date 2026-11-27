@@ -166,7 +166,7 @@ impl Repo {
     /// `listen` is never accidentally reused. The plain `listen_key` name is only
     /// used inside per-tunnel subdirectories where the key is intentionally stable.
     pub async fn listen_key(&self, project_id: Option<&str>) -> Result<SecretKey> {
-        let key = SecretKey::generate(&mut rand::rng());
+        let key = SecretKey::generate();
         let now = chrono::Local::now().format("%Y%m%d%H%M%S");
         let suffix = match project_id {
             Some(pid) => format!("{}.{}", pid, now),
@@ -279,7 +279,7 @@ impl Repo {
     }
 
     async fn create_key(&self, key_file_path: &PathBuf) -> Result<SecretKey> {
-        let key = SecretKey::generate(&mut rand::rng());
+        let key = SecretKey::generate();
         tokio::fs::write(key_file_path, key.to_bytes()).await?;
         Ok(key)
     }
@@ -317,7 +317,7 @@ mod tests {
         // gets a fresh identity instead of joining the cross-project DNS race.
         let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
         // Create a legacy key at the plain LISTEN_KEY_FILE path (no timestamp).
-        let legacy = SecretKey::generate(&mut rand::rng());
+        let legacy = SecretKey::generate();
         let legacy_bytes = legacy.to_bytes();
         let legacy_path = repo.0.join(Repo::LISTEN_KEY_FILE);
         tokio::fs::write(&legacy_path, &legacy_bytes)
@@ -381,7 +381,7 @@ mod tests {
         let tunnel_dir = repo.0.join("my-project").join("my-tunnel");
         tokio::fs::create_dir_all(&tunnel_dir).await.unwrap();
         let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
-        let seed_key = SecretKey::generate(&mut rand::rng());
+        let seed_key = SecretKey::generate();
         tokio::fs::write(&key_path, seed_key.to_bytes()).await.unwrap();
 
         let key = repo
@@ -396,7 +396,7 @@ mod tests {
     async fn listen_key_for_tunnel_migrates_legacy_key_to_default_tunnel() {
         let repo = Repo::open_or_create(temp_repo_dir()).await.unwrap();
         // Create a legacy key at the project root (plain name, no timestamp).
-        let legacy_key = SecretKey::generate(&mut rand::rng());
+        let legacy_key = SecretKey::generate();
         let legacy_bytes = legacy_key.to_bytes();
         let legacy_path = repo.0.join(Repo::LISTEN_KEY_FILE);
         tokio::fs::write(&legacy_path, &legacy_bytes)
@@ -433,7 +433,7 @@ mod tests {
         let tunnel_dir = repo.0.join("stable-proj").join("stable-tunnel");
         tokio::fs::create_dir_all(&tunnel_dir).await.unwrap();
         let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
-        let seed_key = SecretKey::generate(&mut rand::rng());
+        let seed_key = SecretKey::generate();
         tokio::fs::write(&key_path, seed_key.to_bytes()).await.unwrap();
 
         let first = repo
@@ -459,7 +459,7 @@ mod tests {
             let tunnel_dir = repo.0.join("multi-proj").join(name);
             tokio::fs::create_dir_all(&tunnel_dir).await.unwrap();
             let key_path = tunnel_dir.join(Repo::LISTEN_KEY_FILE);
-            let seed_key = SecretKey::generate(&mut rand::rng());
+            let seed_key = SecretKey::generate();
             tokio::fs::write(&key_path, seed_key.to_bytes()).await.unwrap();
         }
         let key_a = repo

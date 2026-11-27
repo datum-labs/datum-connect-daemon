@@ -15,7 +15,7 @@ hex = "0.4.3"
 http = "1"
 k8s-openapi = { version = "0.26.1", features = ["v1_30"] }
 kube = { version = "2.0.1", default-features = false, features = ["client", "derive", "rustls-tls"] }
-n0-error = { version = "0.1", features = ["anyhow"] }
+n0-error = { version = "1.0", features = ["anyhow"] }
 n0-future = "0.3"
 rand = "0.9"
 reqwest = { version = "0.12", features = ["rustls-tls", "json"] }
